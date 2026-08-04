@@ -1,0 +1,12 @@
+# Add to the VPS Caddyfile — Neo's public webhook endpoint.
+# Mirrors the reviews.rhobear.ai/webhook block; loopback-only backend on :8767.
+neo.rhobear.ai {
+    handle /webhook {
+        reverse_proxy 127.0.0.1:8767
+    }
+    # Health/landing — Neo has no public UI yet; the dashboard slot lives in the
+    # Reviews dashboard. Everything else 404s so the surface stays closed.
+    handle {
+        respond "rhobear-neo" 200
+    }
+}

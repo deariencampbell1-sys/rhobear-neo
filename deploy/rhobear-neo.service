@@ -1,0 +1,19 @@
+[Unit]
+Description=rhobear-neo — the review-and-merge gate (sibling to rhobear-reviews)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/rhobear/rhobear-neo
+EnvironmentFile=/opt/rhobear/rhobear-neo/.env
+ExecStart=/opt/rhobear/rhobear-neo/.venv/bin/python -m src
+Restart=always
+RestartSec=3
+# The DeepSeek-swapped `claude` CLI + `gh` live on PATH; keep the login user's PATH.
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/opt/rhobear/rhobear-neo/.venv/bin
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
