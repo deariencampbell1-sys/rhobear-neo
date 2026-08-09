@@ -6,13 +6,11 @@ edit, test runner) in an isolated per-run work directory.
 
 Architecture:
   - Claude Code CLI via subprocess, OpenRouter as Anthropic-compatible backend
-  - Isolated CLAUDE_CONFIG_DIR (pre-armed with a settings file that allows all
-    tools — this is a dedicated service, not a shared login shell)
-  - Per-run temp work directory (gh repo clone, git, editor, test runner live
-    here; deleted after the run)
-  - NDJSON output parsing for deterministic text + usage extraction
+  - Isolated per-run temp work directory (deleted after the run)
+  - Single JSON result object parsing (not NDJSON — Claude Code --output-format
+    json returns one result object, not a stream)
   - Fail-closed on nonzero exit, timeout, missing result, unknown verdict,
-    or malformed stream
+    permission denials, truncation, or malformed JSON
 
 Usage:
     agent = ClaudeAgent.from_config(cfg)
@@ -31,17 +29,14 @@ from .config import Config
 
 log = logging.getLogger("rhobear_neo.agent")
 
-# Claude Code settings file content — pre-authorises all tools since Neo is a
-# dedicated service agent (not a shared login shell).  Written into the isolated
-# CLAUDE_CONFIG_DIR at each run.
-CLAUDE_SETTINGS = json.dumps({
-    "permissions": {
-        "*": True,
-    },
-    "allow_all_tools": True,
-    "disablePromptCache": True,       # no cache between runs — each brief is unique
-    "verbose": False,                  # keep stderr quiet
-}, indent=2)
+# Canonical Neo verdicts — anything else is rejected.
+CANONICAL_VERDICTS = frozenset({
+    "ACCEPT-MERGED",
+    "ACCEPT-READY",
+    "FIX-FORWARD",
+    "BOUNCE-BUILDER",
+    "ESCALATE",
+})
 
 
 class AgentError(Exception):
@@ -57,7 +52,7 @@ class TimeoutError(AgentError):
 
 
 class TruncatedOutput(AgentError):
-    """Output was truncated (max_tokens hit)."""
+    """Output was truncated (stop_reason=length / max_tokens)."""
 
 
 class MissingResult(AgentError):
@@ -65,19 +60,19 @@ class MissingResult(AgentError):
 
 
 class MalformedStream(AgentError):
-    """NDJSON output could not be parsed."""
+    """JSON output could not be parsed or has unexpected shape."""
 
 
 class UnknownVerdict(AgentError):
-    """No VERDICT: line found in the agent's output."""
+    """No VERDICT: line found in the agent's output or verdict not canonical."""
 
 
 class ClaudeAgent:
     """Run the Neo brief through Claude Code CLI (headless, with tools).
 
-    Each call creates an isolated temp work directory + temp CLAUDE_CONFIG_DIR
-    so the agent has a clean slate.  The work directory is deleted after the
-    run — no accumulated clone/copy graveyard.
+    Each call creates an isolated temp work directory so the agent has a clean
+    slate.  The work directory is deleted after the run — no accumulated
+    clone/copy graveyard.
 
     Thread-safe for sequential calls (each call creates its own subprocess).
     """
@@ -91,13 +86,14 @@ class ClaudeAgent:
         model: str,
         effort: str = "max",
         max_tokens: int = 32000,
-        timeout: int = 300,
+        timeout: int = 1800,
         gh_token: str = "",
     ) -> None:
         self.claude_bin = claude_bin
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
-        self.model = model
+        # Ensure model has the [1m] context suffix required by OpenRouter.
+        self.model = model if model.endswith("[1m]") else f"{model}[1m]"
         self.effort = effort
         self.max_tokens = max_tokens
         self.timeout = timeout
@@ -135,9 +131,10 @@ class ClaudeAgent:
         Raises AgentError subclasses on failure — the caller should
         catch and return empty usage + empty verdict.
         """
-        # Temp work directory — the agent clones/clones/edit/test here.
+        # Temp work directory — the agent clones/edits/tests here.
         with tempfile.TemporaryDirectory(prefix="neo-work-") as work_dir:
-            # Temp config directory — isolated Claude Code settings.
+            # Temp config directory — empty, deleted after run for cleanup.
+            # (No settings file — --dangerously-skip-permissions replaces that.)
             with tempfile.TemporaryDirectory(prefix="neo-config-") as config_dir:
                 return self._run_in(brief, work_dir, config_dir)
 
@@ -145,7 +142,6 @@ class ClaudeAgent:
         self, brief: str, work_dir: str, config_dir: str,
     ) -> tuple[dict[str, int], str]:
         """Run inside pre-created temp directories."""
-        self._write_settings(config_dir)
         env = self._build_env(config_dir)
         cmd = self._build_cmd(brief)
 
@@ -176,27 +172,22 @@ class ClaudeAgent:
         return self._parse_output(proc)
 
     # ------------------------------------------------------------------
-    # Internal: env / cmd / settings
+    # Internal: env / cmd
     # ------------------------------------------------------------------
-
-    def _write_settings(self, config_dir: str) -> None:
-        """Write claude_settings.json into the isolated config dir."""
-        cfg_path = os.path.join(config_dir, "claude_settings.json")
-        with open(cfg_path, "w") as f:
-            f.write(CLAUDE_SETTINGS)
-        log.debug("wrote %s", cfg_path)
 
     def _build_env(self, config_dir: str) -> dict[str, str]:
         """Build the environment for the Claude Code subprocess.
 
-        Preserves the host PATH and HOME but overrides everything Claude Code
-        cares about.  Never logs or echoes the API key.
+        Uses ANTHROPIC_BASE_URL (the gateway env var that Claude Code respects)
+        and sets both ANTHROPIC_AUTH_TOKEN and ANTHROPIC_API_KEY for maximum
+        compatibility.  Preserves the host PATH and HOME.  Never logs or echoes
+        the API key.
         """
         env = {
             **os.environ,
-            "CLAUDE_CONFIG_DIR": config_dir,
-            "CLAUDE_CODE_ANTHROPIC_BASE_URL": self.base_url,
+            "ANTHROPIC_BASE_URL": self.base_url,
             "ANTHROPIC_API_KEY": self.api_key,
+            "ANTHROPIC_AUTH_TOKEN": self.api_key,
             "ANTHROPIC_MODEL": self.model,
             "CLAUDE_CODE_EFFORT_LEVEL": self.effort,
             "CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(self.max_tokens),
@@ -206,21 +197,24 @@ class ClaudeAgent:
         if self.gh_token:
             env["GH_TOKEN"] = self.gh_token
         # Remove conflicting env vars that might point at a different provider.
-        env.pop("ANTHROPIC_BASE_URL", None)
+        env.pop("CLAUDE_CODE_ANTHROPIC_BASE_URL", None)
         env.pop("CLAUDE_CODE_BASE_URL", None)
         return env
 
     def _build_cmd(self, brief: str) -> list[str]:
         """Build the Claude Code CLI command.
 
-        Runs in one-shot prompt mode (-p) with the exact model and max effort.
-        No runtime probe/fallback — the provider already accepted max effort.
+        Runs in one-shot prompt mode (-p) with the exact model, max effort,
+        dangerously-skip-permissions (pre-approves all tools — Neo is a
+        dedicated service agent), no session persistence, and JSON output.
         """
         return [
             self.claude_bin,
             "-p", brief,
             "--model", self.model,
             "--effort", self.effort,
+            "--dangerously-skip-permissions",
+            "--no-session-persistence",
             "--output-format", "json",
         ]
 
@@ -233,16 +227,19 @@ class ClaudeAgent:
     ) -> tuple[dict[str, int], str]:
         """Parse the Claude Code CLI output.
 
-        Handles NDJSON output format (each line is a JSON event with a 'type'
-        field).  Falls back to treating the entire stdout as response text if
-        NDJSON parsing fails.
+        Claude Code --output-format json returns a single JSON result object
+        (not NDJSON lines).  The object has type=result, subtype=success,
+        is_error=false, a result string, usage, stop_reason, num_turns, and
+        permission_denials.
 
         Fail-closed on:
-          - Nonzero exit (unless we got a valid verdict)
-          - Truncation (finish_reason=length or max_tokens edge)
-          - No output (stdout empty)
-          - No VERDICT: line in the response
-          - Malformed NDJSON
+          - Nonzero exit (even with a verdict — the process must exit clean)
+          - Truncation (stop_reason=length or max_tokens)
+          - Permission denials (non-empty array)
+          - No output / no result text
+          - No VERDICT: line in the result text
+          - Non-canonical verdict value
+          - Malformed JSON
 
         Returns (usage, verdict).
         """
@@ -251,82 +248,88 @@ class ClaudeAgent:
 
         # --- Empty output ---
         if not stdout:
-            # If stderr has content, log it for debugging.
             if stderr:
                 log.warning("claude produced no stdout; stderr=%.500s", stderr)
             raise MissingResult("no stdout from claude")
 
-        # --- Parse NDJSON ---
-        text_parts: list[str] = []
-        usage: dict[str, int] = {}
-        truncated = False
-        ndjson_ok = False
+        # --- Parse JSON result ---
+        try:
+            result = json.loads(stdout)
+        except json.JSONDecodeError:
+            log.warning("stdout is not valid JSON: %.200s", stdout[:200])
+            raise MalformedStream("stdout is not valid JSON")
 
-        for line in stdout.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                # Not NDJSON — fall back to treating stdout as raw text.
-                log.debug("stdout is not NDJSON (line not JSON: %.120s)", line)
-                text_parts = []
-                break
+        if not isinstance(result, dict):
+            raise MalformedStream(f"expected JSON object, got {type(result).__name__}")
 
-            ndjson_ok = True
-            event_type = event.get("type", "")
+        # --- Validate envelope ---
+        if result.get("type") != "result":
+            raise MalformedStream(f"unexpected json type: {result.get('type')!r}")
+        if result.get("is_error", False):
+            error_info = result.get("error", "unknown error")
+            raise MalformedStream(f"claude returned error: {error_info}")
+        if result.get("subtype") != "success":
+            raise MalformedStream(f"unexpected subtype: {result.get('subtype')!r}")
 
-            if event_type == "text":
-                text_parts.append(event.get("text", ""))
-            elif event_type == "usage":
-                usage = {
-                    "input_tokens": int(event.get("input_tokens", 0) or 0),
-                    "output_tokens": int(event.get("output_tokens", 0) or 0),
-                }
-            elif event_type == "error":
-                log.error("claude error event: %s", event.get("error", "unknown"))
-            elif event_type == "finish":
-                reason = event.get("reason", "")
-                if reason == "length" or reason == "max_tokens":
-                    truncated = True
-
-        # --- Fallback: treat stdout as raw text ---
-        if not ndjson_ok and not text_parts:
-            text_parts = [stdout]
-
-        full_text = "\n".join(text_parts).strip()
-
-        # --- Missing result ---
-        if not full_text:
-            raise MissingResult("no response text from claude")
-
-        # --- Truncation ---
-        if truncated:
-            raise TruncatedOutput(
-                "claude output truncated (finish_reason=length / max_tokens)"
+        # --- Permission denials (fail-closed) ---
+        permission_denials = result.get("permission_denials") or []
+        if permission_denials:
+            raise MalformedStream(
+                f"permission denied: {json.dumps(permission_denials, ensure_ascii=False)}"
             )
 
-        # --- Nonzero exit (even with output, fail closed unless we have a verdict) ---
+        # --- Truncation check ---
+        stop_reason = result.get("stop_reason", "") or ""
+        if stop_reason in ("length", "max_tokens"):
+            raise TruncatedOutput(
+                f"claude output truncated (stop_reason={stop_reason})"
+            )
+
+        # --- Non-stopping terminal reason (fail-closed if not a proper stop) ---
+        # Acceptable: end_turn, stop.  Anything else is suspicious.
+        terminal_stop_reasons = {"end_turn", "stop"}
+        if stop_reason and stop_reason not in terminal_stop_reasons:
+            raise MalformedStream(
+                f"non-terminal stop_reason: {stop_reason!r}"
+            )
+
+        # --- At least one turn taken ---
+        num_turns = result.get("num_turns", 0) or 0
+        if num_turns < 1:
+            raise MissingResult("no turns taken by claude")
+
+        # --- Extract result text ---
+        result_text = (result.get("result") or "").strip()
+        if not result_text:
+            raise MissingResult("no result text from claude")
+
+        # --- Nonzero exit (always fail-closed, even with a verdict) ---
         if proc.returncode != 0:
             log.warning("claude exit=%d but produced output: %.200s",
-                        proc.returncode, full_text[:200])
-            # If we have output AND a verdict, let it through — the model may
-            # have finished its work before the CLI hit a tool-call edge.
-            verdict = self._extract_verdict(full_text)
-            if not verdict:
-                raise NonZeroExit(
-                    f"claude exited {proc.returncode} with no verdict"
-                )
-            # Use the usage we collected (or empty).
-            return usage, verdict
+                        proc.returncode, result_text[:200])
+            raise NonZeroExit(
+                f"claude exited {proc.returncode}"
+            )
+
+        # --- Extract usage from the usage object ---
+        usage_raw = result.get("usage") or {}
+        if not isinstance(usage_raw, dict):
+            usage_raw = {}
+        usage = {
+            "input_tokens": int(usage_raw.get("input_tokens", 0) or 0),
+            "output_tokens": int(usage_raw.get("output_tokens", 0) or 0),
+        }
 
         # --- Extract verdict ---
-        verdict = self._extract_verdict(full_text)
+        verdict = self._extract_verdict(result_text)
         if not verdict:
-            # Log the first 500 chars of output for debugging.
-            log.warning("no VERDICT line in output: %.500s", full_text)
+            log.warning("no VERDICT line in result: %.500s", result_text)
             raise UnknownVerdict("no VERDICT: line in claude output")
+
+        # --- Validate verdict against canonical set ---
+        if verdict.upper() not in CANONICAL_VERDICTS:
+            log.warning("non-canonical verdict: %r", verdict)
+            raise UnknownVerdict(f"non-canonical verdict: {verdict}")
 
         return usage, verdict
 

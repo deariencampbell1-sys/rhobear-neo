@@ -81,7 +81,7 @@ class Config:
     openrouter_max_tokens: int = field(default_factory=lambda: _get_int(
         "NEO_MAX_TOKENS", 32000))
     openrouter_timeout: int = field(default_factory=lambda: _get_int(
-        "NEO_TIMEOUT", 300))
+        "NEO_TIMEOUT", 1800))
 
     # --- claude binary path (on the VPS: /usr/bin/claude) ---
     claude_bin: str = field(default_factory=lambda: _get("NEO_CLAUDE_BIN", "/usr/bin/claude"))

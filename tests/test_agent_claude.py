@@ -1,21 +1,21 @@
-"""Tests for the Claude Code CLI agent — realistic fixtures, every error path.
+"""Tests for the Claude Code CLI agent — realistic JSON fixtures, every error path.
 
 Covers:
-  - Command assembly (env, args, settings file) — secrets redacted in assertions
-  - NDJSON stream parsing (text + usage events)
-  - Usage extraction from NDJSON
+  - Command assembly (env, args) — secrets redacted in assertions
+  - Single JSON result object parsing (type=result, subtype=success)
+  - Usage extraction from the usage object
   - Canonical verdicts (ACCEPT-MERGED, ACCEPT-READY, FIX-FORWARD, BOUNCE-BUILDER, ESCALATE)
+  - Non-canonical verdict rejection
   - Timeout
-  - Nonzero exit (with and without verdict)
-  - Truncated output (finish_reason=length)
-  - Malformed stream (not NDJSON → fallback to raw text)
-  - Empty stdout / missing result
+  - Nonzero exit (always rejected, even with verdict)
+  - Truncated output (stop_reason=length / max_tokens)
+  - Permission denials (fail-closed)
+  - Malformed JSON / unexpected envelope
+  - Empty stdout / missing result / no turns
   - Unknown verdict (no VERDICT: line)
   - Verdict markdown stripped
   - Verdict case-insensitive
   - Temp cwd lifecycle (dir created, used, cleaned)
-  - Settings file written correctly
-  - Env built correctly (no secret leaked in assertions)
   - _run_agent wrapper in neo_worker (catch -> empty, pass -> usage)
 """
 from __future__ import annotations
@@ -25,7 +25,7 @@ import os
 import subprocess
 import tempfile
 from typing import Any
-from unittest.mock import ANY, MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -38,7 +38,7 @@ from src.agent_claude import (
     MissingResult,
     UnknownVerdict,
     MalformedStream,
-    CLAUDE_SETTINGS,
+    CANONICAL_VERDICTS,
 )
 from src.config import Config
 
@@ -49,6 +49,7 @@ from src.config import Config
 BASE = "https://openrouter.ai/api"
 API_KEY = "sk-or-v1-test-placeholder"
 MODEL = "deepseek/deepseek-v4-flash"
+MODEL_FULL = MODEL + "[1m]"          # __init__ normalises this
 GH_TOKEN = "ghp_test_token_placeholder"
 CLAUDE_BIN = "/usr/bin/claude"
 
@@ -62,7 +63,7 @@ def _make_agent(**overrides: Any) -> ClaudeAgent:
         model=MODEL,
         effort="max",
         max_tokens=32000,
-        timeout=300,
+        timeout=1800,
         gh_token=GH_TOKEN,
     )
     kwargs.update(overrides)
@@ -83,21 +84,33 @@ def _fake_proc(
     )
 
 
-def _ndjson_text(text: str) -> str:
-    """Build an NDJSON stream with a single text event."""
-    return json.dumps({"type": "text", "text": text}) + "\n"
-
-
-def _ndjson_usage(in_tok: int = 150, out_tok: int = 80) -> str:
-    """Build an NDJSON usage event line."""
-    return json.dumps({
-        "type": "usage", "input_tokens": in_tok, "output_tokens": out_tok,
-    }) + "\n"
-
-
-def _ndjson_finish(reason: str = "stop") -> str:
-    """Build an NDJSON finish event line."""
-    return json.dumps({"type": "finish", "reason": reason}) + "\n"
+def _json_result(
+    *,
+    result: str = "",
+    in_tok: int = 150,
+    out_tok: int = 80,
+    stop_reason: str = "end_turn",
+    num_turns: int = 2,
+    is_error: bool = False,
+    subtype: str = "success",
+    error: str | None = None,
+    permission_denials: list | None = None,
+) -> str:
+    """Build a realistic single JSON result object (the actual output format)."""
+    obj: dict[str, Any] = {
+        "type": "result",
+        "subtype": subtype,
+        "is_error": is_error,
+        "result": result,
+        "usage": {"input_tokens": in_tok, "output_tokens": out_tok},
+        "modelUsage": {"input_tokens": in_tok, "output_tokens": out_tok},
+        "num_turns": num_turns,
+        "stop_reason": stop_reason,
+        "permission_denials": permission_denials or [],
+    }
+    if error is not None:
+        obj["error"] = error
+    return json.dumps(obj)
 
 
 # ===================================================================
@@ -105,7 +118,7 @@ def _ndjson_finish(reason: str = "stop") -> str:
 # ===================================================================
 
 class TestCommandAssembly:
-    """Verify the CLI command is built correctly — env, args, settings."""
+    """Verify the CLI command is built correctly — env, args."""
 
     def test_build_cmd_has_correct_args(self) -> None:
         agent = _make_agent()
@@ -114,9 +127,11 @@ class TestCommandAssembly:
         assert "-p" in cmd
         assert cmd[cmd.index("-p") + 1] == "test brief"
         assert "--model" in cmd
-        assert cmd[cmd.index("--model") + 1] == MODEL
+        assert cmd[cmd.index("--model") + 1] == MODEL_FULL
         assert "--effort" in cmd
         assert cmd[cmd.index("--effort") + 1] == "max"
+        assert "--dangerously-skip-permissions" in cmd
+        assert "--no-session-persistence" in cmd
         assert "--output-format" in cmd
         assert cmd[cmd.index("--output-format") + 1] == "json"
 
@@ -126,18 +141,20 @@ class TestCommandAssembly:
         # API key is set — we assert it exists but never log the value.
         assert "ANTHROPIC_API_KEY" in env
         assert env["ANTHROPIC_API_KEY"] == API_KEY
-        # Base URL, model, effort, max_tokens.
-        assert env["CLAUDE_CODE_ANTHROPIC_BASE_URL"] == BASE
-        assert env["ANTHROPIC_MODEL"] == MODEL
+        # Auth token also set.
+        assert "ANTHROPIC_AUTH_TOKEN" in env
+        assert env["ANTHROPIC_AUTH_TOKEN"] == API_KEY
+        # Base URL uses the correct gateway env var (not CLAUDE_CODE_ANTHROPIC_BASE_URL).
+        assert env["ANTHROPIC_BASE_URL"] == BASE
+        assert "CLAUDE_CODE_ANTHROPIC_BASE_URL" not in env
+        # Model, effort, max_tokens.
+        assert env["ANTHROPIC_MODEL"] == MODEL_FULL
         assert env["CLAUDE_CODE_EFFORT_LEVEL"] == "max"
         assert env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "32000"
         assert env["CLAUDE_CODE_OUTPUT_FORMAT"] == "json"
-        # Config dir is set.
-        assert env["CLAUDE_CONFIG_DIR"] == "/tmp/neo-config-test"
         # GH_TOKEN propagated.
         assert env["GH_TOKEN"] == GH_TOKEN
         # Conflicting vars removed.
-        assert "ANTHROPIC_BASE_URL" not in env
         assert "CLAUDE_CODE_BASE_URL" not in env
 
     def test_gh_token_omitted_when_empty(self) -> None:
@@ -146,19 +163,18 @@ class TestCommandAssembly:
         agent = _make_agent(gh_token="")
         env = agent._build_env("/tmp/neo-config-test")
         # GH_TOKEN may be inherited from the host env; we just don't force it.
-        # If the host env has it, the value is the host's value, not ours.
         host_val = os.environ.get("GH_TOKEN", "")
         assert env.get("GH_TOKEN", "") == host_val
 
-    def test_settings_file_written(self) -> None:
+    def test_model_normalised(self) -> None:
+        """Model without [1m] suffix gets it appended."""
         agent = _make_agent()
-        with tempfile.TemporaryDirectory() as tmpdir:
-            agent._write_settings(tmpdir)
-            cfg_path = os.path.join(tmpdir, "claude_settings.json")
-            assert os.path.isfile(cfg_path)
-            with open(cfg_path) as f:
-                content = f.read()
-            assert content == CLAUDE_SETTINGS
+        assert agent.model == MODEL_FULL
+
+    def test_model_preserves_existing_suffix(self) -> None:
+        """Model already ending with [1m] is not double-suffixed."""
+        agent = _make_agent(model=MODEL_FULL)
+        assert agent.model == MODEL_FULL
 
     def test_from_config(self) -> None:
         """from_config should populate agent fields from Config."""
@@ -168,7 +184,7 @@ class TestCommandAssembly:
         cfg.openrouter_model = MODEL
         cfg.openrouter_reasoning_effort = "max"
         cfg.openrouter_max_tokens = 32000
-        cfg.openrouter_timeout = 300
+        cfg.openrouter_timeout = 1800
         cfg.claude_bin = CLAUDE_BIN
         cfg.gh_token = GH_TOKEN
 
@@ -176,26 +192,24 @@ class TestCommandAssembly:
         assert agent.claude_bin == CLAUDE_BIN
         assert agent.api_key == API_KEY
         assert agent.base_url == BASE
-        assert agent.model == MODEL
+        assert agent.model == MODEL_FULL
         assert agent.effort == "max"
         assert agent.max_tokens == 32000
-        assert agent.timeout == 300
+        assert agent.timeout == 1800
         assert agent.gh_token == GH_TOKEN
 
 
 # ===================================================================
-# NDJSON stream parsing
+# JSON result parsing
 # ===================================================================
 
-class TestNDJSONParsing:
-    """Parse NDJSON output with text + usage events."""
+class TestJSONResultParsing:
+    """Parse single JSON result object with text + usage."""
 
-    def test_ndjson_text_and_usage(self) -> None:
-        output = (
-            _ndjson_text("I've reviewed the code.\n") +
-            _ndjson_usage(150, 80) +
-            _ndjson_text("VERDICT: ACCEPT-MERGED") +
-            _ndjson_finish("stop")
+    def test_result_with_verdict_and_usage(self) -> None:
+        output = _json_result(
+            result="TOOL_OK\nVERDICT: ACCEPT-MERGED",
+            in_tok=150, out_tok=80,
         )
         proc = _fake_proc(stdout=output)
         agent = _make_agent()
@@ -204,63 +218,42 @@ class TestNDJSONParsing:
         assert usage["input_tokens"] == 150
         assert usage["output_tokens"] == 80
 
-    def test_ndjson_multiple_text_chunks(self) -> None:
-        """Multiple text events should be joined."""
-        output = (
-            _ndjson_text("Line one.\n") +
-            _ndjson_text("Line two.\n") +
-            _ndjson_text("VERDICT: FIX-FORWARD") +
-            _ndjson_finish("stop")
+    def test_result_with_newlines_in_text(self) -> None:
+        """Multi-line result text is parsed correctly."""
+        output = _json_result(
+            result="Step one complete.\nStep two complete.\nVERDICT: FIX-FORWARD",
         )
         proc = _fake_proc(stdout=output)
         agent = _make_agent()
         usage, verdict = agent._parse_output(proc)
         assert verdict == "FIX-FORWARD"
 
-    def test_ndjson_no_usage_fallback(self) -> None:
-        """When usage event is missing, return empty dict."""
-        output = (
-            _ndjson_text("All good.\nVERDICT: ACCEPT-READY") +
-            _ndjson_finish("stop")
+    def test_result_no_usage_object(self) -> None:
+        """When usage object is missing or null, return zeros."""
+        output = json.dumps({
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "All good.\nVERDICT: ACCEPT-READY",
+            "num_turns": 2,
+            "stop_reason": "end_turn",
+            "permission_denials": [],
+        })
+        proc = _fake_proc(stdout=output)
+        agent = _make_agent()
+        usage, verdict = agent._parse_output(proc)
+        assert verdict == "ACCEPT-READY"
+        assert usage == {"input_tokens": 0, "output_tokens": 0}
+
+    def test_result_multiple_verdicts_takes_first(self) -> None:
+        """Only the first VERDICT: line is extracted."""
+        output = _json_result(
+            result="VERDICT: ACCEPT-READY\nAlso VERDICT: ESCALATE",
         )
         proc = _fake_proc(stdout=output)
         agent = _make_agent()
         usage, verdict = agent._parse_output(proc)
         assert verdict == "ACCEPT-READY"
-        assert usage == {}
-
-    def test_ndjson_error_event(self) -> None:
-        """Error events should not crash parsing."""
-        output = (
-            json.dumps({"type": "error", "error": "tool call failed"}) + "\n" +
-            _ndjson_text("Still works.\nVERDICT: ESCALATE") +
-            _ndjson_finish("stop")
-        )
-        proc = _fake_proc(stdout=output)
-        agent = _make_agent()
-        usage, verdict = agent._parse_output(proc)
-        assert verdict == "ESCALATE"
-
-
-# ===================================================================
-# Fallback: raw text (not NDJSON)
-# ===================================================================
-
-class TestRawTextFallback:
-    """When stdout is not NDJSON, treat the whole thing as response text."""
-
-    def test_raw_text_verdict(self) -> None:
-        proc = _fake_proc(stdout="Analysis.\nVERDICT: ACCEPT-MERGED\n")
-        agent = _make_agent()
-        usage, verdict = agent._parse_output(proc)
-        assert verdict == "ACCEPT-MERGED"
-        assert usage == {}
-
-    def test_raw_text_with_extra_lines(self) -> None:
-        proc = _fake_proc(stdout="Here is my analysis.\nVERDICT: BOUNCE-BUILDER\nDone.")
-        agent = _make_agent()
-        usage, verdict = agent._parse_output(proc)
-        assert verdict == "BOUNCE-BUILDER"
 
 
 # ===================================================================
@@ -268,36 +261,51 @@ class TestRawTextFallback:
 # ===================================================================
 
 class TestCanonicalVerdicts:
-    """All five canonical verdict types."""
+    """All five canonical verdict types — and rejection of non-canonical."""
 
-    @pytest.mark.parametrize("verdict", [
-        "ACCEPT-MERGED", "ACCEPT-READY", "FIX-FORWARD",
-        "BOUNCE-BUILDER", "ESCALATE",
-    ])
+    @pytest.mark.parametrize("verdict", sorted(CANONICAL_VERDICTS))
     def test_all_verdicts(self, verdict: str) -> None:
-        proc = _fake_proc(stdout=f"Analysis.\nVERDICT: {verdict}\n")
+        proc = _fake_proc(
+            stdout=_json_result(result=f"Analysis.\nVERDICT: {verdict}\n"),
+        )
         agent = _make_agent()
         usage, v = agent._parse_output(proc)
         assert v == verdict
 
     def test_verdict_markdown_stripped(self) -> None:
-        proc = _fake_proc(stdout="Analysis.\nVERDICT: **ACCEPT-MERGED**\n")
+        proc = _fake_proc(
+            stdout=_json_result(result="Analysis.\nVERDICT: **ACCEPT-MERGED**\n"),
+        )
         agent = _make_agent()
         usage, v = agent._parse_output(proc)
         assert v == "ACCEPT-MERGED"
 
     def test_verdict_backtick_stripped(self) -> None:
-        proc = _fake_proc(stdout="Analysis.\nVERDICT: `BOUNCE-BUILDER`\n")
+        proc = _fake_proc(
+            stdout=_json_result(result="Analysis.\nVERDICT: `BOUNCE-BUILDER`\n"),
+        )
         agent = _make_agent()
         usage, v = agent._parse_output(proc)
         assert v == "BOUNCE-BUILDER"
 
     def test_verdict_case_insensitive(self) -> None:
-        """Lowercase 'verdict:' should also match."""
-        proc = _fake_proc(stdout="Analysis.\nverdict: accept-merged\n")
+        """Lowercase 'verdict:' should also match.
+        The verdict value is returned as-is (case preserved)."""
+        proc = _fake_proc(
+            stdout=_json_result(result="Analysis.\nverdict: accept-merged\n"),
+        )
         agent = _make_agent()
         usage, v = agent._parse_output(proc)
         assert v == "accept-merged"
+
+    def test_non_canonical_verdict_rejected(self) -> None:
+        """A verdict not in the canonical set raises UnknownVerdict."""
+        proc = _fake_proc(
+            stdout=_json_result(result="Analysis.\nVERDICT: APPROVE\n"),
+        )
+        agent = _make_agent()
+        with pytest.raises(UnknownVerdict, match="non-canonical verdict"):
+            agent._parse_output(proc)
 
 
 # ===================================================================
@@ -316,26 +324,29 @@ class TestErrorPaths:
 
     def test_nonzero_exit_no_verdict(self) -> None:
         """Nonzero exit without a verdict should raise NonZeroExit."""
-        proc = _fake_proc(stdout="Something went wrong.", returncode=1)
+        proc = _fake_proc(
+            stdout=_json_result(result="Something went wrong."),
+            returncode=1,
+        )
         agent = _make_agent()
         with pytest.raises(NonZeroExit, match="exited 1"):
             agent._parse_output(proc)
 
-    def test_nonzero_exit_with_verdict_allowed(self) -> None:
-        """Nonzero exit WITH a valid verdict should succeed."""
+    def test_nonzero_exit_with_verdict_rejected(self) -> None:
+        """Nonzero exit WITH a valid verdict should ALSO raise NonZeroExit."""
         proc = _fake_proc(
-            stdout="Analysis.\nVERDICT: ACCEPT-READY",
+            stdout=_json_result(result="Analysis.\nVERDICT: ACCEPT-READY"),
             returncode=1,
         )
         agent = _make_agent()
-        usage, verdict = agent._parse_output(proc)
-        assert verdict == "ACCEPT-READY"
+        with pytest.raises(NonZeroExit, match="exited 1"):
+            agent._parse_output(proc)
 
     def test_truncated_output_raises(self) -> None:
-        """finish_reason=length should raise TruncatedOutput."""
-        output = (
-            _ndjson_text("Partial analysis.\nVERDICT: ") +
-            _ndjson_finish("length")
+        """stop_reason=length should raise TruncatedOutput."""
+        output = _json_result(
+            result="Partial analysis.\nVERDICT: ",
+            stop_reason="length",
         )
         proc = _fake_proc(stdout=output)
         agent = _make_agent()
@@ -343,10 +354,10 @@ class TestErrorPaths:
             agent._parse_output(proc)
 
     def test_truncated_max_tokens_raises(self) -> None:
-        """finish_reason=max_tokens should also raise TruncatedOutput."""
-        output = (
-            _ndjson_text("Partial.\nVERDICT: ") +
-            _ndjson_finish("max_tokens")
+        """stop_reason=max_tokens should also raise TruncatedOutput."""
+        output = _json_result(
+            result="Partial.\nVERDICT: ",
+            stop_reason="max_tokens",
         )
         proc = _fake_proc(stdout=output)
         agent = _make_agent()
@@ -361,7 +372,9 @@ class TestErrorPaths:
 
     def test_missing_verdict_raises(self) -> None:
         """Output with no VERDICT: line should raise UnknownVerdict."""
-        proc = _fake_proc(stdout="I've analyzed the code. Everything looks fine.")
+        proc = _fake_proc(
+            stdout=_json_result(result="I've analyzed the code. Everything looks fine."),
+        )
         agent = _make_agent()
         with pytest.raises(UnknownVerdict, match="no VERDICT"):
             agent._parse_output(proc)
@@ -370,6 +383,69 @@ class TestErrorPaths:
         proc = _fake_proc(stdout="   \n  \n  ")
         agent = _make_agent()
         with pytest.raises(MissingResult, match="no stdout"):
+            agent._parse_output(proc)
+
+    def test_malformed_json_raises(self) -> None:
+        """Non-JSON stdout should raise MalformedStream."""
+        proc = _fake_proc(stdout="not json at all")
+        agent = _make_agent()
+        with pytest.raises(MalformedStream, match="not valid JSON"):
+            agent._parse_output(proc)
+
+    def test_wrong_type_raises(self) -> None:
+        """JSON object with wrong type field should raise MalformedStream."""
+        proc = _fake_proc(stdout=json.dumps({"type": "text", "text": "hello"}))
+        agent = _make_agent()
+        with pytest.raises(MalformedStream, match="unexpected json type"):
+            agent._parse_output(proc)
+
+    def test_is_error_raises(self) -> None:
+        """is_error=true should raise MalformedStream."""
+        output = _json_result(result="", is_error=True, error="tool crashed")
+        proc = _fake_proc(stdout=output)
+        agent = _make_agent()
+        with pytest.raises(MalformedStream, match="returned error"):
+            agent._parse_output(proc)
+
+    def test_permission_denials_raises(self) -> None:
+        """Non-empty permission_denials should raise MalformedStream."""
+        output = _json_result(
+            result="Analysis.\nVERDICT: ACCEPT-READY",
+            permission_denials=["gh:repo:write"],
+        )
+        proc = _fake_proc(stdout=output)
+        agent = _make_agent()
+        with pytest.raises(MalformedStream, match="permission denied"):
+            agent._parse_output(proc)
+
+    def test_no_turns_raises(self) -> None:
+        """num_turns < 1 should raise MissingResult."""
+        output = _json_result(
+            result="Analysis.\nVERDICT: ACCEPT-READY",
+            num_turns=0,
+        )
+        proc = _fake_proc(stdout=output)
+        agent = _make_agent()
+        with pytest.raises(MissingResult, match="no turns"):
+            agent._parse_output(proc)
+
+    def test_non_terminal_stop_reason_raises(self) -> None:
+        """Unknown stop_reason should raise MalformedStream."""
+        output = _json_result(
+            result="Analysis.\nVERDICT: ACCEPT-READY",
+            stop_reason="tool_use",
+        )
+        proc = _fake_proc(stdout=output)
+        agent = _make_agent()
+        with pytest.raises(MalformedStream, match="non-terminal stop_reason"):
+            agent._parse_output(proc)
+
+    def test_empty_result_text_raises(self) -> None:
+        """JSON with empty result string should raise MissingResult."""
+        output = _json_result(result="")
+        proc = _fake_proc(stdout=output)
+        agent = _make_agent()
+        with pytest.raises(MissingResult, match="no result text"):
             agent._parse_output(proc)
 
 
@@ -384,34 +460,10 @@ class TestTempCwdLifecycle:
         """Temp dirs should be created during run() and deleted after."""
         agent = _make_agent()
 
-        # Track the temp dirs that were created.
-        created_work = []
-        created_config = []
-
-        original_tmpdir = tempfile.TemporaryDirectory
-
-        def tracking_workdir(*a, **kw):
-            d = original_tmpdir(*a, **kw)
-            created_work.append(d.name)
-            return d
-
-        def tracking_configdir(*a, **kw):
-            d = original_tmpdir(*a, **kw)
-            created_config.append(d.name)
-            return d
-
-        with patch.object(tempfile, "TemporaryDirectory", tracking_workdir) as mock_work:
-            # We need to patch the inner call differently. Actually, run() uses
-            # two `with tempfile.TemporaryDirectory(...)` in sequence. Let's
-            # just verify the method exists and calls _run_in.
-            pass
-
-        # Simpler approach: verify that _run_in is called with a temp dir.
         with patch.object(agent, "_run_in") as mock_run:
             agent.run("test brief")
             assert mock_run.called
             args = mock_run.call_args
-            # Args: (brief, work_dir, config_dir)
             assert len(args[0]) == 3
             assert args[0][0] == "test brief"
             # Both work_dir and config_dir should start with a temp path.
@@ -424,14 +476,14 @@ class TestTempCwdLifecycle:
 
         with patch.object(subprocess, "run") as mock_run:
             mock_run.return_value = _fake_proc(
-                stdout="Analysis.\nVERDICT: ACCEPT"
+                stdout=_json_result(result="Analysis.\nVERDICT: ACCEPT-READY"),
             )
             agent.run("test brief")
 
             call_kwargs = mock_run.call_args[1]
             assert "cwd" in call_kwargs
             cwd = call_kwargs["cwd"]
-            # cwd should be a temp dir (starts with system temp path).
+            # cwd should be a temp dir.
             assert cwd.startswith(tempfile.gettempdir())
             assert "neo-work-" in cwd
 
@@ -491,13 +543,13 @@ class TestConfigMapping:
         assert agent.api_key == "sk-or-v1-test-key"
 
     def test_openrouter_model_mapped(self) -> None:
-        """openrouter_model from Config -> model in ClaudeAgent."""
+        """openrouter_model from Config -> model in ClaudeAgent (with [1m])."""
         cfg = Config()
         cfg.openrouter_model = "deepseek/deepseek-v4-flash"
         cfg.gh_token = GH_TOKEN
         cfg.claude_bin = CLAUDE_BIN
         agent = ClaudeAgent.from_config(cfg)
-        assert agent.model == "deepseek/deepseek-v4-flash"
+        assert agent.model == "deepseek/deepseek-v4-flash[1m]"
 
 
 # ===================================================================
@@ -509,7 +561,7 @@ class TestConfigValidation:
 
     def test_missing_required_raises(self) -> None:
         cfg = Config()
-        cfg.webhook_secret = ""  # ensure at least one missing
+        cfg.webhook_secret = ""
         with pytest.raises(RuntimeError, match="missing required env"):
             cfg.require()
 
@@ -519,5 +571,21 @@ class TestConfigValidation:
         cfg.openrouter_key = "sk-or-v1-test"
         cfg.database_url = "postgres://localhost/test"
         cfg.gh_token = "ghp_test"
-        # Should not raise.
         cfg.require()
+
+
+# ===================================================================
+# CANONICAL_VERDICTS constant
+# ===================================================================
+
+class TestCanonicalSet:
+    """The CANONICAL_VERDICTS constant contains exactly the 5 expected values."""
+
+    def test_exact_set(self) -> None:
+        assert CANONICAL_VERDICTS == {
+            "ACCEPT-MERGED",
+            "ACCEPT-READY",
+            "FIX-FORWARD",
+            "BOUNCE-BUILDER",
+            "ESCALATE",
+        }
