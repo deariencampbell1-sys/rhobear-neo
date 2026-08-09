@@ -8,9 +8,10 @@ the product boundary: Reviews only reads + posts a verdict; Neo **writes and mer
 1. Wakes on a **trusted reviewer's verdict** landing on a PR head SHA — GitHub `status` (Reviews uses
    the Statuses API) or `check_run: completed` (Checks-API reviewers like CodeAnt). It does NOT
    subscribe to `pull_request`, so it never races the reviewer.
-2. Runs the **Neo protocol** (`neo.md` canon): triage findings → **fix-forward** trivial issues (DeepSeek
-   Flash) → dispatch a **DeepSeek-Pro builder** for substantial bugs → **ESCALATE** owner-gated forks →
-   **merge on green** behind the per-install auto-merge toggle.
+2. Runs the **Neo protocol** (`neo.md` canon) in one agentic Claude Code CLI loop pinned to
+   OpenRouter `deepseek/deepseek-v4-flash` at maximum effort with at least 32K output headroom:
+   triage findings → **fix-forward** trivial issues → repair substantial bugs with tools →
+   **ESCALATE** owner-gated forks → **merge on green** behind the per-install auto-merge toggle.
 3. The loop **closes itself**: a fix-forward commit or a builder push is a new `pull_request` event →
    Reviews re-fires → Neo re-fires. Bounded retry (≤2 builder rounds) → escalate, never thrash.
 
@@ -18,9 +19,10 @@ the product boundary: Reviews only reads + posts a verdict; Neo **writes and mer
 - Stdlib HTTP webhook server on `127.0.0.1:8767`; Caddy fronts `https://neo.rhobear.ai/webhook`.
 - State in the shared VPS Postgres (`reviews_state`) — Neo-owned tables (`neo_actions`, `neo_installs`):
   loop guard (keyed PR+SHA), builder-round counter, per-install auto-merge toggle + credit balance.
-- Engine: DeepSeek via the Anthropic-compatible endpoint (Flash triage, Pro builder). **Priced at the
-  Gemini baseline + margin** (RHOBEAR credits model) — DeepSeek's lower cost is our margin. See
-  `~/.claude/plans/neo-pricing-model.md`.
+- Engine: Claude Code CLI with tool access, routed only through OpenRouter to
+  `deepseek/deepseek-v4-flash`; config validation rejects model, endpoint, effort, or output-budget
+  drift before the worker starts. **Priced at the Gemini baseline + margin** (RHOBEAR credits model)
+  — DeepSeek's lower cost is our margin. See `~/.claude/plans/neo-pricing-model.md`.
 
 ## Files
 - `src/config.py` — env-driven config (no secrets baked in).

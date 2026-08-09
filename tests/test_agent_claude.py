@@ -160,13 +160,11 @@ class TestCommandAssembly:
         assert "CLAUDE_CODE_BASE_URL" not in env
 
     def test_gh_token_omitted_when_empty(self) -> None:
-        """When gh_token is empty, GH_TOKEN is not *forced* — the host env
-        may still have it, but we don't override."""
-        agent = _make_agent(gh_token="")
-        env = agent._build_env("/tmp/neo-config-test")
-        # GH_TOKEN may be inherited from the host env; we just don't force it.
-        host_val = os.environ.get("GH_TOKEN", "")
-        assert env.get("GH_TOKEN", "") == host_val
+        """An empty configured token must not inherit a stale host token."""
+        with patch.dict(os.environ, {"GH_TOKEN": "stale-host-token"}):
+            agent = _make_agent(gh_token="")
+            env = agent._build_env("/tmp/neo-config-test")
+        assert "GH_TOKEN" not in env
 
     def test_model_normalised(self) -> None:
         """Model without [1m] suffix gets it appended.

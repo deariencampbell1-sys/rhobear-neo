@@ -205,7 +205,9 @@ class ClaudeAgent:
             "CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(self.max_tokens),
             "CLAUDE_CODE_OUTPUT_FORMAT": "json",
         }
-        # Propagate GH_TOKEN for the agent's gh/git operations.
+        # Use only the configured GitHub credential. A stale host token must
+        # never leak into Neo when its explicit token is absent.
+        env.pop("GH_TOKEN", None)
         if self.gh_token:
             env["GH_TOKEN"] = self.gh_token
         # Remove conflicting env vars that might point at a different provider.
