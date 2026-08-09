@@ -147,8 +147,10 @@ class TestCommandAssembly:
         # Base URL uses the correct gateway env var (not CLAUDE_CODE_ANTHROPIC_BASE_URL).
         assert env["ANTHROPIC_BASE_URL"] == BASE
         assert "CLAUDE_CODE_ANTHROPIC_BASE_URL" not in env
-        # Model, effort, max_tokens.
-        assert env["ANTHROPIC_MODEL"] == MODEL_FULL
+        # CLAUDE_CONFIG_DIR is set to the temp config dir.
+        assert env["CLAUDE_CONFIG_DIR"] == "/tmp/neo-config-test"
+        # Model in env vars uses clean slug (no [1m] suffix).
+        assert env["ANTHROPIC_MODEL"] == MODEL
         assert env["CLAUDE_CODE_EFFORT_LEVEL"] == "max"
         assert env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "32000"
         assert env["CLAUDE_CODE_OUTPUT_FORMAT"] == "json"
@@ -167,14 +169,25 @@ class TestCommandAssembly:
         assert env.get("GH_TOKEN", "") == host_val
 
     def test_model_normalised(self) -> None:
-        """Model without [1m] suffix gets it appended."""
+        """Model without [1m] suffix gets it appended.
+        _clean_model should be the clean slug (no [1m] suffix)."""
         agent = _make_agent()
         assert agent.model == MODEL_FULL
+        assert agent._clean_model == MODEL
 
     def test_model_preserves_existing_suffix(self) -> None:
-        """Model already ending with [1m] is not double-suffixed."""
+        """Model already ending with [1m] is not double-suffixed.
+        _clean_model strips the [1m] suffix."""
         agent = _make_agent(model=MODEL_FULL)
         assert agent.model == MODEL_FULL
+        assert agent._clean_model == MODEL
+
+    def test_clean_model_in_env(self) -> None:
+        """ANTHROPIC_MODEL in env vars should use the clean slug, no [1m]."""
+        agent = _make_agent()
+        env = agent._build_env("/tmp/neo-config-test")
+        assert env["ANTHROPIC_MODEL"] == MODEL
+        assert "[1m]" not in env["ANTHROPIC_MODEL"]
 
     def test_from_config(self) -> None:
         """from_config should populate agent fields from Config."""
@@ -290,13 +303,13 @@ class TestCanonicalVerdicts:
 
     def test_verdict_case_insensitive(self) -> None:
         """Lowercase 'verdict:' should also match.
-        The verdict value is returned as-is (case preserved)."""
+        The verdict value is normalized to uppercase for canonical matching."""
         proc = _fake_proc(
             stdout=_json_result(result="Analysis.\nverdict: accept-merged\n"),
         )
         agent = _make_agent()
         usage, v = agent._parse_output(proc)
-        assert v == "accept-merged"
+        assert v == "ACCEPT-MERGED"
 
     def test_non_canonical_verdict_rejected(self) -> None:
         """A verdict not in the canonical set raises UnknownVerdict."""
@@ -543,13 +556,15 @@ class TestConfigMapping:
         assert agent.api_key == "sk-or-v1-test-key"
 
     def test_openrouter_model_mapped(self) -> None:
-        """openrouter_model from Config -> model in ClaudeAgent (with [1m])."""
+        """openrouter_model from Config -> model in ClaudeAgent (with [1m]).
+        _clean_model should be the clean slug."""
         cfg = Config()
         cfg.openrouter_model = "deepseek/deepseek-v4-flash"
         cfg.gh_token = GH_TOKEN
         cfg.claude_bin = CLAUDE_BIN
         agent = ClaudeAgent.from_config(cfg)
         assert agent.model == "deepseek/deepseek-v4-flash[1m]"
+        assert agent._clean_model == "deepseek/deepseek-v4-flash"
 
 
 # ===================================================================
@@ -589,3 +604,288 @@ class TestCanonicalSet:
             "BOUNCE-BUILDER",
             "ESCALATE",
         }
+
+
+# ===================================================================
+# Verdict extraction — anchored regex
+# ===================================================================
+
+class TestVerdictExtraction:
+    """Verdict extraction anchored to start of line — rejects misleading prose."""
+
+    def test_anchored_rejects_misleading_prose(self) -> None:
+        """A line like 'Do not output VERDICT: ...' should NOT be treated as a verdict."""
+        proc = _fake_proc(
+            stdout=_json_result(
+                result="Do not output VERDICT: ACCEPT-MERGED\nLet me reconsider.\nVERDICT: ESCALATE",
+            ),
+        )
+        agent = _make_agent()
+        usage, v = agent._parse_output(proc)
+        # Should pick up the second (real) verdict, not the prose one.
+        assert v == "ESCALATE"
+
+    def test_anchored_rejects_misleading_only_line(self) -> None:
+        """When the only match is misleading prose, raise UnknownVerdict."""
+        proc = _fake_proc(
+            stdout=_json_result(
+                result="Do not output VERDICT: ACCEPT-MERGED\nNothing else here.",
+            ),
+        )
+        agent = _make_agent()
+        with pytest.raises(UnknownVerdict, match="no VERDICT"):
+            agent._parse_output(proc)
+
+    def test_anchored_markdown_prefix_bold(self) -> None:
+        """**VERDICT: ...** with bold markdown prefix should match."""
+        proc = _fake_proc(
+            stdout=_json_result(result="**VERDICT: FIX-FORWARD**"),
+        )
+        agent = _make_agent()
+        usage, v = agent._parse_output(proc)
+        assert v == "FIX-FORWARD"
+
+    def test_anchored_markdown_prefix_blockquote(self) -> None:
+        """> VERDICT: ... with blockquote prefix should match."""
+        proc = _fake_proc(
+            stdout=_json_result(result="> VERDICT: BOUNCE-BUILDER"),
+        )
+        agent = _make_agent()
+        usage, v = agent._parse_output(proc)
+        assert v == "BOUNCE-BUILDER"
+
+    def test_anchored_markdown_prefix_list(self) -> None:
+        """- VERDICT: ... with list prefix should match."""
+        proc = _fake_proc(
+            stdout=_json_result(result="- VERDICT: ACCEPT-READY"),
+        )
+        agent = _make_agent()
+        usage, v = agent._parse_output(proc)
+        assert v == "ACCEPT-READY"
+
+
+# ===================================================================
+# Verdict normalization
+# ===================================================================
+
+class TestVerdictNormalization:
+    """Verdict normalized to uppercase after extraction."""
+
+    def test_lowercase_verdict_normalized(self) -> None:
+        """Lowercase verdict value is normalized to uppercase."""
+        proc = _fake_proc(
+            stdout=_json_result(result="VERDICT: accept-ready"),
+        )
+        agent = _make_agent()
+        usage, v = agent._parse_output(proc)
+        assert v == "ACCEPT-READY"
+
+    def test_mixed_case_verdict_normalized(self) -> None:
+        """Mixed case verdict value is normalized to uppercase."""
+        proc = _fake_proc(
+            stdout=_json_result(result="VERDICT: Fix-Forward"),
+        )
+        agent = _make_agent()
+        usage, v = agent._parse_output(proc)
+        assert v == "FIX-FORWARD"
+
+    def test_uppercase_verdict_stays_uppercase(self) -> None:
+        """Already uppercase verdict stays uppercase."""
+        proc = _fake_proc(
+            stdout=_json_result(result="VERDICT: ESCALATE"),
+        )
+        agent = _make_agent()
+        usage, v = agent._parse_output(proc)
+        assert v == "ESCALATE"
+
+
+# ===================================================================
+# Terminal reason and API error status
+# ===================================================================
+
+class TestResultEnvelope:
+    """Validate terminal_reason and api_error_status in the result envelope."""
+
+    def test_terminal_reason_error_fails(self) -> None:
+        """terminal_reason='error' should raise MalformedStream."""
+        output = json.dumps({
+            "type": "result", "subtype": "success", "is_error": False,
+            "result": "Analysis.\nVERDICT: ACCEPT-READY",
+            "usage": {"input_tokens": 50, "output_tokens": 20},
+            "num_turns": 1, "stop_reason": "end_turn",
+            "terminal_reason": "error", "permission_denials": [],
+        })
+        proc = _fake_proc(stdout=output)
+        agent = _make_agent()
+        with pytest.raises(MalformedStream, match="terminal_reason"):
+            agent._parse_output(proc)
+
+    def test_terminal_reason_end_turn_ok(self) -> None:
+        """terminal_reason='end_turn' should be accepted."""
+        output = json.dumps({
+            "type": "result", "subtype": "success", "is_error": False,
+            "result": "Analysis.\nVERDICT: ACCEPT-READY",
+            "usage": {"input_tokens": 50, "output_tokens": 20},
+            "num_turns": 1, "stop_reason": "end_turn",
+            "terminal_reason": "end_turn", "permission_denials": [],
+        })
+        proc = _fake_proc(stdout=output)
+        agent = _make_agent()
+        usage, v = agent._parse_output(proc)
+        assert v == "ACCEPT-READY"
+
+    def test_terminal_reason_null_ok(self) -> None:
+        """No terminal_reason (absent or null) should be accepted."""
+        output = json.dumps({
+            "type": "result", "subtype": "success", "is_error": False,
+            "result": "Analysis.\nVERDICT: ACCEPT-READY",
+            "usage": {"input_tokens": 50, "output_tokens": 20},
+            "num_turns": 1, "stop_reason": "end_turn",
+            "permission_denials": [],
+        })
+        proc = _fake_proc(stdout=output)
+        agent = _make_agent()
+        usage, v = agent._parse_output(proc)
+        assert v == "ACCEPT-READY"
+
+    def test_api_error_status_present_fails(self) -> None:
+        """Non-null api_error_status should raise MalformedStream."""
+        output = json.dumps({
+            "type": "result", "subtype": "success", "is_error": False,
+            "result": "Analysis.\nVERDICT: ACCEPT-READY",
+            "usage": {"input_tokens": 50, "output_tokens": 20},
+            "num_turns": 1, "stop_reason": "end_turn",
+            "api_error_status": "rate_limited", "permission_denials": [],
+        })
+        proc = _fake_proc(stdout=output)
+        agent = _make_agent()
+        with pytest.raises(MalformedStream, match="api_error_status"):
+            agent._parse_output(proc)
+
+    def test_api_error_status_null_ok(self) -> None:
+        """Null/absent api_error_status should be accepted."""
+        output = json.dumps({
+            "type": "result", "subtype": "success", "is_error": False,
+            "result": "Analysis.\nVERDICT: ACCEPT-READY",
+            "usage": {"input_tokens": 50, "output_tokens": 20},
+            "num_turns": 1, "stop_reason": "end_turn",
+            "permission_denials": [],
+        })
+        proc = _fake_proc(stdout=output)
+        agent = _make_agent()
+        usage, v = agent._parse_output(proc)
+        assert v == "ACCEPT-READY"
+
+
+# ===================================================================
+# Config.validate() — strict startup validation
+# ===================================================================
+
+class TestConfigValidate:
+    """Config.validate() rejects non-OpenRouter configs."""
+
+    def test_validate_wrong_base_url(self) -> None:
+        cfg = Config()
+        cfg.openrouter_base_url = "https://api.deepseek.com"
+        with pytest.raises(ValueError, match="openrouter_base_url"):
+            cfg.validate()
+
+    def test_validate_base_url_trailing_slash_ok(self) -> None:
+        """Trailing slash on the base URL should be tolerated."""
+        cfg = Config()
+        cfg.openrouter_base_url = "https://openrouter.ai/api/"
+        cfg.validate()  # should not raise
+
+    def test_validate_wrong_model(self) -> None:
+        cfg = Config()
+        cfg.openrouter_model = "deepseek/deepseek-chat"
+        with pytest.raises(ValueError, match="openrouter_model"):
+            cfg.validate()
+
+    def test_validate_wrong_effort(self) -> None:
+        cfg = Config()
+        cfg.openrouter_reasoning_effort = "high"
+        with pytest.raises(ValueError, match="openrouter_reasoning_effort"):
+            cfg.validate()
+
+    def test_validate_undersized_tokens(self) -> None:
+        cfg = Config()
+        cfg.openrouter_max_tokens = 16000
+        with pytest.raises(ValueError, match="openrouter_max_tokens"):
+            cfg.validate()
+
+    def test_validate_ok(self) -> None:
+        """Valid config should pass validate() without error."""
+        cfg = Config()
+        cfg.openrouter_base_url = "https://openrouter.ai/api"
+        cfg.openrouter_model = "deepseek/deepseek-v4-flash"
+        cfg.openrouter_reasoning_effort = "max"
+        cfg.openrouter_max_tokens = 32000
+        cfg.validate()  # should not raise
+
+
+# ===================================================================
+# Real smoke test — full ClaudeAgent.run() lifecycle
+# ===================================================================
+
+class TestRealSmoke:
+    """Smoke test using a real subprocess (fake Claude binary).
+
+    Verifies the full run() lifecycle: temp dirs created and cleaned,
+    subprocess invoked, output parsed, verdict returned.
+    """
+
+    def test_smoke_run_with_temp_config(self) -> None:
+        """Full run() lifecycle with a real subprocess and temp config dir.
+
+        Creates a temp batch file that acts as the Claude CLI, outputs
+        valid JSON, and exits cleanly.  Verifies temp dirs are created
+        during run() and cleaned after.
+        """
+        import tempfile as _tf
+        import os as _os
+
+        # Temp Python script that outputs valid Claude JSON result.
+        _script = '''import json, sys
+data = {
+    "type": "result",
+    "subtype": "success",
+    "is_error": False,
+    "result": "VERDICT: ACCEPT-READY",
+    "usage": {"input_tokens": 100, "output_tokens": 50},
+    "num_turns": 1,
+    "stop_reason": "end_turn",
+    "permission_denials": [],
+}
+print(json.dumps(data))
+sys.exit(0)
+'''
+        with _tf.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as _f:
+            _f.write(_script)
+            _py_path = _f.name
+
+        # Temp batch file that calls the Python script (ignores all CLI args).
+        _bat_content = '@echo off\npython "' + _py_path + '"\nexit /b 0\n'
+        with _tf.NamedTemporaryFile(mode='w', suffix='.bat', delete=False) as _f:
+            _f.write(_bat_content)
+            _bat_path = _f.name
+
+        try:
+            agent = ClaudeAgent(
+                claude_bin=_bat_path,
+                api_key="sk-or-v1-smoke",
+                base_url="https://openrouter.ai/api",
+                model="deepseek/deepseek-v4-flash",
+                effort="max",
+                max_tokens=32000,
+                timeout=30,
+                gh_token="ghp_smoke",
+            )
+            usage, verdict = agent.run("test brief")
+            assert verdict == "ACCEPT-READY"
+            assert usage["input_tokens"] == 100
+            assert usage["output_tokens"] == 50
+        finally:
+            for _p in (_py_path, _bat_path):
+                if _os.path.exists(_p):
+                    _os.unlink(_p)

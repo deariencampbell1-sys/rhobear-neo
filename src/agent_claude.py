@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -37,6 +38,14 @@ CANONICAL_VERDICTS = frozenset({
     "BOUNCE-BUILDER",
     "ESCALATE",
 })
+
+# Verdict extraction regex: anchored to start of line (after optional markdown
+# prefix like **, *, >, -) followed by VERDICT: and the value.  This prevents
+# prose like "Do not output VERDICT: ..." from matching.
+_VERDICT_RE = re.compile(
+    r'^\s*(?:[*]{1,2}|>`?\s*|-\s+)?VERDICT:\s*(.*?)(?:\s*[*`]+)?\s*$',
+    re.IGNORECASE,
+)
 
 
 class AgentError(Exception):
@@ -92,8 +101,10 @@ class ClaudeAgent:
         self.claude_bin = claude_bin
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
-        # Ensure model has the [1m] context suffix required by OpenRouter.
-        self.model = model if model.endswith("[1m]") else f"{model}[1m]"
+        # Clean model name (no CLI context suffix) — used for env vars.
+        self._clean_model = model.replace("[1m]", "")
+        # Model with [1m] context suffix required by OpenRouter for CLI args.
+        self.model = f"{self._clean_model}[1m]"
         self.effort = effort
         self.max_tokens = max_tokens
         self.timeout = timeout
@@ -185,10 +196,11 @@ class ClaudeAgent:
         """
         env = {
             **os.environ,
+            "CLAUDE_CONFIG_DIR": config_dir,
             "ANTHROPIC_BASE_URL": self.base_url,
             "ANTHROPIC_API_KEY": self.api_key,
             "ANTHROPIC_AUTH_TOKEN": self.api_key,
-            "ANTHROPIC_MODEL": self.model,
+            "ANTHROPIC_MODEL": self._clean_model,
             "CLAUDE_CODE_EFFORT_LEVEL": self.effort,
             "CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(self.max_tokens),
             "CLAUDE_CODE_OUTPUT_FORMAT": "json",
@@ -293,6 +305,22 @@ class ClaudeAgent:
                 f"non-terminal stop_reason: {stop_reason!r}"
             )
 
+        # --- Terminal reason (from the API envelope, not stop_reason) ---
+        terminal_reason = result.get("terminal_reason") or ""
+        if terminal_reason:
+            acceptable_terminal = {"stop", "end_turn"}
+            if terminal_reason not in acceptable_terminal:
+                raise MalformedStream(
+                    f"non-terminal terminal_reason: {terminal_reason!r}"
+                )
+
+        # --- API error status (fail-closed on any non-null status) ---
+        api_error_status = result.get("api_error_status")
+        if api_error_status is not None and api_error_status != "":
+            raise MalformedStream(
+                f"api_error_status present: {api_error_status}"
+            )
+
         # --- At least one turn taken ---
         num_turns = result.get("num_turns", 0) or 0
         if num_turns < 1:
@@ -326,8 +354,11 @@ class ClaudeAgent:
             log.warning("no VERDICT line in result: %.500s", result_text)
             raise UnknownVerdict("no VERDICT: line in claude output")
 
+        # Normalize to canonical uppercase for consistent phase mapping.
+        verdict = verdict.upper()
+
         # --- Validate verdict against canonical set ---
-        if verdict.upper() not in CANONICAL_VERDICTS:
+        if verdict not in CANONICAL_VERDICTS:
             log.warning("non-canonical verdict: %r", verdict)
             raise UnknownVerdict(f"non-canonical verdict: {verdict}")
 
@@ -337,21 +368,20 @@ class ClaudeAgent:
     def _extract_verdict(text: str) -> str:
         """Extract the VERDICT: line from the agent's output.
 
-        Returns the verdict value (with markdown stripped) or empty string
-        if no VERDICT: line is found.
+        Only matches VERDICT: at the start of a line (after optional markdown
+        prefix like **, *, >, -).  This prevents prose like "Do not output
+        VERDICT: ..." from being mistaken for the final verdict.
+
+        Returns the verdict value (with enclosing markdown stripped) or empty
+        string if no VERDICT: line is found.
         """
         for line in text.splitlines():
-            stripped = line.strip()
-            # Case-insensitive match for "VERDICT:".
-            upper = stripped.upper()
-            idx = upper.find("VERDICT:")
-            if idx < 0:
-                continue
-            after = stripped[idx + 8:]  # after "VERDICT:"
-            verdict = after.strip()
-            # Strip markdown formatting the model sometimes wraps around the
-            # verdict value.
-            verdict = verdict.replace("*", "").replace("`", "").strip()
-            if verdict:
-                return verdict
+            m = _VERDICT_RE.match(line)
+            if m:
+                value = m.group(1).strip()
+                # Strip enclosing markdown the model sometimes wraps around
+                # the verdict value (e.g., **ACCEPT-MERGED** or `BOUNCE-BUILDER`).
+                value = value.replace("*", "").replace("`", "").strip()
+                if value:
+                    return value
         return ""

@@ -12,6 +12,7 @@ work directory, and full tool access (gh, git, edit, test).
 from __future__ import annotations
 
 import os
+import shutil
 from dataclasses import dataclass, field
 
 
@@ -109,6 +110,51 @@ class Config:
         }.items() if not v]
         if missing:
             raise RuntimeError(f"rhobear-neo missing required env: {', '.join(missing)}")
+        return self
+
+    def validate(self) -> "Config":
+        """Strict startup validation — reject non-OpenRouter config.
+
+        Verifies:
+          - base_url exactly https://openrouter.ai/api (trailing slash tolerant)
+          - model exactly deepseek/deepseek-v4-flash
+          - effort exactly max
+          - max_tokens >= 32000
+          - claude_bin exists/executable (where practical)
+
+        Raises ValueError (safe to log — no secrets) on any violation.
+        """
+        base = self.openrouter_base_url.rstrip("/")
+        if base != "https://openrouter.ai/api":
+            raise ValueError(
+                f"openrouter_base_url must be https://openrouter.ai/api, "
+                f"got {self.openrouter_base_url!r}"
+            )
+        if self.openrouter_model.strip() != "deepseek/deepseek-v4-flash":
+            raise ValueError(
+                f"openrouter_model must be 'deepseek/deepseek-v4-flash', "
+                f"got {self.openrouter_model!r}"
+            )
+        if self.openrouter_reasoning_effort.strip().lower() != "max":
+            raise ValueError(
+                f"openrouter_reasoning_effort must be 'max', "
+                f"got {self.openrouter_reasoning_effort!r}"
+            )
+        if self.openrouter_max_tokens < 32000:
+            raise ValueError(
+                f"openrouter_max_tokens must be >= 32000, "
+                f"got {self.openrouter_max_tokens}"
+            )
+        # Check claude binary exists where practical (skip on Windows — it's a
+        # remote VPS path like /usr/bin/claude).
+        if self.claude_bin and os.name != "nt":
+            resolved = shutil.which(self.claude_bin)
+            if resolved is None:
+                # Fallback: check exact path if not in PATH.
+                if not os.path.isfile(self.claude_bin):
+                    raise ValueError(
+                        f"claude_bin not found: {self.claude_bin}"
+                    )
         return self
 
 
