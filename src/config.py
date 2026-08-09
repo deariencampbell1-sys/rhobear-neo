@@ -63,9 +63,29 @@ class Config:
         )
     )
 
-    # --- engine (DeepSeek via the Anthropic-compatible endpoint) ---
-    # Flash = fast triage/review; Pro = the heavy builder. Priced at Gemini
-    # baseline downstream; DeepSeek is the cheap real engine.
+    # --- engine: OpenRouter (direct HTTP, no Pi CLI) ---
+    # OpenRouter routes to the best provider for the model. Reason:
+    # a) consistent API, b) reasoning_effort parameter, c) fail-closed
+    # on provider errors. The old Pi/direct-DeepSeek path is dead — see
+    # the wave0-neo migration.
+    openrouter_base_url: str = field(default_factory=lambda: _get(
+        "NEO_OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"))
+    openrouter_key: str = field(default_factory=lambda: _get("NEO_OPENROUTER_API_KEY"))
+    openrouter_model: str = field(default_factory=lambda: _get(
+        "NEO_OPENROUTER_MODEL", "deepseek/deepseek-v4-flash"))
+    # Reasoning effort: probed at startup — max accepted → max, else high.
+    openrouter_reasoning_effort: str = field(default_factory=lambda: _get(
+        "NEO_REASONING_EFFORT", "max"))
+    openrouter_max_tokens: int = field(default_factory=lambda: _get_int(
+        "NEO_MAX_TOKENS", 8192))
+    openrouter_timeout: int = field(default_factory=lambda: _get_int(
+        "NEO_TIMEOUT", 300))
+    openrouter_max_retries: int = field(default_factory=lambda: _get_int(
+        "NEO_MAX_RETRIES", 3))
+
+    # Old DeepSeek/Pi path (kept during migration, remove after verifying
+    # OpenRouter works in production). These are NOT required defaults;
+    # they exist only to avoid breaking old .env files during rollout.
     deepseek_base_url: str = field(default_factory=lambda: _get(
         "NEO_ANTHROPIC_BASE_URL", "https://api.deepseek.com/anthropic"))
     deepseek_key: str = field(default_factory=lambda: _get("NEO_DEEPSEEK_API_KEY"))
@@ -89,6 +109,7 @@ class Config:
     def require(self) -> "Config":
         missing = [n for n, v in {
             "RHOBEAR_NEO_WEBHOOK_SECRET": self.webhook_secret,
+            "NEO_OPENROUTER_API_KEY": self.openrouter_key,
             "DATABASE_URL": self.database_url,
             "GH_TOKEN": self.gh_token,
         }.items() if not v]
