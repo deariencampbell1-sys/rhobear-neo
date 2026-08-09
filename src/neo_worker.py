@@ -4,10 +4,10 @@ Flow per wake ({repo, sha, green, context[, pr_number]}):
   1. Resolve PR number from the head SHA (if not supplied).
   2. Loop/thrash guard: skip if we already acted on this SHA; read builder rounds.
   3. Entitlement/credits gate (per-install balance) — Neo actions only for a paid install.
-  4. Build the Neo brief (neo_protocol) and run it headless on OpenRouter
-     (deepseek/deepseek-v4-flash at max reasoning effort).  The brief itself
-     dispatches a builder when a substantial fix is needed; the OpenRouter
-     client handles retries, timeouts, and fail-closed verdict extraction.
+  4. Build the Neo brief (neo_protocol) and run it headless via Claude Code CLI
+     (deepseek/deepseek-v4-flash at max reasoning effort, isolated config + temp
+     workdir).  The brief itself dispatches a builder when a substantial fix is
+     needed; the Claude Code agent handles gh, git, edit, and test runner tools.
   5. Record the action + credits (Gemini-baseline cost via the shared pricing) in state.
 
 The heavy lifting (read findings, fix-forward, dispatch builder, merge) is done by the
@@ -23,7 +23,7 @@ import subprocess
 
 from .config import Config
 from .neo_state import NeoState
-from .openrouter_client import OpenRouterClient, OpenRouterError
+from .agent_claude import ClaudeAgent, AgentError
 from . import neo_protocol
 
 log = logging.getLogger("rhobear_neo.worker")
@@ -100,15 +100,15 @@ def run_neo(cfg: Config, state: NeoState, wake: dict) -> None:
     state.record(repo, pr, sha, "triage", detail={"context": wake.get("context"),
                                                    "green": wake.get("green")})
 
-    # --- run the Neo protocol headless on OpenRouter -------------------------
+    # --- run the Neo protocol headless via Claude Code CLI --------------------
     brief = neo_protocol.build_brief(
         repo=repo, pr=pr, head_sha=sha,
         reviewer_context=wake.get("context", "?"), reviewer_green=bool(wake.get("green")),
         auto_merge=auto_merge, builder_round=rounds,
-        max_builder_rounds=cfg.max_builder_rounds, builder_model=cfg.model_builder,
+        max_builder_rounds=cfg.max_builder_rounds, builder_model=cfg.openrouter_model,
     )
-    client = OpenRouterClient.from_config(cfg)
-    usage, verdict = _run_agent(client, brief)
+    agent = ClaudeAgent.from_config(cfg)
+    usage, verdict = _run_agent(agent, brief)
     is_builder = verdict.startswith("BOUNCE-BUILDER")
     credits = credits_for(usage, builder=is_builder)
     phase = {
@@ -123,22 +123,18 @@ def run_neo(cfg: Config, state: NeoState, wake: dict) -> None:
              repo, pr, sha[:8], verdict or "?", credits, auto_merge, rounds)
 
 
-def _run_agent(client: OpenRouterClient, brief: str) -> tuple[dict, str]:
-    """Run the Neo brief headless on **OpenRouter** (deepseek/deepseek-v4-flash).
+def _run_agent(agent: ClaudeAgent, brief: str) -> tuple[dict, str]:
+    """Run the Neo brief headless via Claude Code CLI.
 
-    Direct HTTP API call — no CLI subprocess, no Pi, no work directory.
-    The OpenRouter client handles:
-      - reasoning effort (max / high, probed at startup)
-      - content + reasoning_content parsing
-      - retries with exponential backoff
-      - timeout / truncation / empty-response detection
-      - fail-closed: empty verdict on any error
+    Claude Code runs with isolated config dir + per-run temp workdir, giving
+    the agent full tool access (gh, git, edit, test runner).  OpenRouter
+    provides the Anthropic-compatible backend.
 
-    Returns (normalized usage, verdict line).  On any error both are empty
+    Returns (normalised usage, verdict line).  On any error both are empty
     so the caller skips merge and escalates."""
     try:
-        usage, verdict = client.chat(brief)
+        usage, verdict = agent.run(brief)
         return usage, verdict
-    except OpenRouterError:
-        log.exception("neo openrouter run failed")
+    except AgentError:
+        log.exception("neo claude agent run failed")
         return {}, ""
