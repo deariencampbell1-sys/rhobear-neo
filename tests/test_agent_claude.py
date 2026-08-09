@@ -396,6 +396,35 @@ class TestErrorPaths:
         with pytest.raises(MissingResult, match="no stdout"):
             agent._parse_output(proc)
 
+    def test_empty_stdout_logs_safe_metadata_not_secret(self) -> None:
+        """Empty stdout with stderr containing a secret must log only safe metadata,
+        never the raw stderr content."""
+        import logging
+        from io import StringIO
+
+        secret = "sk-or-v1-secret-key-1234567890abcdef"
+        proc = _fake_proc(stdout="", stderr=f"Error: {secret}\nTraceback ...")
+        agent = _make_agent()
+
+        # Capture log output at WARNING level.
+        buf = StringIO()
+        handler = logging.StreamHandler(buf)
+        handler.setLevel(logging.WARNING)
+        logger = logging.getLogger("rhobear_neo.agent")
+        logger.addHandler(handler)
+        try:
+            with pytest.raises(MissingResult, match="no stdout"):
+                agent._parse_output(proc)
+        finally:
+            logger.removeHandler(handler)
+
+        log_text = buf.getvalue()
+        # The raw stderr (including the planted secret) must NOT appear in logs.
+        assert secret not in log_text, "secret leaked into log output"
+        # Safe metadata should be present: exit code and stderr length.
+        assert "exit=" in log_text, "exit code not in log"
+        assert "stderr_len=" in log_text, "stderr length not in log"
+
     def test_malformed_json_raises(self) -> None:
         """Non-JSON stdout should raise MalformedStream."""
         proc = _fake_proc(stdout="not json at all")
@@ -698,6 +727,78 @@ class TestVerdictNormalization:
 
 
 # ===================================================================
+# Trailing punctuation tolerance
+# ===================================================================
+
+class TestVerdictTrailingPunctuation:
+    """Verdict values with trailing sentence punctuation must still match
+    the canonical set.  Hyphens inside ACCEPT-READY, BOUNCE-BUILDER, etc.
+    must be preserved."""
+
+    @pytest.mark.parametrize("trailing", [".", ",", ";", ":", "!", "?"])
+    def test_trailing_punctuation_stripped(self, trailing: str) -> None:
+        """A verdict followed by trailing punctuation must parse correctly."""
+        proc = _fake_proc(
+            stdout=_json_result(
+                result=f"Analysis.\nVERDICT: ACCEPT-MERGED{trailing}\n",
+            ),
+        )
+        agent = _make_agent()
+        usage, v = agent._parse_output(proc)
+        assert v == "ACCEPT-MERGED"
+
+    @pytest.mark.parametrize("verdict", ["ACCEPT-READY", "FIX-FORWARD", "BOUNCE-BUILDER", "ESCALATE"])
+    def test_all_verdicts_with_trailing_period(self, verdict: str) -> None:
+        """All canonical verdicts with trailing period must parse correctly."""
+        proc = _fake_proc(
+            stdout=_json_result(result=f"Analysis.\nVERDICT: {verdict}.\n"),
+        )
+        agent = _make_agent()
+        usage, v = agent._parse_output(proc)
+        assert v == verdict
+
+    def test_hyphens_preserved_inside_verdict(self) -> None:
+        """Hyphens in ACCEPT-READY must not be stripped by punctuation removal."""
+        proc = _fake_proc(
+            stdout=_json_result(result="Analysis.\nVERDICT: ACCEPT-READY.\n"),
+        )
+        agent = _make_agent()
+        usage, v = agent._parse_output(proc)
+        assert v == "ACCEPT-READY"
+        # Verify hyphens are intact.
+        assert "-" in v
+
+    def test_multiple_trailing_punctuation_stripped(self) -> None:
+        """Multiple trailing punctuation marks (e.g. '!!') must be stripped."""
+        proc = _fake_proc(
+            stdout=_json_result(result="Analysis.\nVERDICT: ACCEPT-READY!!\n"),
+        )
+        agent = _make_agent()
+        usage, v = agent._parse_output(proc)
+        assert v == "ACCEPT-READY"
+
+    def test_non_canonical_still_rejected(self) -> None:
+        """A non-canonical value like 'APPROVE' must still be rejected
+        even after punctuation stripping."""
+        proc = _fake_proc(
+            stdout=_json_result(result="Analysis.\nVERDICT: APPROVE.\n"),
+        )
+        agent = _make_agent()
+        with pytest.raises(UnknownVerdict, match="non-canonical verdict"):
+            agent._parse_output(proc)
+
+    def test_punctuation_only_still_rejected(self) -> None:
+        """A verdict value that is only punctuation after stripping
+        (e.g. 'VERDICT: .') should not match and raise UnknownVerdict."""
+        proc = _fake_proc(
+            stdout=_json_result(result="Analysis.\nVERDICT: .\n"),
+        )
+        agent = _make_agent()
+        with pytest.raises(UnknownVerdict, match="non-canonical verdict"):
+            agent._parse_output(proc)
+
+
+# ===================================================================
 # Terminal reason and API error status
 # ===================================================================
 
@@ -820,6 +921,125 @@ class TestConfigValidate:
         cfg.openrouter_reasoning_effort = "max"
         cfg.openrouter_max_tokens = 32000
         cfg.validate()  # should not raise
+
+    def test_validate_missing_claude_bin_posix(self) -> None:
+        """On POSIX, a missing claude_bin must raise ValueError.
+
+        Uses mocking to safely test the POSIX branch without affecting
+        Windows development."""
+        cfg = Config()
+        cfg.openrouter_base_url = "https://openrouter.ai/api"
+        cfg.openrouter_model = "deepseek/deepseek-v4-flash"
+        cfg.openrouter_reasoning_effort = "max"
+        cfg.openrouter_max_tokens = 32000
+        cfg.claude_bin = "/usr/bin/claude"
+
+        with patch("src.config.os.name", "posix"), \
+             patch("src.config.shutil.which", return_value=None), \
+             patch("src.config.os.path.isfile", return_value=False):
+            with pytest.raises(ValueError, match="claude_bin not found"):
+                cfg.validate()
+
+    def test_validate_claude_bin_ok_on_windows(self) -> None:
+        """On Windows, claude_bin validation is skipped (the binary is on
+        the remote VPS, not the local dev box)."""
+        cfg = Config()
+        cfg.openrouter_base_url = "https://openrouter.ai/api"
+        cfg.openrouter_model = "deepseek/deepseek-v4-flash"
+        cfg.openrouter_reasoning_effort = "max"
+        cfg.openrouter_max_tokens = 32000
+        cfg.claude_bin = "/usr/bin/claude"
+
+        with patch("src.config.os.name", "nt"):
+            cfg.validate()  # should not raise despite missing binary
+
+    def test_validate_claude_bin_found_in_path(self) -> None:
+        """When claude_bin resolves via shutil.which on POSIX, validation
+        should pass."""
+        cfg = Config()
+        cfg.openrouter_base_url = "https://openrouter.ai/api"
+        cfg.openrouter_model = "deepseek/deepseek-v4-flash"
+        cfg.openrouter_reasoning_effort = "max"
+        cfg.openrouter_max_tokens = 32000
+        cfg.claude_bin = "claude"
+
+        with patch("src.config.os.name", "posix"), \
+             patch("src.config.shutil.which", return_value="/usr/local/bin/claude"):
+            cfg.validate()  # should not raise
+
+    def test_validate_claude_bin_found_exact_path(self) -> None:
+        """When shutil.which returns None but the exact path exists,
+        validation should pass."""
+        cfg = Config()
+        cfg.openrouter_base_url = "https://openrouter.ai/api"
+        cfg.openrouter_model = "deepseek/deepseek-v4-flash"
+        cfg.openrouter_reasoning_effort = "max"
+        cfg.openrouter_max_tokens = 32000
+        cfg.claude_bin = "/usr/bin/claude"
+
+        with patch("src.config.os.name", "posix"), \
+             patch("src.config.shutil.which", return_value=None), \
+             patch("src.config.os.path.isfile", return_value=True):
+            cfg.validate()  # should not raise
+
+
+# ===================================================================
+# Startup validation — Config.validate() must fire before side effects
+# ===================================================================
+
+class TestStartupValidation:
+    """Startup with invalid config must raise before any side effect
+    (state connection, server start)."""
+
+    def _make_invalid_cfg(self, **overrides: Any) -> Config:
+        cfg = Config()
+        cfg.webhook_secret = "whs_test"
+        cfg.openrouter_key = "sk-or-v1-test"
+        cfg.database_url = "postgres://localhost/test"
+        cfg.gh_token = "ghp_test"
+        cfg.openrouter_base_url = "https://openrouter.ai/api"
+        cfg.openrouter_model = "deepseek/deepseek-v4-flash"
+        cfg.openrouter_reasoning_effort = "max"
+        cfg.openrouter_max_tokens = 32000
+        for k, v in overrides.items():
+            setattr(cfg, k, v)
+        return cfg
+
+    def test_startup_wrong_base_url_raises(self) -> None:
+        """Invalid base_url in startup must raise ValueError before any
+        side effect — NeoState/serve never reached."""
+        cfg = self._make_invalid_cfg(openrouter_base_url="https://api.deepseek.com")
+        with pytest.raises(ValueError, match="openrouter_base_url"):
+            cfg.require().validate()
+        # If we got here, validate() caught it before any DB/server call.
+
+    def test_startup_wrong_model_raises(self) -> None:
+        cfg = self._make_invalid_cfg(openrouter_model="deepseek/deepseek-chat")
+        with pytest.raises(ValueError, match="openrouter_model"):
+            cfg.require().validate()
+
+    def test_startup_wrong_effort_raises(self) -> None:
+        cfg = self._make_invalid_cfg(openrouter_reasoning_effort="high")
+        with pytest.raises(ValueError, match="openrouter_reasoning_effort"):
+            cfg.require().validate()
+
+    def test_startup_undersized_budget_raises(self) -> None:
+        cfg = self._make_invalid_cfg(openrouter_max_tokens=16000)
+        with pytest.raises(ValueError, match="openrouter_max_tokens"):
+            cfg.require().validate()
+
+    def test_startup_validate_after_require_ok(self) -> None:
+        """A valid config passes require().validate() chain."""
+        cfg = self._make_invalid_cfg()  # all defaults are valid
+        cfg.require().validate()  # should not raise
+
+    def test_main_uses_validate_chain(self) -> None:
+        """main() must call .validate() — verify the chain is wired."""
+        from src import __main__ as entrypoint
+        import inspect
+        source = inspect.getsource(entrypoint.main)
+        assert "require().validate()" in source, \
+            "main() must call require().validate() before any side effect"
 
 
 # ===================================================================

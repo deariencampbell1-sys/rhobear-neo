@@ -263,7 +263,8 @@ class ClaudeAgent:
         # --- Empty output ---
         if not stdout:
             if stderr:
-                log.warning("claude produced no stdout; stderr=%.500s", stderr)
+                log.warning("claude produced no stdout (exit=%d, stderr_len=%d)",
+                            proc.returncode, len(stderr))
             raise MissingResult("no stdout from claude")
 
         # --- Parse JSON result ---
@@ -358,6 +359,10 @@ class ClaudeAgent:
 
         # Normalize to canonical uppercase for consistent phase mapping.
         verdict = verdict.upper()
+        # Strip trailing sentence punctuation that would break canonical
+        # matching (e.g. "ACCEPT-MERGED." -> "ACCEPT-MERGED").  Preserves
+        # hyphens inside ACCEPT-READY, BOUNCE-BUILDER, etc.
+        verdict = verdict.rstrip(".,;:!?")
 
         # --- Validate verdict against canonical set ---
         if verdict not in CANONICAL_VERDICTS:
