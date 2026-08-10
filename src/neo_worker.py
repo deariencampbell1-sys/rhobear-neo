@@ -4,12 +4,14 @@ Flow per wake ({repo, sha, green, context[, pr_number]}):
   1. Resolve PR number from the head SHA (if not supplied).
   2. Loop/thrash guard: skip if we already acted on this SHA; read builder rounds.
   3. Entitlement/credits gate (per-install balance) — Neo actions only for a paid install.
-  4. Build the Neo brief (neo_protocol) and run it headless on DeepSeek (Flash triage;
-     the brief itself dispatches a Pro builder when a substantial fix is needed).
+  4. Build the Neo brief (neo_protocol) and run it headless via Claude Code CLI
+     (deepseek/deepseek-v4-flash at max reasoning effort, isolated config + temp
+     workdir).  The brief itself dispatches a builder when a substantial fix is
+     needed; the Claude Code agent handles gh, git, edit, and test runner tools.
   5. Record the action + credits (Gemini-baseline cost via the shared pricing) in state.
 
 The heavy lifting (read findings, fix-forward, dispatch builder, merge) is done by the
-DeepSeek agent bound to the canon — this worker is the deterministic wrapper: guardrails,
+LLM bound to the canon — this worker is the deterministic wrapper: guardrails,
 credits, state. Merge authority + the auto-merge toggle live here.
 """
 from __future__ import annotations
@@ -18,10 +20,10 @@ import json
 import logging
 import os
 import subprocess
-import time
 
 from .config import Config
 from .neo_state import NeoState
+from .agent_claude import ClaudeAgent, AgentError
 from . import neo_protocol
 
 log = logging.getLogger("rhobear_neo.worker")
@@ -98,14 +100,15 @@ def run_neo(cfg: Config, state: NeoState, wake: dict) -> None:
     state.record(repo, pr, sha, "triage", detail={"context": wake.get("context"),
                                                    "green": wake.get("green")})
 
-    # --- run the Neo protocol headless on DeepSeek --------------------------
+    # --- run the Neo protocol headless via Claude Code CLI --------------------
     brief = neo_protocol.build_brief(
         repo=repo, pr=pr, head_sha=sha,
         reviewer_context=wake.get("context", "?"), reviewer_green=bool(wake.get("green")),
         auto_merge=auto_merge, builder_round=rounds,
-        max_builder_rounds=cfg.max_builder_rounds, builder_model=cfg.model_builder,
+        max_builder_rounds=cfg.max_builder_rounds, builder_model=cfg.openrouter_model,
     )
-    usage, verdict = _run_agent(cfg, repo, brief)
+    agent = ClaudeAgent.from_config(cfg)
+    usage, verdict = _run_agent(agent, brief)
     is_builder = verdict.startswith("BOUNCE-BUILDER")
     credits = credits_for(usage, builder=is_builder)
     phase = {
@@ -120,62 +123,18 @@ def run_neo(cfg: Config, state: NeoState, wake: dict) -> None:
              repo, pr, sha[:8], verdict or "?", credits, auto_merge, rounds)
 
 
-def _run_agent(cfg: Config, repo: str, brief: str) -> tuple[dict, str]:
-    """Run the Neo brief headless on **Pi** (pi.dev) pointed at DeepSeek.
+def _run_agent(agent: ClaudeAgent, brief: str) -> tuple[dict, str]:
+    """Run the Neo brief headless via Claude Code CLI.
 
-    Pi over the Claude CLI (owner directive): leaner + cheaper, small system prompt (less token
-    waste), auto-executes its bash/edit/write tools with no permission prompt (so no root/skip-
-    permissions block), and it just WORKS the task — no sub-agent fan-out. The triage runs on Flash;
-    the brief itself shells out to a Pro `pi` worker when a substantial fix is needed.
+    Claude Code runs with isolated config dir + per-run temp workdir, giving
+    the agent full tool access (gh, git, edit, test runner).  OpenRouter
+    provides the Anthropic-compatible backend.
 
-    Runs in a fresh per-PR work dir so the agent can `gh repo clone` + edit for a fix-forward without
-    touching the service tree. Returns (normalized usage, verdict line)."""
-    model = cfg.model_triage
-    work = os.path.join("/tmp/neo-work", repo.replace("/", "__"))
-    os.makedirs(work, exist_ok=True)
-    env = {
-        **os.environ,
-        # Pi reads the DeepSeek provider key from env / ~/.pi/agent/auth.json.
-        "DEEPSEEK_API_KEY": cfg.deepseek_key,
-        "GH_TOKEN": cfg.gh_token,
-    }
+    Returns (normalised usage, verdict line).  On any error both are empty
+    so the caller skips merge and escalates."""
     try:
-        p = subprocess.run(
-            # --thinking off: deepseek-v4-flash is a reasoning model; on a complex brief its
-            # reasoning eats the whole budget and it never ACTS (5-min hangs, empty output). Off
-            # makes it decisively run tools + emit the verdict. (Builder=Pro can keep thinking.)
-            ["pi", "--provider", "deepseek", "--model", model, "--thinking", "off", "-p", brief,
-             "--mode", "json", "--no-context-files", "--no-session", "--no-skills"],
-            capture_output=True, text=True, env=env, timeout=1800, cwd=work,
-        )
-        usage = {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0}
-        last_text = ""
-        for line in (p.stdout or "").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                e = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            m = e.get("message") or {}
-            if m.get("role") == "assistant":
-                u = m.get("usage") or {}
-                usage["input_tokens"] += u.get("input", 0) or 0
-                usage["output_tokens"] += u.get("output", 0) or 0
-                usage["cache_read_input_tokens"] += u.get("cacheRead", 0) or 0
-                for b in (m.get("content") or []):
-                    if isinstance(b, dict) and b.get("type") == "text" and b.get("text"):
-                        last_text = b["text"]
-        verdict = ""
-        for ln in last_text.splitlines():
-            if ln.strip().upper().startswith("VERDICT:"):
-                # models like to bold/quote the verdict (**FIX-FORWARD**, `ACCEPT`) — strip markdown.
-                verdict = ln.split(":", 1)[1].replace("*", "").replace("`", "").strip()
-                break
-        if not verdict and p.returncode != 0:
-            log.warning("pi rc=%d stderr=%s", p.returncode, (p.stderr or "")[-200:])
+        usage, verdict = agent.run(brief)
         return usage, verdict
-    except Exception as e:
-        log.exception("neo agent (pi) run failed: %s", e)
+    except AgentError:
+        log.exception("neo claude agent run failed")
         return {}, ""

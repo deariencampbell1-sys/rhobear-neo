@@ -24,7 +24,7 @@ log = logging.getLogger("rhobear_neo")
 
 
 def main() -> None:
-    cfg = _config.load().require()
+    cfg = _config.load().require().validate()
     state = NeoState(cfg.database_url)
     state.ensure_schema()
 

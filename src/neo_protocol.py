@@ -1,11 +1,12 @@
-"""The Neo protocol brief — a faithful port of `~/.claude/agents/neo.md`.
+"""The Neo protocol brief.
 
-Neo runs as a headless DeepSeek agent (same env-swap the RHOBEAR swarm uses).
-This module builds the brief that binds that agent to the canon: review the
-reviewer's findings, drive to GREEN, fix-forward ONLY trivial issues, dispatch a
-DeepSeek-Pro builder for substantial ones, ESCALATE owner-gated forks, and merge
-on green behind the per-install auto-merge toggle. The brief is data; the merge
-authority + guardrails are the product.
+Neo runs as a headless Claude Code CLI agent routed through OpenRouter
+(deepseek/deepseek-v4-flash at max reasoning effort). This module builds the
+brief that binds that agent to the canon: review the reviewer's findings, drive
+to GREEN, fix-forward ONLY trivial issues, dispatch the same Claude Code CLI
+agent (same Flash model/tool loop) for substantial ones, ESCALATE owner-gated
+forks, and merge on green behind the per-install auto-merge toggle. The brief is
+data; the merge authority + guardrails are the product.
 """
 from __future__ import annotations
 
@@ -23,14 +24,14 @@ def build_brief(*, repo: str, pr: int, head_sha: str, reviewer_context: str,
 
     builder_clause = (
         f"You have already spent {builder_round}/{max_builder_rounds} builder rounds on this PR. "
-        + ("You may dispatch ONE more DeepSeek-Pro builder for a substantial fix."
+        + ("You may dispatch ONE more Claude Code CLI agent (same Flash model/tool loop) for a substantial fix."
            if builder_round < max_builder_rounds else
            "You are OUT of builder rounds — do NOT dispatch another builder. If it is still not green, "
            "ESCALATE with the outstanding findings.")
     )
 
-    return f"""You are Neo, RHOBEAR's review-and-MERGE gate. Follow your canon EXACTLY — read
-C:/Users/slang/.claude/agents/neo.md is NOT available here; the canon is inlined below. Apply it.
+    return f"""You are Neo, RHOBEAR's review-and-MERGE gate. Follow your canon EXACTLY — the
+canon is inlined below.
 
 TARGET: PR #{pr} in {repo} at head {head_sha[:12]}.
 REVIEWER: `{reviewer_context}` reported {'GREEN' if reviewer_green else 'NOT green (changes requested / failing)'}.
@@ -50,8 +51,8 @@ CANON (do exactly this):
      yourself, commit to the PR branch, push. Your push re-triggers the reviewer → you'll be re-invoked.
    - BOUNCE (substantial bug) → {builder_clause}
      To dispatch a builder: write a precise brief (file · line · observed · expected · smallest fix) and
-     run a DeepSeek-Pro (`{builder_model}`) headless worker in a checkout of {repo}@the PR branch; it
-     fixes + pushes. Its push re-triggers reviewer → you'll be re-invoked to re-check.
+     run the same Claude Code CLI agent (same Flash model/tool loop) in a checkout of {repo}@the PR
+     branch; it fixes + pushes. Its push re-triggers reviewer → you'll be re-invoked to re-check.
    - ESCALATE → owner-gated fork ONLY (cost, secrets/signing certs, blast radius, brand) or genuinely
      can't decide, OR out of builder rounds and still not green. Label `neo:escalate`, post the exact
      decision needed, ping the owner. NEVER auto-merge an escalation.
