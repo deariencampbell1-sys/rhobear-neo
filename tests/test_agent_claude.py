@@ -1043,6 +1043,65 @@ class TestStartupValidation:
 
 
 # ===================================================================
+# Protocol census — no stale Pro/direct/Pi/Windows-home text
+# ===================================================================
+
+class TestProtocolCensus:
+    """neo_protocol.py must not contain stale DeepSeek-Pro, Pi, direct-HTTP,
+    or Windows-home-path references.  The model identifier
+    `deepseek/deepseek-v4-flash` (lowercase) is allowed — only the
+    uppercase protocol references are stale."""
+
+    @staticmethod
+    def _protocol_source() -> str:
+        src_dir = os.path.join(os.path.dirname(__file__), "..", "src")
+        with open(os.path.join(src_dir, "neo_protocol.py")) as f:
+            return f.read()
+
+    def test_no_deepseek_pro_reference(self) -> None:
+        """'DeepSeek-Pro' (capital D, capital S, capital P) is stale."""
+        src = self._protocol_source()
+        assert "DeepSeek-Pro" not in src, (
+            "neo_protocol.py must not mention DeepSeek-Pro"
+        )
+
+    def test_no_headless_deepseek_reference(self) -> None:
+        """'headless DeepSeek' with capital letters is the old agent description."""
+        src = self._protocol_source()
+        assert "headless DeepSeek" not in src, (
+            "neo_protocol.py must not mention 'headless DeepSeek'"
+        )
+
+    def test_no_pi_reference(self) -> None:
+        """'Pi' (the old Pi protocol) is stale in the protocol text."""
+        src = self._protocol_source()
+        assert " Pi " not in src and "Pi\n" not in src, (
+            "neo_protocol.py must not reference Pi protocol"
+        )
+
+    def test_no_direct_http_reference(self) -> None:
+        """'direct' as in 'direct HTTP' or 'direct DeepSeek' is stale."""
+        src = self._protocol_source()
+        assert "direct " not in src, (
+            "neo_protocol.py must not describe direct-HTTP or direct-DeepSeek paths"
+        )
+
+    def test_no_windows_home_path(self) -> None:
+        """Hardcoded Windows home paths (C:/Users/) must not appear."""
+        src = self._protocol_source()
+        assert "C:/Users/" not in src, (
+            "neo_protocol.py must not contain hardcoded Windows home paths"
+        )
+
+    def test_no_windows_path_reference(self) -> None:
+        """'Windows' as a path reference is stale (VPS runtime)."""
+        src = self._protocol_source()
+        assert "Windows" not in src, (
+            "neo_protocol.py must not reference Windows paths"
+        )
+
+
+# ===================================================================
 # Real smoke test — full ClaudeAgent.run() lifecycle
 # ===================================================================
 
