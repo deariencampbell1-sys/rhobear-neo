@@ -152,6 +152,8 @@ class TestCommandAssembly:
         assert env["ANTHROPIC_MODEL"] == MODEL
         assert env["CLAUDE_CODE_EFFORT_LEVEL"] == "max"
         assert env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "32000"
+        assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "1048576"
+        assert env["CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT"] == "1"
         assert env["CLAUDE_CODE_OUTPUT_FORMAT"] == "json"
         # GH_TOKEN propagated.
         assert env["GH_TOKEN"] == GH_TOKEN

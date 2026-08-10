@@ -203,6 +203,12 @@ class ClaudeAgent:
             "ANTHROPIC_MODEL": self.model,
             "CLAUDE_CODE_EFFORT_LEVEL": self.effort,
             "CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(self.max_tokens),
+            # DeepSeek Direct supports 1M context, but Claude Code does not
+            # know this newly named model. Keep the direct model ID bare and
+            # provide the real window explicitly; [1m] is an OpenRouter-only
+            # CLI hint and must not be sent to DeepSeek Direct.
+            "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1048576",
+            "CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT": "1",
             "CLAUDE_CODE_OUTPUT_FORMAT": "json",
         }
         # Use only the configured GitHub credential. A stale host token must
