@@ -5,7 +5,8 @@ CLI loop: Claude Code runs the Neo brief with full tool access (gh, git, file
 edit, test runner) in an isolated per-run work directory.
 
 Architecture:
-  - Claude Code CLI via subprocess, OpenRouter as Anthropic-compatible backend
+  - Claude Code CLI via subprocess, DeepSeek Direct as Anthropic-compatible
+    backend (https://api.deepseek.com/anthropic)
   - Isolated per-run temp work directory (deleted after the run)
   - Single JSON result object parsing (not NDJSON — Claude Code --output-format
     json returns one result object, not a stream)
@@ -101,10 +102,9 @@ class ClaudeAgent:
         self.claude_bin = claude_bin
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
-        # Clean model name (no CLI context suffix) — used for env vars.
-        self._clean_model = model.replace("[1m]", "")
-        # Model with [1m] context suffix required by OpenRouter for CLI args.
-        self.model = f"{self._clean_model}[1m]"
+        # Exact direct model ID (deepseek-v4-flash) — no /deepseek prefix, no
+        # [1m] context suffix. The same value goes to --model and env vars.
+        self.model = model.strip()
         self.effort = effort
         self.max_tokens = max_tokens
         self.timeout = timeout
@@ -119,12 +119,12 @@ class ClaudeAgent:
         """Build from a Config object."""
         return cls(
             claude_bin=cfg.claude_bin,
-            api_key=cfg.openrouter_key,
-            base_url=cfg.openrouter_base_url,
-            model=cfg.openrouter_model,
-            effort=cfg.openrouter_reasoning_effort,
-            max_tokens=cfg.openrouter_max_tokens,
-            timeout=cfg.openrouter_timeout,
+            api_key=cfg.deepseek_key,
+            base_url=cfg.deepseek_base_url,
+            model=cfg.deepseek_model,
+            effort=cfg.deepseek_reasoning_effort,
+            max_tokens=cfg.deepseek_max_tokens,
+            timeout=cfg.deepseek_timeout,
             gh_token=cfg.gh_token,
         )
 
@@ -200,7 +200,7 @@ class ClaudeAgent:
             "ANTHROPIC_BASE_URL": self.base_url,
             "ANTHROPIC_API_KEY": self.api_key,
             "ANTHROPIC_AUTH_TOKEN": self.api_key,
-            "ANTHROPIC_MODEL": self._clean_model,
+            "ANTHROPIC_MODEL": self.model,
             "CLAUDE_CODE_EFFORT_LEVEL": self.effort,
             "CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(self.max_tokens),
             "CLAUDE_CODE_OUTPUT_FORMAT": "json",
@@ -210,7 +210,8 @@ class ClaudeAgent:
         env.pop("GH_TOKEN", None)
         if self.gh_token:
             env["GH_TOKEN"] = self.gh_token
-        # Remove conflicting env vars that might point at a different provider.
+        # Remove conflicting env vars that might point at a different provider
+        # (e.g. a stale OpenRouter gateway URL or the CLI's own base-url var).
         env.pop("CLAUDE_CODE_ANTHROPIC_BASE_URL", None)
         env.pop("CLAUDE_CODE_BASE_URL", None)
         return env
