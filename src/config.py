@@ -6,8 +6,10 @@ Claude Code agent for substantial), and merges on green behind a per-install
 auto-merge toggle. Sibling service to rhobear-reviews on the same VPS.
 
 Claude Code CLI replaces the old Pi/direct-DeepSeek and direct-HTTP-OpenRouter
-paths.  The agent runs headless with isolated CLAUDE_CONFIG_DIR, a per-run temp
-work directory, and full tool access (gh, git, edit, test).
+paths. The agent now routes through DeepSeek Direct (Anthropic-compatible
+endpoint) at the exact `deepseek-v4-flash` model and `max` reasoning effort. It
+runs headless with isolated CLAUDE_CONFIG_DIR, a per-run temp work directory,
+and full tool access (gh, git, edit, test).
 """
 from __future__ import annotations
 
@@ -68,20 +70,22 @@ class Config:
         )
     )
 
-    # --- engine: Claude Code CLI via OpenRouter (Anthropic-compatible backend) ---
+    # --- engine: Claude Code CLI via DeepSeek Direct (Anthropic-compatible endpoint) ---
     # Claude Code runs headless with isolated config dir + per-run temp workdir.
     # The agent has full tool access (gh, git, edit, test runner).
-    # Config shared with rhobear-reviews: OPENROUTER_API_KEY is the single secret.
-    openrouter_base_url: str = field(default_factory=lambda: _get(
-        "NEO_OPENROUTER_BASE_URL", "https://openrouter.ai/api"))
-    openrouter_key: str = field(default_factory=lambda: _get("OPENROUTER_API_KEY"))
-    openrouter_model: str = field(default_factory=lambda: _get(
-        "NEO_OPENROUTER_MODEL", "deepseek/deepseek-v4-flash"))
-    openrouter_reasoning_effort: str = field(default_factory=lambda: _get(
+    # DEEPSEEK_API_KEY is the single secret (rotated, owned by Neo).
+    # Stale OpenRouter env vars (OPENROUTER_API_KEY / NEO_OPENROUTER_*) are
+    # deliberately NOT read here — validate() rejects any non-direct base URL.
+    deepseek_base_url: str = field(default_factory=lambda: _get(
+        "NEO_DEEPSEEK_BASE_URL", "https://api.deepseek.com/anthropic"))
+    deepseek_key: str = field(default_factory=lambda: _get("DEEPSEEK_API_KEY"))
+    deepseek_model: str = field(default_factory=lambda: _get(
+        "NEO_DEEPSEEK_MODEL", "deepseek-v4-flash"))
+    deepseek_reasoning_effort: str = field(default_factory=lambda: _get(
         "NEO_REASONING_EFFORT", "max"))
-    openrouter_max_tokens: int = field(default_factory=lambda: _get_int(
+    deepseek_max_tokens: int = field(default_factory=lambda: _get_int(
         "NEO_MAX_TOKENS", 32000))
-    openrouter_timeout: int = field(default_factory=lambda: _get_int(
+    deepseek_timeout: int = field(default_factory=lambda: _get_int(
         "NEO_TIMEOUT", 1800))
 
     # --- claude binary path (on the VPS: /usr/bin/claude) ---
@@ -104,7 +108,7 @@ class Config:
     def require(self) -> "Config":
         missing = [n for n, v in {
             "RHOBEAR_NEO_WEBHOOK_SECRET": self.webhook_secret,
-            "OPENROUTER_API_KEY": self.openrouter_key,
+            "DEEPSEEK_API_KEY": self.deepseek_key,
             "DATABASE_URL": self.database_url,
             "GH_TOKEN": self.gh_token,
         }.items() if not v]
@@ -113,37 +117,40 @@ class Config:
         return self
 
     def validate(self) -> "Config":
-        """Strict startup validation — reject non-OpenRouter config.
+        """Strict startup validation — DeepSeek Direct only, no fallback.
 
         Verifies:
-          - base_url exactly https://openrouter.ai/api (trailing slash tolerant)
-          - model exactly deepseek/deepseek-v4-flash
+          - base_url exactly https://api.deepseek.com/anthropic (trailing slash
+            tolerant) — any OpenRouter or bare api.deepseek.com value is rejected
+          - model exactly deepseek-v4-flash (unprefixed direct ID; a stale
+            deepseek/... or [...]-suffixed value is rejected)
           - effort exactly max
           - max_tokens >= 32000
           - claude_bin exists/executable (where practical)
 
         Raises ValueError (safe to log — no secrets) on any violation.
         """
-        base = self.openrouter_base_url.rstrip("/")
-        if base != "https://openrouter.ai/api":
+        base = self.deepseek_base_url.rstrip("/")
+        if base != "https://api.deepseek.com/anthropic":
             raise ValueError(
-                f"openrouter_base_url must be https://openrouter.ai/api, "
-                f"got {self.openrouter_base_url!r}"
+                f"deepseek_base_url must be https://api.deepseek.com/anthropic, "
+                f"got {self.deepseek_base_url!r}"
             )
-        if self.openrouter_model.strip() != "deepseek/deepseek-v4-flash":
+        if self.deepseek_model.strip() != "deepseek-v4-flash":
             raise ValueError(
-                f"openrouter_model must be 'deepseek/deepseek-v4-flash', "
-                f"got {self.openrouter_model!r}"
+                f"deepseek_model must be 'deepseek-v4-flash' (DeepSeek Direct "
+                f"ID, no /deepseek prefix or [1m] suffix), "
+                f"got {self.deepseek_model!r}"
             )
-        if self.openrouter_reasoning_effort.strip().lower() != "max":
+        if self.deepseek_reasoning_effort.strip().lower() != "max":
             raise ValueError(
-                f"openrouter_reasoning_effort must be 'max', "
-                f"got {self.openrouter_reasoning_effort!r}"
+                f"deepseek_reasoning_effort must be 'max', "
+                f"got {self.deepseek_reasoning_effort!r}"
             )
-        if self.openrouter_max_tokens < 32000:
+        if self.deepseek_max_tokens < 32000:
             raise ValueError(
-                f"openrouter_max_tokens must be >= 32000, "
-                f"got {self.openrouter_max_tokens}"
+                f"deepseek_max_tokens must be >= 32000, "
+                f"got {self.deepseek_max_tokens}"
             )
         # Check claude binary exists where practical (skip on Windows — it's a
         # remote VPS path like /usr/bin/claude).

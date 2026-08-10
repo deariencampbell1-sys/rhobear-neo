@@ -9,39 +9,52 @@ Runs: `.venv/bin/python -m src`, reads `.env` via `EnvironmentFile`.
 `.env`, `app-key.pem` (GitHub App private key), `.local/` — all on the box only.
 `config.py` reads everything from the environment; there is no secret in source.
 
-## Claude Code CLI migration (wave0-neo bounce 1, 2026-08-09)
+## Claude Code CLI migration (wave0-neo bounce 1, 2026-08-09) — history only
+
+The old Pi/direct-DeepSeek path and direct-HTTP OpenRouterClient are both gone.
+Neo runs as a **Claude Code CLI agent** (`/usr/bin/claude`) with full tool
+access (gh, git, edit, test runner) in an isolated per-run temp work directory.
+That first CLI migration routed through OpenRouter; the cutover below replaces
+it with DeepSeek Direct. The env vars in this old section are OBSOLETE — see
+the cutover section for what `.env` must contain today.
+
+## DeepSeek Direct cutover (2026-08-10)
 
 ### What changed
-The old Pi/direct-DeepSeek path and direct-HTTP OpenRouterClient are both gone.
-Neo now runs as a **Claude Code CLI agent** (`/usr/bin/claude`) with full tool
-access (gh, git, edit, test runner) in an isolated per-run temp work directory.
-OpenRouter provides the Anthropic-compatible backend; the model is exact
-`deepseek/deepseek-v4-flash` at `max` reasoning effort.
+The OpenRouter route is disabled. Neo's Claude Code agent now talks to
+**DeepSeek Direct** at the Anthropic-compatible endpoint
+`https://api.deepseek.com/anthropic`, model exactly `deepseek-v4-flash`
+(unprefixed direct ID — no `/deepseek` prefix, no `[1m]` suffix) at `max`
+reasoning effort, `--effort max` / `CLAUDE_CODE_EFFORT_LEVEL=max` explicit,
+`CLAUDE_CODE_MAX_OUTPUT_TOKENS=32000` output headroom.
 
 ### New env vars (REQUIRED — add to `.env` on the VPS before restart)
 ```bash
-OPENROUTER_API_KEY=sk-or-v1-...   # single shared secret (same as rhobear-reviews)
-NEO_OPENROUTER_BASE_URL=https://openrouter.ai/api   # default, can be omitted
-NEO_OPENROUTER_MODEL=deepseek/deepseek-v4-flash     # default, can be omitted
+DEEPSEEK_API_KEY=sk-...            # rotated key, owned by Neo (never commit)
+NEO_DEEPSEEK_BASE_URL=https://api.deepseek.com/anthropic   # default, can be omitted
+NEO_DEEPSEEK_MODEL=deepseek-v4-flash                       # default, can be omitted
 NEO_REASONING_EFFORT=max            # default; no runtime probe/fallback
-NEO_MAX_TOKENS=32000                # default; was 8192 in the old client
+NEO_MAX_TOKENS=32000                # default; validation floor is 32000
 NEO_TIMEOUT=300                     # default (seconds), can be omitted
 NEO_CLAUDE_BIN=/usr/bin/claude     # default, can be omitted
 ```
 
 ### Removed/deprecated env vars
-- `NEO_OPENROUTER_API_KEY` — renamed to `OPENROUTER_API_KEY` (shared with Reviews).
+- `OPENROUTER_API_KEY` — removed; the OpenRouter route is disabled. Remove it from
+  `.env` so a stale route cannot silently select itself.
+- `NEO_OPENROUTER_BASE_URL` / `NEO_OPENROUTER_MODEL` — removed; config no longer reads
+  them and startup validation rejects the old `https://openrouter.ai/api` value and
+  the old `deepseek/...`-prefixed model outright.
+- `NEO_OPENROUTER_API_KEY` — renamed to `DEEPSEEK_API_KEY` (Neo-owned secret now).
 - `NEO_DEEPSEEK_API_KEY` — no longer used. The old Pi/direct-DeepSeek path is deleted.
 - `NEO_ANTHROPIC_BASE_URL` — no longer used.
 - `NEO_MODEL_TRIAGE` / `NEO_MODEL_BUILDER` — no longer used; one model now.
-- `DEEPSEEK_API_KEY` — no longer needed in the service environment.
 - `NEO_MAX_RETRIES` — no longer needed; the Claude Code CLI handles its own retries.
-- `NEO_OPENROUTER_BASE_URL` — still used but default changed to `https://openrouter.ai/api`
-  (no `/v1` suffix — the CLI appends the Anthropic-compatible path).
 
 ### Rollout steps
-1. Add `OPENROUTER_API_KEY` (and optional overrides) to `/opt/rhobear/rhobear-neo/.env`.
-2. Remove old `NEO_OPENROUTER_API_KEY`, `NEO_DEEPSEEK_API_KEY`, `NEO_ANTHROPIC_BASE_URL`,
+1. Add `DEEPSEEK_API_KEY` (and optional overrides) to `/opt/rhobear/rhobear-neo/.env`.
+2. Remove stale `OPENROUTER_API_KEY`, `NEO_OPENROUTER_BASE_URL`, `NEO_OPENROUTER_MODEL`,
+   `NEO_OPENROUTER_API_KEY`, `NEO_DEEPSEEK_API_KEY`, `NEO_ANTHROPIC_BASE_URL`,
    `NEO_MODEL_TRIAGE`, `NEO_MODEL_BUILDER`, `NEO_MAX_RETRIES` from `.env`.
 3. Copy the source tree to the VPS — this is NOT a git checkout:
    ```bash

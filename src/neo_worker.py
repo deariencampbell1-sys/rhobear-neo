@@ -5,9 +5,10 @@ Flow per wake ({repo, sha, green, context[, pr_number]}):
   2. Loop/thrash guard: skip if we already acted on this SHA; read builder rounds.
   3. Entitlement/credits gate (per-install balance) — Neo actions only for a paid install.
   4. Build the Neo brief (neo_protocol) and run it headless via Claude Code CLI
-     (deepseek/deepseek-v4-flash at max reasoning effort, isolated config + temp
-     workdir).  The brief itself dispatches a builder when a substantial fix is
-     needed; the Claude Code agent handles gh, git, edit, and test runner tools.
+     (deepseek-v4-flash at max reasoning effort via DeepSeek Direct, isolated
+     config + temp workdir).  The brief itself dispatches a builder when a
+     substantial fix is needed; the Claude Code agent handles gh, git, edit, and
+     test runner tools.
   5. Record the action + credits (Gemini-baseline cost via the shared pricing) in state.
 
 The heavy lifting (read findings, fix-forward, dispatch builder, merge) is done by the
@@ -105,7 +106,7 @@ def run_neo(cfg: Config, state: NeoState, wake: dict) -> None:
         repo=repo, pr=pr, head_sha=sha,
         reviewer_context=wake.get("context", "?"), reviewer_green=bool(wake.get("green")),
         auto_merge=auto_merge, builder_round=rounds,
-        max_builder_rounds=cfg.max_builder_rounds, builder_model=cfg.openrouter_model,
+        max_builder_rounds=cfg.max_builder_rounds, builder_model=cfg.deepseek_model,
     )
     agent = ClaudeAgent.from_config(cfg)
     usage, verdict = _run_agent(agent, brief)
@@ -127,8 +128,8 @@ def _run_agent(agent: ClaudeAgent, brief: str) -> tuple[dict, str]:
     """Run the Neo brief headless via Claude Code CLI.
 
     Claude Code runs with isolated config dir + per-run temp workdir, giving
-    the agent full tool access (gh, git, edit, test runner).  OpenRouter
-    provides the Anthropic-compatible backend.
+    the agent full tool access (gh, git, edit, test runner).  DeepSeek Direct
+    provides the Anthropic-compatible endpoint.
 
     Returns (normalised usage, verdict line).  On any error both are empty
     so the caller skips merge and escalates."""

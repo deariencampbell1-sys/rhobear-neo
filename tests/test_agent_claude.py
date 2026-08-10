@@ -46,10 +46,9 @@ from src.config import Config
 # Helpers
 # ---------------------------------------------------------------------------
 
-BASE = "https://openrouter.ai/api"
-API_KEY = "sk-or-v1-test-placeholder"
-MODEL = "deepseek/deepseek-v4-flash"
-MODEL_FULL = MODEL + "[1m]"          # __init__ normalises this
+BASE = "https://api.deepseek.com/anthropic"
+API_KEY = "sk-test-placeholder"
+MODEL = "deepseek-v4-flash"          # exact direct ID — no prefix, no [1m] suffix
 GH_TOKEN = "ghp_test_token_placeholder"
 CLAUDE_BIN = "/usr/bin/claude"
 
@@ -127,7 +126,7 @@ class TestCommandAssembly:
         assert "-p" in cmd
         assert cmd[cmd.index("-p") + 1] == "test brief"
         assert "--model" in cmd
-        assert cmd[cmd.index("--model") + 1] == MODEL_FULL
+        assert cmd[cmd.index("--model") + 1] == MODEL
         assert "--effort" in cmd
         assert cmd[cmd.index("--effort") + 1] == "max"
         assert "--dangerously-skip-permissions" in cmd
@@ -149,10 +148,12 @@ class TestCommandAssembly:
         assert "CLAUDE_CODE_ANTHROPIC_BASE_URL" not in env
         # CLAUDE_CONFIG_DIR is set to the temp config dir.
         assert env["CLAUDE_CONFIG_DIR"] == "/tmp/neo-config-test"
-        # Model in env vars uses clean slug (no [1m] suffix).
+        # Model in env vars is the exact direct ID (no [1m] suffix).
         assert env["ANTHROPIC_MODEL"] == MODEL
         assert env["CLAUDE_CODE_EFFORT_LEVEL"] == "max"
         assert env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "32000"
+        assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "1048576"
+        assert env["CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT"] == "1"
         assert env["CLAUDE_CODE_OUTPUT_FORMAT"] == "json"
         # GH_TOKEN propagated.
         assert env["GH_TOKEN"] == GH_TOKEN
@@ -166,36 +167,29 @@ class TestCommandAssembly:
             env = agent._build_env("/tmp/neo-config-test")
         assert "GH_TOKEN" not in env
 
-    def test_model_normalised(self) -> None:
-        """Model without [1m] suffix gets it appended.
-        _clean_model should be the clean slug (no [1m] suffix)."""
+    def test_model_passed_exactly(self) -> None:
+        """The direct model ID is used verbatim in every active path — CLI
+        --model, ANTHROPIC_MODEL env var, and the agent's own model field.
+        No /deepseek prefix is added and no [1m] context suffix is appended
+        (that was an OpenRouter CLI hint; DeepSeek Direct takes the bare ID)."""
         agent = _make_agent()
-        assert agent.model == MODEL_FULL
-        assert agent._clean_model == MODEL
-
-    def test_model_preserves_existing_suffix(self) -> None:
-        """Model already ending with [1m] is not double-suffixed.
-        _clean_model strips the [1m] suffix."""
-        agent = _make_agent(model=MODEL_FULL)
-        assert agent.model == MODEL_FULL
-        assert agent._clean_model == MODEL
-
-    def test_clean_model_in_env(self) -> None:
-        """ANTHROPIC_MODEL in env vars should use the clean slug, no [1m]."""
-        agent = _make_agent()
+        assert agent.model == MODEL
         env = agent._build_env("/tmp/neo-config-test")
         assert env["ANTHROPIC_MODEL"] == MODEL
+        cmd = agent._build_cmd("brief")
+        assert cmd[cmd.index("--model") + 1] == MODEL
         assert "[1m]" not in env["ANTHROPIC_MODEL"]
+        assert "[1m]" not in agent.model
 
     def test_from_config(self) -> None:
         """from_config should populate agent fields from Config."""
         cfg = Config()
-        cfg.openrouter_key = API_KEY
-        cfg.openrouter_base_url = BASE
-        cfg.openrouter_model = MODEL
-        cfg.openrouter_reasoning_effort = "max"
-        cfg.openrouter_max_tokens = 32000
-        cfg.openrouter_timeout = 1800
+        cfg.deepseek_key = API_KEY
+        cfg.deepseek_base_url = BASE
+        cfg.deepseek_model = MODEL
+        cfg.deepseek_reasoning_effort = "max"
+        cfg.deepseek_max_tokens = 32000
+        cfg.deepseek_timeout = 1800
         cfg.claude_bin = CLAUDE_BIN
         cfg.gh_token = GH_TOKEN
 
@@ -203,7 +197,7 @@ class TestCommandAssembly:
         assert agent.claude_bin == CLAUDE_BIN
         assert agent.api_key == API_KEY
         assert agent.base_url == BASE
-        assert agent.model == MODEL_FULL
+        assert agent.model == MODEL
         assert agent.effort == "max"
         assert agent.max_tokens == 32000
         assert agent.timeout == 1800
@@ -573,25 +567,25 @@ class TestWorkerWrapper:
 class TestConfigMapping:
     """Config fields map correctly to ClaudeAgent."""
 
-    def test_openrouter_key_mapped(self) -> None:
-        """openrouter_key from Config -> api_key in ClaudeAgent."""
+    def test_deepseek_key_mapped(self) -> None:
+        """deepseek_key from Config -> api_key in ClaudeAgent."""
         cfg = Config()
-        cfg.openrouter_key = "sk-or-v1-test-key"
+        cfg.deepseek_key = "sk-test-key"
         cfg.gh_token = GH_TOKEN
         cfg.claude_bin = CLAUDE_BIN
         agent = ClaudeAgent.from_config(cfg)
-        assert agent.api_key == "sk-or-v1-test-key"
+        assert agent.api_key == "sk-test-key"
 
-    def test_openrouter_model_mapped(self) -> None:
-        """openrouter_model from Config -> model in ClaudeAgent (with [1m]).
-        _clean_model should be the clean slug."""
+    def test_deepseek_model_mapped(self) -> None:
+        """deepseek_model from Config -> model in ClaudeAgent, exact and
+        unsuffixed (no [1m])."""
         cfg = Config()
-        cfg.openrouter_model = "deepseek/deepseek-v4-flash"
+        cfg.deepseek_model = "deepseek-v4-flash"
         cfg.gh_token = GH_TOKEN
         cfg.claude_bin = CLAUDE_BIN
         agent = ClaudeAgent.from_config(cfg)
-        assert agent.model == "deepseek/deepseek-v4-flash[1m]"
-        assert agent._clean_model == "deepseek/deepseek-v4-flash"
+        assert agent.model == "deepseek-v4-flash"
+        assert agent.model == cfg.deepseek_model
 
 
 # ===================================================================
@@ -610,10 +604,49 @@ class TestConfigValidation:
     def test_all_required_present_ok(self) -> None:
         cfg = Config()
         cfg.webhook_secret = "whs_test"
-        cfg.openrouter_key = "sk-or-v1-test"
+        cfg.deepseek_key = "sk-test"
         cfg.database_url = "postgres://localhost/test"
         cfg.gh_token = "ghp_test"
         cfg.require()
+
+
+# ===================================================================
+# Stale OpenRouter env vars — must be invisible to Config
+# ===================================================================
+
+class TestStaleOpenRouterEnv:
+    """Env vars from the disabled OpenRouter route must never be read by
+    Config. A stale OPENROUTER_API_KEY / NEO_OPENROUTER_* cannot silently
+    select a route or model."""
+
+    def test_stale_openrouter_env_ignored(self) -> None:
+        # DEEPSEEK_API_KEY is pinned to "" so the test is hermetic on any
+        # machine (a real key may be present in the shell environment).
+        with patch.dict(os.environ, {
+            "OPENROUTER_API_KEY": "sk-or-v1-stale-secret",
+            "NEO_OPENROUTER_BASE_URL": "https://openrouter.ai/api",
+            "NEO_OPENROUTER_MODEL": "deepseek/deepseek-v4-flash",
+            "DEEPSEEK_API_KEY": "",
+        }, clear=False):
+            cfg = Config()
+        # Config holds only the DeepSeek Direct defaults — no stale values leak.
+        assert cfg.deepseek_key == ""
+        assert cfg.deepseek_base_url == "https://api.deepseek.com/anthropic"
+        assert cfg.deepseek_model == "deepseek-v4-flash"
+
+    def test_stale_key_does_not_satisfy_require(self) -> None:
+        """require() demands DEEPSEEK_API_KEY — a stale OPENROUTER_API_KEY in
+        the environment must not satisfy it."""
+        with patch.dict(os.environ, {
+            "OPENROUTER_API_KEY": "sk-or-v1-stale-secret",
+            "DEEPSEEK_API_KEY": "",
+        }, clear=False):
+            cfg = Config()
+            cfg.webhook_secret = "whs_test"
+            cfg.database_url = "postgres://localhost/test"
+            cfg.gh_token = "ghp_test"
+            with pytest.raises(RuntimeError, match="DEEPSEEK_API_KEY"):
+                cfg.require()
 
 
 # ===================================================================
@@ -881,45 +914,70 @@ class TestResultEnvelope:
 # ===================================================================
 
 class TestConfigValidate:
-    """Config.validate() rejects non-OpenRouter configs."""
+    """Config.validate() rejects any non-direct DeepSeek config."""
 
-    def test_validate_wrong_base_url(self) -> None:
+    def test_validate_rejects_stale_openrouter_url(self) -> None:
+        """The disabled OpenRouter route must be rejected — a stale
+        NEO_OPENROUTER_BASE_URL cannot silently select a route."""
         cfg = Config()
-        cfg.openrouter_base_url = "https://api.deepseek.com"
-        with pytest.raises(ValueError, match="openrouter_base_url"):
+        cfg.deepseek_base_url = "https://openrouter.ai/api"
+        with pytest.raises(ValueError, match="deepseek_base_url"):
+            cfg.validate()
+
+    def test_validate_rejects_bare_deepseek_url(self) -> None:
+        """https://api.deepseek.com without the /anthropic path is rejected."""
+        cfg = Config()
+        cfg.deepseek_base_url = "https://api.deepseek.com"
+        with pytest.raises(ValueError, match="deepseek_base_url"):
             cfg.validate()
 
     def test_validate_base_url_trailing_slash_ok(self) -> None:
         """Trailing slash on the base URL should be tolerated."""
         cfg = Config()
-        cfg.openrouter_base_url = "https://openrouter.ai/api/"
+        cfg.deepseek_base_url = "https://api.deepseek.com/anthropic/"
         cfg.validate()  # should not raise
+
+    def test_validate_rejects_stale_prefixed_model(self) -> None:
+        """The old OpenRouter model slug (deepseek/... prefix) must be
+        rejected — the direct ID is unprefixed."""
+        cfg = Config()
+        cfg.deepseek_model = "deepseek/deepseek-v4-flash"
+        with pytest.raises(ValueError, match="deepseek_model"):
+            cfg.validate()
+
+    def test_validate_rejects_context_suffixed_model(self) -> None:
+        """A [1m]-suffixed model must be rejected — that suffix was an
+        OpenRouter CLI hint and has no meaning on the direct route."""
+        cfg = Config()
+        cfg.deepseek_model = "deepseek-v4-flash[1m]"
+        with pytest.raises(ValueError, match="deepseek_model"):
+            cfg.validate()
 
     def test_validate_wrong_model(self) -> None:
         cfg = Config()
-        cfg.openrouter_model = "deepseek/deepseek-chat"
-        with pytest.raises(ValueError, match="openrouter_model"):
+        cfg.deepseek_model = "deepseek-chat"
+        with pytest.raises(ValueError, match="deepseek_model"):
             cfg.validate()
 
     def test_validate_wrong_effort(self) -> None:
         cfg = Config()
-        cfg.openrouter_reasoning_effort = "high"
-        with pytest.raises(ValueError, match="openrouter_reasoning_effort"):
+        cfg.deepseek_reasoning_effort = "high"
+        with pytest.raises(ValueError, match="deepseek_reasoning_effort"):
             cfg.validate()
 
     def test_validate_undersized_tokens(self) -> None:
         cfg = Config()
-        cfg.openrouter_max_tokens = 16000
-        with pytest.raises(ValueError, match="openrouter_max_tokens"):
+        cfg.deepseek_max_tokens = 16000
+        with pytest.raises(ValueError, match="deepseek_max_tokens"):
             cfg.validate()
 
     def test_validate_ok(self) -> None:
         """Valid config should pass validate() without error."""
         cfg = Config()
-        cfg.openrouter_base_url = "https://openrouter.ai/api"
-        cfg.openrouter_model = "deepseek/deepseek-v4-flash"
-        cfg.openrouter_reasoning_effort = "max"
-        cfg.openrouter_max_tokens = 32000
+        cfg.deepseek_base_url = "https://api.deepseek.com/anthropic"
+        cfg.deepseek_model = "deepseek-v4-flash"
+        cfg.deepseek_reasoning_effort = "max"
+        cfg.deepseek_max_tokens = 32000
         cfg.validate()  # should not raise
 
     def test_validate_missing_claude_bin_posix(self) -> None:
@@ -928,10 +986,10 @@ class TestConfigValidate:
         Uses mocking to safely test the POSIX branch without affecting
         Windows development."""
         cfg = Config()
-        cfg.openrouter_base_url = "https://openrouter.ai/api"
-        cfg.openrouter_model = "deepseek/deepseek-v4-flash"
-        cfg.openrouter_reasoning_effort = "max"
-        cfg.openrouter_max_tokens = 32000
+        cfg.deepseek_base_url = "https://api.deepseek.com/anthropic"
+        cfg.deepseek_model = "deepseek-v4-flash"
+        cfg.deepseek_reasoning_effort = "max"
+        cfg.deepseek_max_tokens = 32000
         cfg.claude_bin = "/usr/bin/claude"
 
         with patch("src.config.os.name", "posix"), \
@@ -944,10 +1002,10 @@ class TestConfigValidate:
         """On Windows, claude_bin validation is skipped (the binary is on
         the remote VPS, not the local dev box)."""
         cfg = Config()
-        cfg.openrouter_base_url = "https://openrouter.ai/api"
-        cfg.openrouter_model = "deepseek/deepseek-v4-flash"
-        cfg.openrouter_reasoning_effort = "max"
-        cfg.openrouter_max_tokens = 32000
+        cfg.deepseek_base_url = "https://api.deepseek.com/anthropic"
+        cfg.deepseek_model = "deepseek-v4-flash"
+        cfg.deepseek_reasoning_effort = "max"
+        cfg.deepseek_max_tokens = 32000
         cfg.claude_bin = "/usr/bin/claude"
 
         with patch("src.config.os.name", "nt"):
@@ -957,10 +1015,10 @@ class TestConfigValidate:
         """When claude_bin resolves via shutil.which on POSIX, validation
         should pass."""
         cfg = Config()
-        cfg.openrouter_base_url = "https://openrouter.ai/api"
-        cfg.openrouter_model = "deepseek/deepseek-v4-flash"
-        cfg.openrouter_reasoning_effort = "max"
-        cfg.openrouter_max_tokens = 32000
+        cfg.deepseek_base_url = "https://api.deepseek.com/anthropic"
+        cfg.deepseek_model = "deepseek-v4-flash"
+        cfg.deepseek_reasoning_effort = "max"
+        cfg.deepseek_max_tokens = 32000
         cfg.claude_bin = "claude"
 
         with patch("src.config.os.name", "posix"), \
@@ -971,10 +1029,10 @@ class TestConfigValidate:
         """When shutil.which returns None but the exact path exists,
         validation should pass."""
         cfg = Config()
-        cfg.openrouter_base_url = "https://openrouter.ai/api"
-        cfg.openrouter_model = "deepseek/deepseek-v4-flash"
-        cfg.openrouter_reasoning_effort = "max"
-        cfg.openrouter_max_tokens = 32000
+        cfg.deepseek_base_url = "https://api.deepseek.com/anthropic"
+        cfg.deepseek_model = "deepseek-v4-flash"
+        cfg.deepseek_reasoning_effort = "max"
+        cfg.deepseek_max_tokens = 32000
         cfg.claude_bin = "/usr/bin/claude"
 
         with patch("src.config.os.name", "posix"), \
@@ -994,38 +1052,39 @@ class TestStartupValidation:
     def _make_invalid_cfg(self, **overrides: Any) -> Config:
         cfg = Config()
         cfg.webhook_secret = "whs_test"
-        cfg.openrouter_key = "sk-or-v1-test"
+        cfg.deepseek_key = "sk-test"
         cfg.database_url = "postgres://localhost/test"
         cfg.gh_token = "ghp_test"
-        cfg.openrouter_base_url = "https://openrouter.ai/api"
-        cfg.openrouter_model = "deepseek/deepseek-v4-flash"
-        cfg.openrouter_reasoning_effort = "max"
-        cfg.openrouter_max_tokens = 32000
+        cfg.deepseek_base_url = "https://api.deepseek.com/anthropic"
+        cfg.deepseek_model = "deepseek-v4-flash"
+        cfg.deepseek_reasoning_effort = "max"
+        cfg.deepseek_max_tokens = 32000
         for k, v in overrides.items():
             setattr(cfg, k, v)
         return cfg
 
     def test_startup_wrong_base_url_raises(self) -> None:
         """Invalid base_url in startup must raise ValueError before any
-        side effect — NeoState/serve never reached."""
-        cfg = self._make_invalid_cfg(openrouter_base_url="https://api.deepseek.com")
-        with pytest.raises(ValueError, match="openrouter_base_url"):
+        side effect — NeoState/serve never reached. The disabled OpenRouter
+        route is the canonical invalid value."""
+        cfg = self._make_invalid_cfg(deepseek_base_url="https://openrouter.ai/api")
+        with pytest.raises(ValueError, match="deepseek_base_url"):
             cfg.require().validate()
         # If we got here, validate() caught it before any DB/server call.
 
     def test_startup_wrong_model_raises(self) -> None:
-        cfg = self._make_invalid_cfg(openrouter_model="deepseek/deepseek-chat")
-        with pytest.raises(ValueError, match="openrouter_model"):
+        cfg = self._make_invalid_cfg(deepseek_model="deepseek/deepseek-v4-flash")
+        with pytest.raises(ValueError, match="deepseek_model"):
             cfg.require().validate()
 
     def test_startup_wrong_effort_raises(self) -> None:
-        cfg = self._make_invalid_cfg(openrouter_reasoning_effort="high")
-        with pytest.raises(ValueError, match="openrouter_reasoning_effort"):
+        cfg = self._make_invalid_cfg(deepseek_reasoning_effort="high")
+        with pytest.raises(ValueError, match="deepseek_reasoning_effort"):
             cfg.require().validate()
 
     def test_startup_undersized_budget_raises(self) -> None:
-        cfg = self._make_invalid_cfg(openrouter_max_tokens=16000)
-        with pytest.raises(ValueError, match="openrouter_max_tokens"):
+        cfg = self._make_invalid_cfg(deepseek_max_tokens=16000)
+        with pytest.raises(ValueError, match="deepseek_max_tokens"):
             cfg.require().validate()
 
     def test_startup_validate_after_require_ok(self) -> None:
@@ -1048,9 +1107,9 @@ class TestStartupValidation:
 
 class TestProtocolCensus:
     """neo_protocol.py must not contain stale DeepSeek-Pro, Pi, direct-HTTP,
-    or Windows-home-path references.  The model identifier
-    `deepseek/deepseek-v4-flash` (lowercase) is allowed — only the
-    uppercase protocol references are stale."""
+    Windows-home-path, OpenRouter-prefixed-model, or [1m]-suffix references.
+    The exact direct model ID `deepseek-v4-flash` (lowercase) is allowed —
+    only the stale/prefix/suffix forms are banned."""
 
     @staticmethod
     def _protocol_source() -> str:
@@ -1084,6 +1143,22 @@ class TestProtocolCensus:
         src = self._protocol_source()
         assert "direct " not in src, (
             "neo_protocol.py must not describe direct-HTTP or direct-DeepSeek paths"
+        )
+
+    def test_no_prefixed_model_reference(self) -> None:
+        """'deepseek/deepseek-v4-flash' (the OpenRouter slug) is stale — the
+        protocol must name the exact unprefixed direct ID."""
+        src = self._protocol_source()
+        assert "deepseek/deepseek-v4-flash" not in src, (
+            "neo_protocol.py must not mention the prefixed OpenRouter model slug"
+        )
+
+    def test_no_context_suffix_reference(self) -> None:
+        """'[1m]' (the OpenRouter CLI context hint) is stale — the direct
+        route takes the bare model ID."""
+        src = self._protocol_source()
+        assert "[1m]" not in src, (
+            "neo_protocol.py must not mention the [1m] context suffix"
         )
 
     def test_no_windows_home_path(self) -> None:
@@ -1150,9 +1225,9 @@ sys.exit(0)
         try:
             agent = ClaudeAgent(
                 claude_bin=_bat_path,
-                api_key="sk-or-v1-smoke",
-                base_url="https://openrouter.ai/api",
-                model="deepseek/deepseek-v4-flash",
+                api_key="sk-smoke",
+                base_url="https://api.deepseek.com/anthropic",
+                model="deepseek-v4-flash",
                 effort="max",
                 max_tokens=32000,
                 timeout=30,
