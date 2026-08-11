@@ -1,0 +1,81 @@
+{
+  "schema_version": "1.4.0",
+  "product_id": "neo",
+  "repo_role": "service",
+  "repo_remote": "https://github.com/deariencampbell1-sys/rhobear-neo",
+  "last_verified": "2026-08-11T10:20:23Z",
+  "surfaces": {
+    "neo.worker": {
+      "profiles": ["backend_service"],
+      "artifact": "api",
+      "entrypoint": null,
+      "source_files": ["src/__main__.py", "src/webhook_server.py", "src/neo_worker.py", "src/config.py", "src/neo_state.py"],
+      "live_verification": {
+        "method": "transport",
+        "timestamp": "2026-08-11T06:45:00Z",
+        "result": "The public Neo response rendered and the deployed service was active on the Direct path. This is not a tool-enabled fix-forward or merge acceptance claim."
+      }
+    }
+  },
+  "features": {
+    "neo.review.wake": {
+      "stable_id": "F-040",
+      "name": "trusted reviewer wake",
+      "description": "Verify a trusted review status/check and queue a Neo action for the matching pull-request head.",
+      "availability": {
+        "neo.worker": {
+          "state": "UNVERIFIED",
+          "reason": "No authorized end-to-end webhook wake against a real pull request was driven in this acceptance lane.",
+          "last_checked": "2026-08-11T06:45:00Z"
+        }
+      }
+    },
+    "neo.protocol.fixforward": {
+      "stable_id": "F-041",
+      "name": "fix-forward protocol",
+      "description": "Run the bounded Neo protocol to triage findings, fix forward, or escalate a pull request.",
+      "availability": {
+        "neo.worker": {
+          "state": "UNVERIFIED",
+          "reason": "Tool-enabled live proof is blocked because root execution rejects the required dangerous-permissions mode.",
+          "last_checked": "2026-08-11T06:45:00Z"
+        }
+      }
+    },
+    "neo.merge.automerge": {
+      "stable_id": "F-042",
+      "name": "per-install automatic merge",
+      "description": "Optionally squash-merge after a green Neo protocol verdict.",
+      "availability": {
+        "neo.worker": {
+          "state": "INTENTIONAL_OMIT",
+          "reason": "NEO_AUTO_MERGE is false by default; merge remains a controlled per-install opt-in rather than an unattended default.",
+          "last_checked": "2026-08-11T06:45:00Z"
+        }
+      }
+    },
+    "neo.provider.direct": {
+      "stable_id": "F-043",
+      "name": "DeepSeek Direct agent route",
+      "description": "Run the isolated Claude Code agent through DeepSeek Direct's Anthropic-compatible endpoint.",
+      "availability": {
+        "neo.worker": {
+          "state": "AVAILABLE",
+          "last_checked": "2026-08-11T06:45:00Z"
+        }
+      }
+    },
+    "neo.install.credits": {
+      "stable_id": "F-044",
+      "name": "install credit guard",
+      "description": "Check per-install entitlement and credit balance before a paid Neo action.",
+      "availability": {
+        "neo.worker": {
+          "state": "UNVERIFIED",
+          "reason": "The authenticated install/credit path has not been exercised in an owner-authorized live acceptance session.",
+          "last_checked": "2026-08-11T06:45:00Z"
+        }
+      }
+    }
+  }
+}
