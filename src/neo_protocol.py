@@ -1,12 +1,11 @@
 """The Neo protocol brief.
 
-Neo runs as a headless Claude Code CLI agent routed through DeepSeek Direct
-(Anthropic-compatible endpoint, exact `deepseek-v4-flash` model at max
-reasoning effort). This module builds the brief that binds that agent to the
-canon: review the reviewer's findings, drive to GREEN, fix-forward ONLY trivial
-issues, dispatch the same Claude Code CLI agent (same Flash model/tool loop)
-for substantial ones, ESCALATE owner-gated forks, and merge on green behind the
-per-install auto-merge toggle. The brief is data; the merge authority +
+Neo runs as a headless Hermes agent on the approved Bedrock route. This module
+builds the brief that binds that agent to the canon: review the reviewer's
+findings, drive to GREEN, fix-forward ONLY trivial issues, hand substantial
+fixes to the external RHOBEAR dispatcher, ESCALATE owner-gated forks, and merge
+on green behind the per-install auto-merge toggle. Neo never creates a nested
+worker or invokes a direct CLI worker. The brief is data; the merge authority +
 guardrails are the product.
 """
 from __future__ import annotations
@@ -25,7 +24,8 @@ def build_brief(*, repo: str, pr: int, head_sha: str, reviewer_context: str,
 
     builder_clause = (
         f"You have already spent {builder_round}/{max_builder_rounds} builder rounds on this PR. "
-        + (f"You may dispatch ONE more Claude Code CLI agent (same {builder_model} model/tool loop) for a substantial fix."
+        + ("Do NOT spawn or invoke a builder from this Neo process. Prepare one precise dispatch brief "
+           "and hand it to the external RHOBEAR dispatcher on its Hermes/Bedrock route."
            if builder_round < max_builder_rounds else
            "You are OUT of builder rounds — do NOT dispatch another builder. If it is still not green, "
            "ESCALATE with the outstanding findings.")
@@ -51,9 +51,9 @@ CANON (do exactly this):
    - FIX-FORWARD → TRIVIAL only (wrong import, typo, missing constant, a test expectation). Fix it
      yourself, commit to the PR branch, push. Your push re-triggers the reviewer → you'll be re-invoked.
    - BOUNCE (substantial bug) → {builder_clause}
-     To dispatch a builder: write a precise brief (file · line · observed · expected · smallest fix) and
-     run the same Claude Code CLI agent (same {builder_model} model/tool loop) in a checkout of {repo}@the PR
-     branch; it fixes + pushes. Its push re-triggers reviewer → you'll be re-invoked to re-check.
+     Write a precise brief (file · line · observed · expected · smallest fix) and hand it to the external
+     RHOBEAR dispatcher. Do not run Claude, Codex, Pi, a thread, or a nested agent from this process. The
+     dispatched Hermes worker fixes and pushes; its push re-triggers reviewer → you'll be re-invoked.
    - ESCALATE → owner-gated fork ONLY (cost, secrets/signing certs, blast radius, brand) or genuinely
      can't decide, OR out of builder rounds and still not green. Label `neo:escalate`, post the exact
      decision needed, ping the owner. NEVER auto-merge an escalation.
