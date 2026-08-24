@@ -1,0 +1,6 @@
+# rhobear-neo — minimal. Stdlib HTTP server; psycopg for state; PyJWT for App auth.
+# httpx was removed in the Claude Code CLI migration — the agent is a subprocess,
+# not an HTTP client.
+psycopg[binary]>=3.1
+PyJWT>=2.8
+cryptography>=42.0
