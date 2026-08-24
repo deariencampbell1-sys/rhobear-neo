@@ -220,6 +220,11 @@ class ClaudeAgent:
         # (e.g. a stale OpenRouter gateway URL or the CLI's own base-url var).
         env.pop("CLAUDE_CODE_ANTHROPIC_BASE_URL", None)
         env.pop("CLAUDE_CODE_BASE_URL", None)
+        # OpenRouter's Claude Code integration requires the legacy API key slot
+        # to be explicitly blank, otherwise it overrides ANTHROPIC_AUTH_TOKEN
+        # and every call comes back 401.
+        if "openrouter.ai" in self.base_url:
+            env["ANTHROPIC_API_KEY"] = ""
         return env
 
     def _build_cmd(self, brief: str) -> list[str]:

@@ -78,7 +78,14 @@ class Config:
     # deliberately NOT read here — validate() rejects any non-direct base URL.
     deepseek_base_url: str = field(default_factory=lambda: _get(
         "NEO_DEEPSEEK_BASE_URL", "https://api.deepseek.com/anthropic"))
-    deepseek_key: str = field(default_factory=lambda: _get("DEEPSEEK_API_KEY"))
+    # The credential follows the route: OpenRouter routes authenticate with
+    # OPENROUTER_API_KEY, DeepSeek Direct with DEEPSEEK_API_KEY. Reading the
+    # wrong one is how a route change turns into a 401 nobody can explain.
+    deepseek_key: str = field(default_factory=lambda: (
+        _get("OPENROUTER_API_KEY")
+        if "openrouter.ai" in _get("NEO_DEEPSEEK_BASE_URL", "")
+        else _get("DEEPSEEK_API_KEY")
+    ))
     deepseek_model: str = field(default_factory=lambda: _get(
         "NEO_DEEPSEEK_MODEL", "deepseek-v4-flash"))
     deepseek_reasoning_effort: str = field(default_factory=lambda: _get(
@@ -108,7 +115,8 @@ class Config:
     def require(self) -> "Config":
         missing = [n for n, v in {
             "RHOBEAR_NEO_WEBHOOK_SECRET": self.webhook_secret,
-            "DEEPSEEK_API_KEY": self.deepseek_key,
+            ("OPENROUTER_API_KEY" if "openrouter.ai" in self.deepseek_base_url
+             else "DEEPSEEK_API_KEY"): self.deepseek_key,
             "DATABASE_URL": self.database_url,
             "GH_TOKEN": self.gh_token,
         }.items() if not v]
@@ -117,30 +125,55 @@ class Config:
         return self
 
     def validate(self) -> "Config":
-        """Strict startup validation — DeepSeek Direct only, no fallback.
+        """Strict startup validation of the agent route — allowlist, no fallback.
 
-        Verifies:
-          - base_url exactly https://api.deepseek.com/anthropic (trailing slash
-            tolerant) — any OpenRouter or bare api.deepseek.com value is rejected
-          - model exactly deepseek-v4-flash (unprefixed direct ID; a stale
-            deepseek/... or [...]-suffixed value is rejected)
-          - effort exactly max
-          - max_tokens >= 32000
-          - claude_bin exists/executable (where practical)
+        Neo is the highest-stakes agent in the system: it edits code, runs
+        tests, and with NEO_AUTO_MERGE=true it lands the PR itself. Its
+        route is therefore chosen for JUDGMENT QUALITY, not price — owner
+        directive 2026-08-23.
+
+        This is an allowlist, not a single-vendor lock. Pinning one vendor's
+        one model meant that when that balance ran dry on 2026-08-23 the
+        service stayed `active` while the gate was dead, with no legal way
+        to move. An outage must cost a route, never the gate.
+
+        Adding a route here is deliberate. Anything else is refused — no
+        silent fallback, no stale env var quietly downgrading the reviewer.
+
+        Also verifies: effort max, max_tokens >= 32000, claude_bin present.
 
         Raises ValueError (safe to log — no secrets) on any violation.
         """
+        # Anthropic-wire-format endpoints the claude CLI can drive, and the
+        # models approved on each for reviewing and landing code.
+        APPROVED_ROUTES = {
+            # NOTE: the local Bedrock relay (127.0.0.1:9010) only speaks OpenAI
+            # chat/completions. Neo drives the `claude` CLI, which requires an
+            # Anthropic-Messages-wire endpoint (ANTHROPIC_BASE_URL). DeepSeek
+            # Direct is the only currently-wired route that speaks that
+            # protocol without going through paid OpenRouter, so it stays
+            # Neo's sole approved route until a Messages-format shim is built
+            # in front of the Bedrock relay. Tracked, not silently dropped.
+            # DeepSeek Direct stays first-class — not deprecated, not demoted.
+            # It is one approved route among several so a dry balance can no
+            # longer take the merge gate offline.
+            "https://api.deepseek.com/anthropic": {
+                "deepseek-v4-flash",
+                "deepseek-v4-pro",
+            },
+        }
+
         base = self.deepseek_base_url.rstrip("/")
-        if base != "https://api.deepseek.com/anthropic":
+        if base not in APPROVED_ROUTES:
             raise ValueError(
-                f"deepseek_base_url must be https://api.deepseek.com/anthropic, "
-                f"got {self.deepseek_base_url!r}"
+                f"neo base_url {self.deepseek_base_url!r} is not an approved "
+                f"agent route. Approved: {', '.join(sorted(APPROVED_ROUTES))}"
             )
-        if self.deepseek_model.strip() != "deepseek-v4-flash":
+        model = self.deepseek_model.strip()
+        if model not in APPROVED_ROUTES[base]:
             raise ValueError(
-                f"deepseek_model must be 'deepseek-v4-flash' (DeepSeek Direct "
-                f"ID, no /deepseek prefix or [1m] suffix), "
-                f"got {self.deepseek_model!r}"
+                f"neo model {self.deepseek_model!r} is not approved on {base}. "
+                f"Approved there: {', '.join(sorted(APPROVED_ROUTES[base]))}"
             )
         if self.deepseek_reasoning_effort.strip().lower() != "max":
             raise ValueError(
