@@ -137,6 +137,7 @@ class Config:
         APPROVED_ROUTES = {
             "rhobear-glm5": {"bedrock/zai.glm-5"},
             "rhobear-glm47": {"bedrock/zai.glm-4.7"},
+            "deepseek": {"deepseek-v4-flash-vision-exp", "deepseek-v4-pro", "deepseek-v4-flash"},
         }
 
         if self.hermes_provider not in APPROVED_ROUTES:
