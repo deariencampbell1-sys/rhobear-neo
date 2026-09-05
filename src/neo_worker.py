@@ -132,10 +132,12 @@ def _run_agent(agent: ClaudeAgent, brief: str) -> tuple[dict, str]:
     loop against the approved provider profile.
 
     Returns (normalised usage, verdict line).  On any error both are empty
-    so the caller skips merge and escalates."""
-    try:
-        usage, verdict = agent.run(brief)
-        return usage, verdict
-    except AgentError:
-        log.exception("neo hermes agent run failed")
-        return {}, ""
+    so the caller skips merge and escalates.  One retry: a single malformed
+    model response should not freeze a lane in triage forever."""
+    for attempt in (1, 2):
+        try:
+            usage, verdict = agent.run(brief)
+            return usage, verdict
+        except AgentError:
+            log.exception("neo hermes agent run failed (attempt %d/2)", attempt)
+    return {}, ""
