@@ -24,7 +24,7 @@ import subprocess
 
 from .config import Config
 from .neo_state import NeoState
-from .agent_claude import ClaudeAgent, AgentError
+from .agent_hermes import HermesAgent as ClaudeAgent, AgentError
 from . import neo_protocol
 
 log = logging.getLogger("rhobear_neo.worker")
@@ -101,12 +101,12 @@ def run_neo(cfg: Config, state: NeoState, wake: dict) -> None:
     state.record(repo, pr, sha, "triage", detail={"context": wake.get("context"),
                                                    "green": wake.get("green")})
 
-    # --- run the Neo protocol headless via Claude Code CLI --------------------
+    # --- run the Neo protocol headless via Hermes ------------------------------
     brief = neo_protocol.build_brief(
         repo=repo, pr=pr, head_sha=sha,
         reviewer_context=wake.get("context", "?"), reviewer_green=bool(wake.get("green")),
         auto_merge=auto_merge, builder_round=rounds,
-        max_builder_rounds=cfg.max_builder_rounds, builder_model=cfg.deepseek_model,
+        max_builder_rounds=cfg.max_builder_rounds, builder_model=cfg.hermes_model,
     )
     agent = ClaudeAgent.from_config(cfg)
     usage, verdict = _run_agent(agent, brief)
@@ -125,17 +125,19 @@ def run_neo(cfg: Config, state: NeoState, wake: dict) -> None:
 
 
 def _run_agent(agent: ClaudeAgent, brief: str) -> tuple[dict, str]:
-    """Run the Neo brief headless via Claude Code CLI.
+    """Run the Neo brief headless via the Hermes CLI.
 
-    Claude Code runs with isolated config dir + per-run temp workdir, giving
-    the agent full tool access (gh, git, edit, test runner).  DeepSeek Direct
-    provides the Anthropic-compatible endpoint.
+    Hermes runs one-shot (-z) with a per-run temp work directory, giving the
+    agent full tool access (gh, git, edit, test runner) through its own tool
+    loop against the approved provider profile.
 
     Returns (normalised usage, verdict line).  On any error both are empty
-    so the caller skips merge and escalates."""
-    try:
-        usage, verdict = agent.run(brief)
-        return usage, verdict
-    except AgentError:
-        log.exception("neo claude agent run failed")
-        return {}, ""
+    so the caller skips merge and escalates.  One retry: a single malformed
+    model response should not freeze a lane in triage forever."""
+    for attempt in (1, 2):
+        try:
+            usage, verdict = agent.run(brief)
+            return usage, verdict
+        except AgentError:
+            log.exception("neo hermes agent run failed (attempt %d/2)", attempt)
+    return {}, ""
