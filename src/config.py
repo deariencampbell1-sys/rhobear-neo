@@ -92,14 +92,18 @@ class Config:
     claude_bin: str = field(default_factory=lambda: _get("NEO_CLAUDE_BIN", "/usr/bin/claude"))
 
     # --- builder lane engine (Hermes) ---
+    # Route: z.ai DIRECT (glm-5.3-flash), NOT the Bedrock proxy. Bedrock
+    # (bedrock/zai.glm-5 via 127.0.0.1:9010) is slower, pricier and reserved
+    # for when a direct route is unavailable. deepseek-v4-flash via the
+    # "deepseek" provider is the documented fallback.
     # neo_builder.dispatch_one reads all three. Without them it raises
     # AttributeError at the moment it picks up real work, systemd restarts it,
     # and the lane crash-loops forever WITHOUT EVER DISPATCHING A FIX -- while
     # still logging harmless-looking "skip (closed/merged)" lines. Found
     # 2026-09-20 after the builder had silently dispatched nothing.
     hermes_bin: str = field(default_factory=lambda: _get("NEO_HERMES_BIN", "/opt/rhobear-hermes/bin/hermes"))
-    hermes_provider: str = field(default_factory=lambda: _get("NEO_HERMES_PROVIDER", "rhobear-glm5"))
-    hermes_model: str = field(default_factory=lambda: _get("NEO_HERMES_MODEL", "bedrock/zai.glm-5"))
+    hermes_provider: str = field(default_factory=lambda: _get("NEO_HERMES_PROVIDER", "zai"))
+    hermes_model: str = field(default_factory=lambda: _get("NEO_HERMES_MODEL", "glm-5.3-flash"))
 
     # --- merge behaviour (the ONE per-install button) ---
     # Off  -> drive to green, fix-forward, dispatch builder, label neo:ready, STOP.
