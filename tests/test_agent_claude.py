@@ -841,7 +841,7 @@ class TestResultEnvelope:
     def test_terminal_reason_error_fails(self) -> None:
         """terminal_reason='error' should raise MalformedStream."""
         output = json.dumps({
-            "type": "result", "subtype": "success", "is_error": False,
+            "type": "result", "type": "result", "subtype": "success", "is_error": False,
             "result": "Analysis.\nVERDICT: ACCEPT-READY",
             "usage": {"input_tokens": 50, "output_tokens": 20},
             "num_turns": 1, "stop_reason": "end_turn",
@@ -855,7 +855,7 @@ class TestResultEnvelope:
     def test_terminal_reason_end_turn_ok(self) -> None:
         """terminal_reason='end_turn' should be accepted."""
         output = json.dumps({
-            "type": "result", "subtype": "success", "is_error": False,
+            "type": "result", "type": "result", "subtype": "success", "is_error": False,
             "result": "Analysis.\nVERDICT: ACCEPT-READY",
             "usage": {"input_tokens": 50, "output_tokens": 20},
             "num_turns": 1, "stop_reason": "end_turn",
@@ -869,7 +869,7 @@ class TestResultEnvelope:
     def test_terminal_reason_null_ok(self) -> None:
         """No terminal_reason (absent or null) should be accepted."""
         output = json.dumps({
-            "type": "result", "subtype": "success", "is_error": False,
+            "type": "result", "type": "result", "subtype": "success", "is_error": False,
             "result": "Analysis.\nVERDICT: ACCEPT-READY",
             "usage": {"input_tokens": 50, "output_tokens": 20},
             "num_turns": 1, "stop_reason": "end_turn",
@@ -883,7 +883,7 @@ class TestResultEnvelope:
     def test_api_error_status_present_fails(self) -> None:
         """Non-null api_error_status should raise MalformedStream."""
         output = json.dumps({
-            "type": "result", "subtype": "success", "is_error": False,
+            "type": "result", "type": "result", "subtype": "success", "is_error": False,
             "result": "Analysis.\nVERDICT: ACCEPT-READY",
             "usage": {"input_tokens": 50, "output_tokens": 20},
             "num_turns": 1, "stop_reason": "end_turn",
@@ -897,7 +897,7 @@ class TestResultEnvelope:
     def test_api_error_status_null_ok(self) -> None:
         """Null/absent api_error_status should be accepted."""
         output = json.dumps({
-            "type": "result", "subtype": "success", "is_error": False,
+            "type": "result", "type": "result", "subtype": "success", "is_error": False,
             "result": "Analysis.\nVERDICT: ACCEPT-READY",
             "usage": {"input_tokens": 50, "output_tokens": 20},
             "num_turns": 1, "stop_reason": "end_turn",
@@ -1241,3 +1241,67 @@ sys.exit(0)
             for _p in (_py_path, _bat_path):
                 if _os.path.exists(_p):
                     _os.unlink(_p)
+
+def test_parse_output_accepts_completed_terminal_reason():
+    """Claude CLI auto-updated to return terminal_reason='completed' for
+    successful runs. _parse_output must accept it (not raise MalformedStream)."""
+    import json as _json
+    from types import SimpleNamespace
+    from src.agent_claude import ClaudeAgent
+
+    agent = ClaudeAgent(
+        claude_bin="/usr/bin/true",
+        api_key="sk-test",
+        base_url="https://example.com",
+        model="test-model",
+        effort="max",
+        max_tokens=1000,
+        timeout=10,
+        gh_token="ghp_test",
+    )
+    mock_proc = SimpleNamespace(
+        returncode=0,
+        stdout=_json.dumps({
+            "type": "result", "subtype": "success", "is_error": False,
+            "result": "VERDICT: ACCEPT-MERGED",
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+            "num_turns": 1, "stop_reason": "end_turn",
+            "terminal_reason": "completed",
+            "permission_denials": [],
+        }),
+        stderr="",
+    )
+    usage, verdict = agent._parse_output(mock_proc)
+    assert verdict == "ACCEPT-MERGED", f"expected ACCEPT-MERGED, got {verdict!r}"
+    assert usage["input_tokens"] == 10
+
+
+def test_parse_output_rejects_unknown_terminal_reason():
+    """An unrecognized terminal_reason must still raise MalformedStream
+    (fail-closed — don't silently accept unknown states)."""
+    import json as _json
+    from types import SimpleNamespace
+    from src.agent_claude import ClaudeAgent, MalformedStream
+
+    agent = ClaudeAgent(
+        claude_bin="/usr/bin/true", api_key="sk-test",
+        base_url="https://example.com", model="test-model",
+        effort="max", max_tokens=1000, timeout=10, gh_token="ghp_test",
+    )
+    mock_proc = SimpleNamespace(
+        returncode=0,
+        stdout=_json.dumps({
+            "type": "result", "subtype": "success", "is_error": False,
+            "result": "VERDICT: ACCEPT-MERGED",
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+            "num_turns": 1, "stop_reason": "end_turn",
+            "terminal_reason": "something_unexpected",
+            "permission_denials": [],
+        }),
+        stderr="",
+    )
+    try:
+        agent._parse_output(mock_proc)
+        assert False, "should have raised MalformedStream"
+    except MalformedStream as e:
+        assert "non-terminal" in str(e), f"wrong error: {e}"

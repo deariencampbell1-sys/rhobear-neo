@@ -42,6 +42,9 @@ CREATE TABLE IF NOT EXISTS neo_installs (
 
 @dataclass
 class NeoState:
+    """Thread-safe Postgres state store. Every method opens a fresh
+    psycopg.connect(dsn, autocommit=True) — no shared connection, cursor, or
+    mutable state. Safe to call from concurrent ThreadPoolExecutor threads."""
     dsn: str
 
     def _conn(self):

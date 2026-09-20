@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import os
 import concurrent.futures
+import threading
 
 from . import config as _config
 from .neo_state import NeoState
@@ -39,10 +40,25 @@ def main() -> None:
         max_workers=max_workers, thread_name_prefix="neo-worker",
     )
 
+    # Bounded backpressure: cap in-flight wakes at 4× workers. Excess wakes
+    # are dropped with a warning (same fail-open behavior as the old
+    # queue.Queue maxsize=1000, but bounded instead of executor-unbounded).
+    _inflight = threading.Semaphore(max_workers * 4)
+
     def on_verdict(wake: dict) -> None:
+        if not _inflight.acquire(blocking=False):
+            log.warning("neo backpressure — dropping %s#%s (queue full)",
+                        wake.get("repo"), wake.get("pr"))
+            return
+        def _task():
+            try:
+                _run_wake(wake)
+            finally:
+                _inflight.release()
         try:
-            executor.submit(_run_wake, wake)
+            executor.submit(_task)
         except RuntimeError:
+            _inflight.release()
             log.warning("neo executor shutting down — dropping %s", wake.get("repo"))
 
     def _run_wake(wake: dict) -> None:
