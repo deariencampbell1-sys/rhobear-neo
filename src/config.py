@@ -91,6 +91,16 @@ class Config:
     # --- claude binary path (on the VPS: /usr/bin/claude) ---
     claude_bin: str = field(default_factory=lambda: _get("NEO_CLAUDE_BIN", "/usr/bin/claude"))
 
+    # --- builder lane engine (Hermes) ---
+    # neo_builder.dispatch_one reads all three. Without them it raises
+    # AttributeError at the moment it picks up real work, systemd restarts it,
+    # and the lane crash-loops forever WITHOUT EVER DISPATCHING A FIX -- while
+    # still logging harmless-looking "skip (closed/merged)" lines. Found
+    # 2026-09-20 after the builder had silently dispatched nothing.
+    hermes_bin: str = field(default_factory=lambda: _get("NEO_HERMES_BIN", "/opt/rhobear-hermes/bin/hermes"))
+    hermes_provider: str = field(default_factory=lambda: _get("NEO_HERMES_PROVIDER", "rhobear-glm5"))
+    hermes_model: str = field(default_factory=lambda: _get("NEO_HERMES_MODEL", "bedrock/zai.glm-5"))
+
     # --- merge behaviour (the ONE per-install button) ---
     # Off  -> drive to green, fix-forward, dispatch builder, label neo:ready, STOP.
     # On   -> also run the squash-merge itself.
