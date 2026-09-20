@@ -318,7 +318,7 @@ class ClaudeAgent:
         # --- Terminal reason (from the API envelope, not stop_reason) ---
         terminal_reason = result.get("terminal_reason") or ""
         if terminal_reason:
-            acceptable_terminal = {"stop", "end_turn"}
+            acceptable_terminal = {"stop", "end_turn", "completed"}
             if terminal_reason not in acceptable_terminal:
                 raise MalformedStream(
                     f"non-terminal terminal_reason: {terminal_reason!r}"
