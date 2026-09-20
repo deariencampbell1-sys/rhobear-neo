@@ -91,6 +91,13 @@ class Config:
     # --- claude binary path (on the VPS: /usr/bin/claude) ---
     claude_bin: str = field(default_factory=lambda: _get("NEO_CLAUDE_BIN", "/usr/bin/claude"))
 
+    # --- builder lane engine (Hermes) ---
+    # neo_builder.dispatch_one reads all three; without them it raises
+    # AttributeError and the service crash-loops without ever dispatching a fix.
+    hermes_bin: str = field(default_factory=lambda: _get("NEO_HERMES_BIN", "/opt/rhobear-hermes/bin/hermes"))
+    hermes_provider: str = field(default_factory=lambda: _get("NEO_HERMES_PROVIDER", "zai"))
+    hermes_model: str = field(default_factory=lambda: _get("NEO_HERMES_MODEL", "glm-5.3-flash"))
+
     # --- merge behaviour (the ONE per-install button) ---
     # Off  -> drive to green, fix-forward, dispatch builder, label neo:ready, STOP.
     # On   -> also run the squash-merge itself.

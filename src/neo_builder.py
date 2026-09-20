@@ -18,6 +18,7 @@ Usage (as the neo venv, User=slang, env from rhobear-neo/.env):
 """
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import logging
 import os
@@ -34,6 +35,24 @@ log = logging.getLogger("rhobear_neo.builder")
 WORKTREES = Path("/opt/rhobear/neo-builder-worktrees")
 BRIEFS = Path("/opt/rhobear/neo-builder-briefs")
 POLL_SECS = int(os.environ.get("NEO_BUILDER_POLL_SECS", "120"))
+# Fan-out width. The lane used to claim one row per poll and then sleep
+# POLL_SECS *even after a productive batch*, so the ceiling was one PR per
+# (fix + 120s) no matter how much compute was idle. prepare_worktree() does a
+# fresh clone into a per-PR dest and every _mark() opens its own connection,
+# so dispatch_one is already thread-safe -- nothing was serialising it but the
+# LIMIT 1 and the unconditional sleep.
+CONCURRENCY = int(os.environ.get("NEO_BUILDER_CONCURRENCY", "4"))
+
+NEWLINE = "\n"
+# Selects only comments that read like review output, so a chatty PR thread
+# does not drown the actual findings.
+JQ_ISSUE_COMMENTS = (
+    '.[] | select(.body | test("finding|verdict|request.?changes|blocker|must fix"; "i"))'
+    ' | "=== " + .user.login + " " + .created_at + " ===" + "\n" + .body'
+)
+JQ_INLINE_COMMENTS = (
+    '.[] | .path + ":" + ((.line // .original_line) | tostring) + " -> " + .body'
+)
 
 
 class BuilderAgent(HermesAgent):
@@ -114,7 +133,16 @@ def prepare_worktree(cfg: Config, repo: str, pr: int) -> tuple[str, str]:
     return str(dest), head_branch
 
 
-def fetch_findings(repo: str) -> str:
+def fetch_findings(cfg: Config, repo: str, pr: int) -> str:
+    """Reviewer findings for this PR. DB first, then the PR's own timeline.
+
+    The DB lookup is scoped to 6 hours, so ANY PR last reviewed before today
+    used to dispatch with an empty findings block -- the brief then told the
+    fixer to "apply the review timeline comments on the PR" without ever
+    handing it those comments. The fixer guessed, produced nothing, and burned
+    a builder round. The whole backlog is August/September PRs, so this was
+    the common case, not the edge case.
+    """
     try:
         conn = _db()
         with conn.cursor() as cur:
@@ -125,10 +153,24 @@ def fetch_findings(repo: str) -> str:
             )
             row = cur.fetchone()
         conn.close()
-        return row[0] if row else ""
+        if row and row[0]:
+            return row[0]
     except Exception as e:  # findings table optional — never block a fix on it
-        log.warning("findings fetch failed (proceeding): %s", e)
-        return ""
+        log.warning("findings fetch failed (falling back to timeline): %s", e)
+
+    parts = []
+    rc, out = gh(cfg, "api", f"repos/{repo}/issues/{pr}/comments", "--paginate",
+                 "--jq", JQ_ISSUE_COMMENTS, timeout=60)
+    if rc == 0 and out.strip():
+        parts.append("## Reviewer comments on this PR" + NEWLINE + out.strip()[-14000:])
+    rc, out = gh(cfg, "api", f"repos/{repo}/pulls/{pr}/comments", "--paginate",
+                 "--jq", JQ_INLINE_COMMENTS, timeout=60)
+    if rc == 0 and out.strip():
+        parts.append("## Inline review comments" + NEWLINE + out.strip()[-8000:])
+    if parts:
+        log.info("findings for %s#%s sourced from PR timeline (%d chars)",
+                 repo, pr, sum(len(p) for p in parts))
+    return (NEWLINE + NEWLINE).join(parts)
 
 
 def build_brief(repo: str, pr: int, sha: str, round_: str, head_branch: str, findings: str) -> str:
@@ -160,14 +202,18 @@ def dispatch_one(cfg: Config, row: dict) -> None:
     state = pr_state(cfg, repo, pr).split("\t")[0]
     if state.upper() not in ("OPEN", "DRAFT"):
         log.info("skip (closed/merged): %s#%s", repo, pr)
-        _mark(_db(), row["id"], {"skipped_merged": True})
+        # brief_dispatched is what queued() filters on. Marking only
+        # skipped_merged leaves the row claimable, and since queued() is
+        # ORDER BY created_at DESC LIMIT 1, a single closed PR at the head
+        # is re-picked every poll and starves the entire queue behind it.
+        _mark(_db(), row["id"], {"skipped_merged": True, "brief_dispatched": True})
         return
     try:
         worktree, head_branch = prepare_worktree(cfg, repo, pr)
     except Exception as e:
         log.error("worktree prep failed %s#%s: %s", repo, pr, e)
         return
-    findings = fetch_findings(repo)
+    findings = fetch_findings(cfg, repo, pr)
     brief = build_brief(repo, pr, sha, round_, head_branch, findings)
     brief_dir = BRIEFS / f"{repo.replace('/', '-')}-{pr}"
     brief_dir.mkdir(parents=True, exist_ok=True)
@@ -195,14 +241,33 @@ def dispatch_one(cfg: Config, row: dict) -> None:
              repo, pr, pushed, head_before[:8], head_after[:8])
 
 
-def queued(conn, repo_filter: str = "", limit: int = 1) -> list[dict]:
-    sql = ("SELECT id, repo, pr_number, head_sha, builder_round FROM neo_actions "
+def queued(conn, repo_filter: str = "", limit: int = 1,
+           allowlist: tuple[str, ...] = ()) -> list[dict]:
+    # DISTINCT ON collapses multiple rounds of the SAME PR to one row.
+    # prepare_worktree() keys its dest on repo+pr, so claiming round 1 and
+    # round 2 of one PR in the same batch made two threads rm -rf and clone
+    # the same directory -- git aborts with
+    # "BUG: initial ref transaction called with existing refs" (SIGABRT).
+    # Serial LIMIT 1 never hit this. Newest round wins; the older round is
+    # stale by definition.
+    sql = ("SELECT id, repo, pr_number, head_sha, builder_round FROM ("
+           "SELECT DISTINCT ON (repo, pr_number) "
+           "id, repo, pr_number, head_sha, builder_round, created_at "
+           "FROM neo_actions "
            "WHERE phase = 'builder' AND NOT (detail ? 'brief_dispatched')")
     params: list = []
     if repo_filter:
         sql += " AND repo = %s"
         params.append(repo_filter)
-    sql += " ORDER BY created_at DESC LIMIT %s"
+    elif allowlist:
+        # Scope the lane to repos that are actually alive. Without this the
+        # builder happily burns fix rounds on archived and renamed repos
+        # (rhobear-app -> rhobear-app-legacy/ARCHIVED, rhobear-hub-web ->
+        # rhobear-builds-web), which can never merge.
+        sql += " AND repo = ANY(%s)"
+        params.append(list(allowlist))
+    sql += (" ORDER BY repo, pr_number, builder_round DESC, created_at DESC"
+            ") q ORDER BY created_at DESC LIMIT %s")
     params.append(limit)
     with conn.cursor() as cur:
         cur.execute(sql, params)
@@ -220,19 +285,38 @@ def main() -> int:
         repo_filter = args[args.index("--repo") + 1]
     cfg = Config()
     conn = _db()
+    pool = concurrent.futures.ThreadPoolExecutor(
+        max_workers=CONCURRENCY, thread_name_prefix="neo-builder")
+    log.info("builder lane up: concurrency=%d poll=%ds allowlist=%s",
+             CONCURRENCY, POLL_SECS, ",".join(cfg.repo_allowlist) or "(none)")
+    last_ids: set[int] = set()
     while True:
-        rows = queued(conn, repo_filter, limit=1)
-        if rows:
+        rows = queued(conn, repo_filter, limit=CONCURRENCY,
+                      allowlist=cfg.repo_allowlist)
+        ids = {r["id"] for r in rows}
+        if rows and dry:
             for row in rows:
-                if dry:
-                    log.info("dry-run: would dispatch %s#%s@%s round=%s",
-                             row["repo"], row["pr_number"], row["head_sha"][:8],
-                             row["builder_round"])
-                else:
-                    dispatch_one(cfg, row)
+                log.info("dry-run: would dispatch %s#%s@%s round=%s",
+                         row["repo"], row["pr_number"], row["head_sha"][:8],
+                         row["builder_round"])
+        elif rows:
+            log.info("claiming %d row(s) across %d repo(s)",
+                     len(rows), len({r["repo"] for r in rows}))
+            futs = [pool.submit(dispatch_one, cfg, row) for row in rows]
+            for fut in concurrent.futures.as_completed(futs):
+                try:
+                    fut.result()
+                except Exception:
+                    log.exception("dispatch worker crashed")
         if once:
             break
-        time.sleep(POLL_SECS)
+        # Sleep only when there is nothing to do, or when the batch made no
+        # progress. dispatch_one returns WITHOUT marking the row if worktree
+        # prep fails, so an unfixable row would otherwise spin a tight loop;
+        # an identical id set two passes running is exactly that condition.
+        if not rows or ids == last_ids:
+            time.sleep(POLL_SECS)
+        last_ids = ids
     conn.close()
     return 0
 
