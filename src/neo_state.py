@@ -62,13 +62,25 @@ class NeoState:
             ).fetchone()
         return int(row[0] or 0)
 
-    def already_acted(self, repo: str, pr: int, head_sha: str, phase: str) -> bool:
+    def already_acted(self, repo: str, pr: int, head_sha: str, phase: str,
+                      green: bool | None = None) -> bool:
+        """Dedup guard. When `green` is given, only a prior action recorded for the
+        SAME verdict color counts as already-acted: a green verdict arriving after a
+        red one (or vice versa) is new information and must be triaged again."""
         with self._conn() as c:
-            row = c.execute(
-                "SELECT 1 FROM neo_actions WHERE repo=%s AND pr_number=%s "
-                "AND head_sha=%s AND phase=%s LIMIT 1",
-                (repo, pr, head_sha, phase),
-            ).fetchone()
+            if green is None:
+                row = c.execute(
+                    "SELECT 1 FROM neo_actions WHERE repo=%s AND pr_number=%s "
+                    "AND head_sha=%s AND phase=%s LIMIT 1",
+                    (repo, pr, head_sha, phase),
+                ).fetchone()
+            else:
+                row = c.execute(
+                    "SELECT 1 FROM neo_actions WHERE repo=%s AND pr_number=%s "
+                    "AND head_sha=%s AND phase=%s AND "
+                    "COALESCE((detail->>'green')::boolean, false) = %s LIMIT 1",
+                    (repo, pr, head_sha, phase, green),
+                ).fetchone()
         return row is not None
 
     def record(self, repo: str, pr: int, head_sha: str, phase: str, *,
