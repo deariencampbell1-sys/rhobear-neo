@@ -33,6 +33,7 @@ log = logging.getLogger("rhobear_neo.agent")
 
 # Canonical Neo verdicts — anything else is rejected.
 CANONICAL_VERDICTS = frozenset({
+    "FIXED",  # builder alias for ACCEPT-READY
     "ACCEPT-MERGED",
     "ACCEPT-READY",
     "FIX-FORWARD",
