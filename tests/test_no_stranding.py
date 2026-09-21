@@ -4,16 +4,35 @@ from src import neo_worker
 
 
 class FakeState:
+    """In-memory NeoState stand-in with the same color-aware dedup contract.
+
+    rows: (repo, pr, sha, phase, green, verdict); green None == legacy row. The
+    real SQL treats a missing detail->>'green' as false (red), so legacy rows
+    only block red wakes -- a first green wake still re-triggers.
+    """
     def __init__(self):
         self.rows = []
-    def already_acted(self, repo, pr, sha, phase):
-        return any(r[:4] == (repo, pr, sha, phase) for r in self.rows)
+    def already_acted(self, repo, pr, sha, phase, green=None):
+        for r in self.rows:
+            if r[:4] != (repo, pr, sha, phase):
+                continue
+            if green is None:
+                return True
+            if r[4] is None:
+                if green is False:
+                    return True
+                continue
+            if bool(r[4]) == bool(green):
+                return True
+        return False
     def builder_rounds(self, repo, pr):
         return 0
     def install(self, *a):
         return {}
     def record(self, repo, pr, sha, phase, **kw):
-        self.rows.append((repo, pr, sha, phase, kw.get("verdict", "")))
+        detail = kw.get("detail") or {}
+        self.rows.append((repo, pr, sha, phase, detail.get("green"),
+                          kw.get("verdict", "")))
     def clear(self, repo, pr, sha, phase):
         before = len(self.rows)
         self.rows = [r for r in self.rows if r[:4] != (repo, pr, sha, phase)]
@@ -47,3 +66,58 @@ def test_successful_triage_still_idempotent():
          mock.patch.object(neo_worker, "_run_agent", return_value=({}, "FIX-FORWARD")):
         neo_worker.run_neo(_cfg(), st, _wake())
     assert st.already_acted("o/r", 7, "a" * 40, "triage")
+
+
+# ===================================================================
+# Verdict-color redelivery -- a green flip on a red-triaged head must re-run
+# ===================================================================
+
+def _run(st, wake, verdict="ACCEPT-READY"):
+    with mock.patch.object(neo_worker, "resolve_pr", return_value=7), \
+         mock.patch.object(neo_worker.ClaudeAgent, "from_config"), \
+         mock.patch.object(neo_worker, "_run_agent", return_value=({}, verdict)) as m:
+        neo_worker.run_neo(_cfg(), st, wake)
+    return m
+
+
+def test_green_flip_after_red_triage_is_not_skipped():
+    """The green-stall bug: reviewer passes the same head Neo already triaged
+    red. The old guard skipped forever; it must triage again."""
+    st = FakeState()
+    st.record("o/r", 7, "a" * 40, "triage", detail={"green": False})
+    m = _run(st, _wake())  # _wake() green=True
+    assert m.called, "green verdict after a red triage must re-run the agent"
+    assert any(r[:4] == ("o/r", 7, "a" * 40, "triage") and r[4] is True
+               for r in st.rows), "green triage must be recorded"
+
+
+def test_same_color_red_wake_is_still_idempotent():
+    """A red wake re-delivered for a red-triaged head stays skipped."""
+    st = FakeState()
+    st.record("o/r", 7, "a" * 40, "triage", detail={"green": False})
+    m = _run(st, {**_wake(), "green": False})
+    assert not m.called, "same-color red redelivery must stay idempotent"
+
+
+def test_legacy_row_without_color_counts_as_red():
+    """Rows written before the color field must not block a first green wake."""
+    st = FakeState()
+    st.record("o/r", 7, "a" * 40, "triage", detail={})
+    m = _run(st, _wake())
+    assert m.called, "legacy colorless row must not swallow a green verdict"
+
+
+def test_red_flip_after_green_triage_re_runs():
+    """The inverse: reviewer turns red after a green triage (regression)."""
+    st = FakeState()
+    st.record("o/r", 7, "a" * 40, "triage", detail={"green": True})
+    m = _run(st, {**_wake(), "green": False}, verdict="BOUNCE-BUILDER")
+    assert m.called, "red verdict after a green triage must re-run the agent"
+
+
+def test_already_merged_head_never_re_runs():
+    """Even a color flip must not re-open a head Neo already merged."""
+    st = FakeState()
+    st.record("o/r", 7, "a" * 40, "merged", detail={"green": True})
+    m = _run(st, _wake())
+    assert not m.called, "a merged head must never be triaged again"

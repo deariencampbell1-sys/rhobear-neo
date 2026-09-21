@@ -81,8 +81,19 @@ def run_neo(cfg: Config, state: NeoState, wake: dict) -> None:
         return
 
     # --- loop / thrash guard ------------------------------------------------
-    if state.already_acted(repo, pr, sha, "triage"):
-        log.info("already triaged %s#%s@%s — skip (idempotent)", repo, pr, sha[:8])
+    # Keyed on verdict COLOR, not sha alone. A green verdict arriving after a
+    # red triage of the same head (the reviewer re-ran and passed it) is new
+    # decision input and must not be swallowed by the old idempotency skip --
+    # that skip is what left green-reviewed PRs open (green-stall) while the
+    # red triage sat as their only record. Missing color on old rows counts
+    # as red so a first green wake still re-triggers.
+    green = bool(wake.get("green"))
+    if state.already_acted(repo, pr, sha, "triage", green=green):
+        log.info("already triaged %s#%s@%s (green=%s) — skip (idempotent)",
+                 repo, pr, sha[:8], green)
+        return
+    if state.already_acted(repo, pr, sha, "merged"):
+        log.info("%s#%s@%s already merged by Neo — skip", repo, pr, sha[:8])
         return
     rounds = state.builder_rounds(repo, pr)
 
