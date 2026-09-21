@@ -79,6 +79,12 @@ class BuilderAgent(HermesAgent):
         log.info("builder hermes exit=%d elapsed=%.0fs stdout=%d stderr=%d",
                  proc.returncode, time.monotonic() - start,
                  len(proc.stdout or ""), len(proc.stderr or ""))
+        if proc.returncode != 0 and (proc.stderr or "").strip():
+            # We were logging the LENGTH of stderr and throwing away the text,
+            # so a failed fixer left nothing to diagnose ("stderr=71" and no 71
+            # characters anywhere). Unattended overnight runs need the reason.
+            log.error("builder hermes stderr tail %s: %s",
+                      self.work_dir.rsplit("/", 1)[-1], proc.stderr.strip()[-1200:])
         try:
             return self._parse_output(proc)
         except Exception as e:
