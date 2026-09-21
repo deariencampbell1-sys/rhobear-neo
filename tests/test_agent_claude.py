@@ -614,6 +614,27 @@ class TestConfigValidation:
 # Stale OpenRouter env vars — must be invisible to Config
 # ===================================================================
 
+class TestClientKeyPrecedence:
+    """NEO_DEEPSEEK_API_KEY (bridge handshake) wins over DEEPSEEK_API_KEY
+    (provider key); direct DeepSeek still works with just DEEPSEEK_API_KEY."""
+
+    def test_bridge_key_wins(self) -> None:
+        with patch.dict(os.environ, {
+            "NEO_DEEPSEEK_API_KEY": "sk-bridge-handshake",
+            "DEEPSEEK_API_KEY": "sk-real-provider",
+        }, clear=False):
+            cfg = Config()
+        assert cfg.deepseek_key == "sk-bridge-handshake"
+
+    def test_provider_key_fallback(self) -> None:
+        with patch.dict(os.environ, {
+            "NEO_DEEPSEEK_API_KEY": "",
+            "DEEPSEEK_API_KEY": "sk-real-provider",
+        }, clear=False):
+            cfg = Config()
+        assert cfg.deepseek_key == "sk-real-provider"
+
+
 class TestStaleOpenRouterEnv:
     """Env vars from the disabled OpenRouter route must never be read by
     Config. A stale OPENROUTER_API_KEY / NEO_OPENROUTER_* cannot silently
@@ -941,6 +962,35 @@ class TestConfigValidate:
         cfg = Config()
         cfg.deepseek_base_url = "https://api.deepseek.com/anthropic/"
         cfg.validate()  # should not raise
+
+    def test_validate_accepts_loopback_bridge_url(self) -> None:
+        """The local Claude-wire bridge is approved: DeepSeek primary with a
+        Bedrock fallback lives behind it, so a DeepSeek balance exhaustion
+        no longer stops Neo."""
+        cfg = Config()
+        cfg.deepseek_base_url = "http://127.0.0.1:8790"
+        cfg.validate()  # should not raise
+
+    def test_validate_accepts_tailnet_bridge_url(self) -> None:
+        """Same bridge on the tailnet address (how Neo reaches it)."""
+        cfg = Config()
+        cfg.deepseek_base_url = "http://100.64.112.103:8790"
+        cfg.validate()  # should not raise
+
+    def test_validate_rejects_unknown_local_gateway(self) -> None:
+        """A random localhost port is NOT the bridge — only the approved
+        endpoints pass."""
+        cfg = Config()
+        cfg.deepseek_base_url = "http://127.0.0.1:9999"
+        with pytest.raises(ValueError, match="deepseek_base_url"):
+            cfg.validate()
+
+    def test_validate_rejects_public_anthropic_clone(self) -> None:
+        """Any other Anthropic-wire host is rejected."""
+        cfg = Config()
+        cfg.deepseek_base_url = "https://api.example.com/anthropic"
+        with pytest.raises(ValueError, match="deepseek_base_url"):
+            cfg.validate()
 
     def test_validate_rejects_stale_prefixed_model(self) -> None:
         """The old OpenRouter model slug (deepseek/... prefix) must be
