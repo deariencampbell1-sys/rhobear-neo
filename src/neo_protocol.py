@@ -36,7 +36,13 @@ def build_brief(*, repo: str, pr: int, head_sha: str, reviewer_context: str,
 canon is inlined below.
 
 TARGET: PR #{pr} in {repo} at head {head_sha[:12]}.
-REVIEWER: `{reviewer_context}` reported {'GREEN' if reviewer_green else 'NOT green (changes requested / failing)'}.
+REVIEWER: `{reviewer_context}` reported {'GREEN' if reviewer_green else 'NOT green (changes requested / failing)'} on this head
+({'commit status success' if reviewer_green else 'commit status failure/pending'}).
+GREEN means the reviewer's COMMIT STATUS is `success` on this exact head. A reviewer verdict
+line of `COMMENT` delivered with that success status is GREEN with non-blocking notes only —
+triage the notes, fix or flag anything real, and you may ACCEPT+merge when no CRITICAL/HIGH is
+open; do not escalate on the verdict word `COMMENT` alone. `REQUEST_CHANGES` is never green,
+even when an older status on the same head says success.
 
 SETUP: You are in an empty working directory with `gh` authed. To read the PR you only need `gh`. If you
 must edit files (a fix-forward, or to prep a builder), first: `gh repo clone {repo} repo && cd repo &&
@@ -48,7 +54,9 @@ CANON (do exactly this):
 2. Pull the reviewer's findings: `gh pr view {pr} -R {repo} --json reviews,statusCheckRollup,comments`
    and `gh api repos/{repo}/commits/{head_sha}/status`. Triage each finding real vs false-positive.
 3. Decide a VERDICT:
-   - ACCEPT  → reviewer green + no open CRITICAL/HIGH + required checks pass. {merge_clause}
+   - ACCEPT  → reviewer green (commit status success on this head) + no open CRITICAL/HIGH +
+     required checks pass. COMMENT-with-success notes are advisory by the reviewer's own gate;
+     a note that is CRITICAL or HIGH is an open finding and still blocks. {merge_clause}
    - FIX-FORWARD → TRIVIAL only (wrong import, typo, missing constant, a test expectation). Fix it
      yourself, commit to the PR branch, push. Your push re-triggers the reviewer → you'll be re-invoked.
    - BOUNCE (substantial bug) → {builder_clause}

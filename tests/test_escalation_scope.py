@@ -53,3 +53,27 @@ def test_irreversible_actions_still_escalate():
     p = _prompt()
     for must in ("spending money", "signing certs", "public launch", "deleting production data"):
         assert must in p, must
+
+
+# ===================================================================
+# GREEN definition — COMMENT + success is green (non-blocking notes)
+# ===================================================================
+
+def test_brief_defines_green_as_commit_status_not_verdict_word():
+    brief = _prompt(reviewer_green=True)
+    assert "COMMIT STATUS is `success`" in brief
+    assert "`COMMENT` delivered with that success status is GREEN" in brief
+    assert "do not escalate on the verdict word `COMMENT` alone" in brief
+    assert "`REQUEST_CHANGES` is never green" in brief
+
+
+def test_brief_comment_notes_are_advisory_but_high_still_blocks():
+    brief = _prompt(reviewer_green=True)
+    assert "COMMENT-with-success notes are advisory" in brief
+    assert "a note that is CRITICAL or HIGH is an open finding and still blocks" in brief
+
+
+def test_brief_not_green_path_unchanged():
+    brief = _prompt(reviewer_green=False)
+    assert "NOT green (changes requested / failing)" in brief
+    assert "commit status failure/pending" in brief
