@@ -85,6 +85,16 @@ class NeoState:
                  json.dumps(detail or {})),
             )
 
+    def clear(self, repo: str, pr: int, head_sha: str, phase: str) -> int:
+        """Remove a phase marker so the next wake for this head re-runs it."""
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM neo_actions WHERE repo=%s AND pr_number=%s "
+                "AND head_sha=%s AND phase=%s",
+                (repo, pr, head_sha, phase),
+            )
+            return cur.rowcount
+
     # --- per-install settings + credits ------------------------------------
     def install(self, install_id: str, org: str) -> dict:
         with self._conn() as c:

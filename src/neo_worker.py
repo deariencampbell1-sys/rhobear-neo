@@ -110,6 +110,17 @@ def run_neo(cfg: Config, state: NeoState, wake: dict) -> None:
     )
     agent = ClaudeAgent.from_config(cfg)
     usage, verdict = _run_agent(agent, brief)
+    if not verdict:
+        # The triage marker above is written BEFORE the agent runs, and
+        # already_acted() treats it as done. So an agent that dies -- provider
+        # 402, timeout, malformed stream -- used to strand this PR at this head
+        # forever: every later wake for the same sha hit "already triaged --
+        # skip". Clear it so the next wake retries. (2026-09-21: DeepSeek ran
+        # out of credit mid-triage and capturd#40 stranded exactly this way.)
+        state.clear(repo, pr, sha, "triage")
+        log.warning("%s#%s@%s agent produced no verdict — triage marker cleared, "
+                    "next wake retries", repo, pr, sha[:8])
+        return
     is_builder = verdict.startswith("BOUNCE-BUILDER")
     credits = credits_for(usage, builder=is_builder)
     phase = {

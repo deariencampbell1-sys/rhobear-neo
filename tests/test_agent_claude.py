@@ -654,7 +654,11 @@ class TestStaleOpenRouterEnv:
 # ===================================================================
 
 class TestCanonicalSet:
-    """The CANONICAL_VERDICTS constant contains exactly the 5 expected values."""
+    """The CANONICAL_VERDICTS constant: the 5 Neo verdicts plus the builder's FIXED.
+
+    FIXED was added deliberately in 43cd510 ("accept VERDICT: FIXED as alias for
+    ACCEPT-READY") so the builder lane's output contract parses; this test was
+    never updated and had been failing since."""
 
     def test_exact_set(self) -> None:
         assert CANONICAL_VERDICTS == {
@@ -663,6 +667,7 @@ class TestCanonicalSet:
             "FIX-FORWARD",
             "BOUNCE-BUILDER",
             "ESCALATE",
+            "FIXED",
         }
 
 
