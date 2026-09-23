@@ -75,10 +75,13 @@ class NeoState:
                     (repo, pr, head_sha, phase),
                 ).fetchone()
             else:
+                # Safe cast: only 'true'/'false' strings are valid; malformed
+                # legacy values (e.g. "yes", "1", "") fall back to false.
                 row = c.execute(
                     "SELECT 1 FROM neo_actions WHERE repo=%s AND pr_number=%s "
                     "AND head_sha=%s AND phase=%s AND "
-                    "COALESCE((detail->>'green')::boolean, false) = %s LIMIT 1",
+                    "CASE WHEN detail->>'green' IN ('true', 'false') "
+                    "THEN (detail->>'green')::boolean ELSE false END = %s LIMIT 1",
                     (repo, pr, head_sha, phase, green),
                 ).fetchone()
         return row is not None
