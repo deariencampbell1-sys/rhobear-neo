@@ -122,7 +122,7 @@ class ClaudeAgent:
             api_key=cfg.deepseek_key,
             base_url=cfg.deepseek_base_url,
             model=cfg.deepseek_model,
-            effort=cfg.deepseek_reasoning_effort,
+            effort=cfg.deepseek_reasoning_effort.strip().lower(),
             max_tokens=cfg.deepseek_max_tokens,
             timeout=cfg.deepseek_timeout,
             gh_token=cfg.gh_token,
