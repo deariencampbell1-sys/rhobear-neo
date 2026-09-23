@@ -23,10 +23,11 @@ import logging
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
-from .agent_hermes import AgentError, HermesAgent
+from .agent_claude import AgentError, ClaudeAgent
 from .config import Config
 
 log = logging.getLogger("rhobear_neo.builder")
@@ -36,8 +37,8 @@ BRIEFS = Path("/opt/rhobear/neo-builder-briefs")
 POLL_SECS = int(os.environ.get("NEO_BUILDER_POLL_SECS", "120"))
 
 
-class BuilderAgent(HermesAgent):
-    """Hermes agent pinned to a real worktree cwd (no per-run temp dir).
+class BuilderAgent(ClaudeAgent):
+    """Claude agent pinned to a real worktree cwd (no per-run temp dir).
 
     Verdict parsing is advisory for the builder lane: the pushed=True/False
     head-diff after the run is the real signal. A missing/malformed VERDICT
@@ -48,24 +49,9 @@ class BuilderAgent(HermesAgent):
         self.work_dir = work_dir
 
     def run(self, brief: str):
-        cmd = self._build_cmd(brief)
-        env = self._build_env()
-        start = time.monotonic()
-        log.info("builder hermes start cwd=%s model=%s", self.work_dir, self.model)
-        try:
-            proc = subprocess.run(cmd, cwd=self.work_dir, env=env,
-                                  capture_output=True, text=True, timeout=self.timeout)
-        except subprocess.TimeoutExpired:
-            raise AgentError(f"builder hermes timed out after {self.timeout}s")
-        log.info("builder hermes exit=%d elapsed=%.0fs stdout=%d stderr=%d",
-                 proc.returncode, time.monotonic() - start,
-                 len(proc.stdout or ""), len(proc.stderr or ""))
-        try:
-            return self._parse_output(proc)
-        except Exception as e:
-            tail = (proc.stdout or "")[-2000:]
-            log.warning("builder verdict parse failed (non-fatal): %s\nstdout tail: %s", e, tail)
-            return {"input_tokens": 0, "output_tokens": 0}, ""
+        # Create a minimal temp config dir for CLAUDE_CONFIG_DIR (never populated)
+        with tempfile.TemporaryDirectory(prefix="neo-builder-config-") as config_dir:
+            return self._run_in(brief, self.work_dir, config_dir)
 
 
 def _db():
@@ -179,17 +165,26 @@ def dispatch_one(cfg: Config, row: dict) -> None:
              repo, pr, round_, worktree, head_branch)
 
     rc, head_before = gh(cfg, "api", f"repos/{repo}/pulls/{pr}", "--jq", ".head.sha")
+    if rc != 0:
+        log.error("failed to get PR head SHA %s#%s: %s", repo, pr, head_before[:200])
+        return
     agent = BuilderAgent(
         work_dir=worktree,
-        hermes_bin=cfg.hermes_bin, provider=cfg.hermes_provider, model=cfg.hermes_model,
-        timeout=cfg.deepseek_timeout, gh_token=cfg.gh_token,
+        claude_bin=cfg.claude_bin, api_key=cfg.deepseek_key, base_url=cfg.deepseek_base_url,
+        model=cfg.deepseek_model, effort=cfg.deepseek_reasoning_effort,
+        max_tokens=cfg.deepseek_max_tokens, timeout=cfg.deepseek_timeout, gh_token=cfg.gh_token,
     )
     try:
         usage, verdict = agent.run(brief)
         log.info("fixer done %s#%s verdict=%s usage=%s", repo, pr, verdict or "?", usage)
     except AgentError:
         log.exception("fixer agent failed %s#%s", repo, pr)
-    head_after = gh(cfg, "api", f"repos/{repo}/pulls/{pr}", "--jq", ".head.sha")[1].strip()
+    rc2, head_after = gh(cfg, "api", f"repos/{repo}/pulls/{pr}", "--jq", ".head.sha")
+    if rc2 != 0:
+        log.error("failed to get PR head SHA after run %s#%s: %s", repo, pr, head_after[:200])
+        head_after = ""
+    else:
+        head_after = head_after.strip()
     pushed = bool(head_after) and head_after != head_before
     log.info("fixer round outcome %s#%s pushed=%s head=%s->%s (loop auto-armed: reviewer+neo re-fire on push)",
              repo, pr, pushed, head_before[:8], head_after[:8])

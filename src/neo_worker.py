@@ -24,7 +24,7 @@ import subprocess
 
 from .config import Config
 from .neo_state import NeoState
-from .agent_hermes import HermesAgent as ClaudeAgent, AgentError
+from .agent_claude import ClaudeAgent, AgentError
 from . import neo_protocol
 
 log = logging.getLogger("rhobear_neo.worker")
@@ -106,7 +106,7 @@ def run_neo(cfg: Config, state: NeoState, wake: dict) -> None:
         repo=repo, pr=pr, head_sha=sha,
         reviewer_context=wake.get("context", "?"), reviewer_green=bool(wake.get("green")),
         auto_merge=auto_merge, builder_round=rounds,
-        max_builder_rounds=cfg.max_builder_rounds, builder_model=cfg.hermes_model,
+        max_builder_rounds=cfg.max_builder_rounds, builder_model=cfg.deepseek_model,
     )
     agent = ClaudeAgent.from_config(cfg)
     usage, verdict = _run_agent(agent, brief)
@@ -125,19 +125,16 @@ def run_neo(cfg: Config, state: NeoState, wake: dict) -> None:
 
 
 def _run_agent(agent: ClaudeAgent, brief: str) -> tuple[dict, str]:
-    """Run the Neo brief headless via the Hermes CLI.
+    """Run the Neo brief headless via the Claude Code CLI.
 
-    Hermes runs one-shot (-z) with a per-run temp work directory, giving the
-    agent full tool access (gh, git, edit, test runner) through its own tool
-    loop against the approved provider profile.
+    Single attempt — no retry. The agent may have already pushed or merged
+    changes before raising AgentError; retrying would repeat those side
+    effects. The caller records the outcome and the next reviewer/neo cycle
+    handles recovery.
 
-    Returns (normalised usage, verdict line).  On any error both are empty
-    so the caller skips merge and escalates.  One retry: a single malformed
-    model response should not freeze a lane in triage forever."""
-    for attempt in (1, 2):
-        try:
-            usage, verdict = agent.run(brief)
-            return usage, verdict
-        except AgentError:
-            log.exception("neo hermes agent run failed (attempt %d/2)", attempt)
-    return {}, ""
+    Returns (normalised usage, verdict line). On error returns ({}, '')."""
+    try:
+        return agent.run(brief)
+    except AgentError:
+        log.exception("neo agent run failed — no retry (side effects may exist)")
+        return {}, ""
