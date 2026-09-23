@@ -33,6 +33,7 @@ log = logging.getLogger("rhobear_neo.agent")
 
 # Canonical Neo verdicts — anything else is rejected.
 CANONICAL_VERDICTS = frozenset({
+    "FIXED",  # builder alias for ACCEPT-READY
     "ACCEPT-MERGED",
     "ACCEPT-READY",
     "FIX-FORWARD",
@@ -316,9 +317,15 @@ class ClaudeAgent:
             )
 
         # --- Terminal reason (from the API envelope, not stop_reason) ---
-        terminal_reason = result.get("terminal_reason") or ""
-        if terminal_reason:
-            acceptable_terminal = {"stop", "end_turn"}
+        terminal_reason = result.get("terminal_reason")
+        if terminal_reason is not None:
+            # Convert to string for safe membership check. Non-string terminal_reason
+            # values (list, dict, etc.) are malformed and should raise MalformedStream.
+            if not isinstance(terminal_reason, str):
+                raise MalformedStream(
+                    f"terminal_reason is not a string: {type(terminal_reason).__name__}"
+                )
+            acceptable_terminal = {"stop", "end_turn", "completed"}
             if terminal_reason not in acceptable_terminal:
                 raise MalformedStream(
                     f"non-terminal terminal_reason: {terminal_reason!r}"

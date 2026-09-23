@@ -614,6 +614,27 @@ class TestConfigValidation:
 # Stale OpenRouter env vars — must be invisible to Config
 # ===================================================================
 
+class TestClientKeyPrecedence:
+    """NEO_DEEPSEEK_API_KEY (bridge handshake) wins over DEEPSEEK_API_KEY
+    (provider key); direct DeepSeek still works with just DEEPSEEK_API_KEY."""
+
+    def test_bridge_key_wins(self) -> None:
+        with patch.dict(os.environ, {
+            "NEO_DEEPSEEK_API_KEY": "sk-bridge-handshake",
+            "DEEPSEEK_API_KEY": "sk-real-provider",
+        }, clear=False):
+            cfg = Config()
+        assert cfg.deepseek_key == "sk-bridge-handshake"
+
+    def test_provider_key_fallback(self) -> None:
+        with patch.dict(os.environ, {
+            "NEO_DEEPSEEK_API_KEY": "",
+            "DEEPSEEK_API_KEY": "sk-real-provider",
+        }, clear=False):
+            cfg = Config()
+        assert cfg.deepseek_key == "sk-real-provider"
+
+
 class TestStaleOpenRouterEnv:
     """Env vars from the disabled OpenRouter route must never be read by
     Config. A stale OPENROUTER_API_KEY / NEO_OPENROUTER_* cannot silently
@@ -654,7 +675,11 @@ class TestStaleOpenRouterEnv:
 # ===================================================================
 
 class TestCanonicalSet:
-    """The CANONICAL_VERDICTS constant contains exactly the 5 expected values."""
+    """The CANONICAL_VERDICTS constant: the 5 Neo verdicts plus the builder's FIXED.
+
+    FIXED was added deliberately in 43cd510 ("accept VERDICT: FIXED as alias for
+    ACCEPT-READY") so the builder lane's output contract parses; this test was
+    never updated and had been failing since."""
 
     def test_exact_set(self) -> None:
         assert CANONICAL_VERDICTS == {
@@ -663,6 +688,7 @@ class TestCanonicalSet:
             "FIX-FORWARD",
             "BOUNCE-BUILDER",
             "ESCALATE",
+            "FIXED",
         }
 
 
@@ -841,7 +867,7 @@ class TestResultEnvelope:
     def test_terminal_reason_error_fails(self) -> None:
         """terminal_reason='error' should raise MalformedStream."""
         output = json.dumps({
-            "type": "result", "subtype": "success", "is_error": False,
+            "type": "result", "type": "result", "subtype": "success", "is_error": False,
             "result": "Analysis.\nVERDICT: ACCEPT-READY",
             "usage": {"input_tokens": 50, "output_tokens": 20},
             "num_turns": 1, "stop_reason": "end_turn",
@@ -855,7 +881,7 @@ class TestResultEnvelope:
     def test_terminal_reason_end_turn_ok(self) -> None:
         """terminal_reason='end_turn' should be accepted."""
         output = json.dumps({
-            "type": "result", "subtype": "success", "is_error": False,
+            "type": "result", "type": "result", "subtype": "success", "is_error": False,
             "result": "Analysis.\nVERDICT: ACCEPT-READY",
             "usage": {"input_tokens": 50, "output_tokens": 20},
             "num_turns": 1, "stop_reason": "end_turn",
@@ -869,7 +895,7 @@ class TestResultEnvelope:
     def test_terminal_reason_null_ok(self) -> None:
         """No terminal_reason (absent or null) should be accepted."""
         output = json.dumps({
-            "type": "result", "subtype": "success", "is_error": False,
+            "type": "result", "type": "result", "subtype": "success", "is_error": False,
             "result": "Analysis.\nVERDICT: ACCEPT-READY",
             "usage": {"input_tokens": 50, "output_tokens": 20},
             "num_turns": 1, "stop_reason": "end_turn",
@@ -880,10 +906,38 @@ class TestResultEnvelope:
         usage, v = agent._parse_output(proc)
         assert v == "ACCEPT-READY"
 
+    def test_terminal_reason_list_raises_malformed(self) -> None:
+        """A non-string terminal_reason must raise MalformedStream, not TypeError."""
+        output = json.dumps({
+            "type": "result", "subtype": "success", "is_error": False,
+            "result": "Analysis.\nVERDICT: ACCEPT-READY",
+            "usage": {"input_tokens": 50, "output_tokens": 20},
+            "num_turns": 1, "stop_reason": "end_turn",
+            "terminal_reason": ["error", "timeout"], "permission_denials": [],
+        })
+        proc = _fake_proc(stdout=output)
+        agent = _make_agent()
+        with pytest.raises(MalformedStream, match="terminal_reason is not a string"):
+            agent._parse_output(proc)
+
+    def test_terminal_reason_dict_raises_malformed(self) -> None:
+        """A dict terminal_reason must raise MalformedStream, not TypeError."""
+        output = json.dumps({
+            "type": "result", "subtype": "success", "is_error": False,
+            "result": "Analysis.\nVERDICT: ACCEPT-READY",
+            "usage": {"input_tokens": 50, "output_tokens": 20},
+            "num_turns": 1, "stop_reason": "end_turn",
+            "terminal_reason": {"code": "timeout"}, "permission_denials": [],
+        })
+        proc = _fake_proc(stdout=output)
+        agent = _make_agent()
+        with pytest.raises(MalformedStream, match="terminal_reason is not a string"):
+            agent._parse_output(proc)
+
     def test_api_error_status_present_fails(self) -> None:
         """Non-null api_error_status should raise MalformedStream."""
         output = json.dumps({
-            "type": "result", "subtype": "success", "is_error": False,
+            "type": "result", "type": "result", "subtype": "success", "is_error": False,
             "result": "Analysis.\nVERDICT: ACCEPT-READY",
             "usage": {"input_tokens": 50, "output_tokens": 20},
             "num_turns": 1, "stop_reason": "end_turn",
@@ -897,7 +951,7 @@ class TestResultEnvelope:
     def test_api_error_status_null_ok(self) -> None:
         """Null/absent api_error_status should be accepted."""
         output = json.dumps({
-            "type": "result", "subtype": "success", "is_error": False,
+            "type": "result", "type": "result", "subtype": "success", "is_error": False,
             "result": "Analysis.\nVERDICT: ACCEPT-READY",
             "usage": {"input_tokens": 50, "output_tokens": 20},
             "num_turns": 1, "stop_reason": "end_turn",
@@ -936,6 +990,35 @@ class TestConfigValidate:
         cfg = Config()
         cfg.deepseek_base_url = "https://api.deepseek.com/anthropic/"
         cfg.validate()  # should not raise
+
+    def test_validate_accepts_loopback_bridge_url(self) -> None:
+        """The local Claude-wire bridge is approved: DeepSeek primary with a
+        Bedrock fallback lives behind it, so a DeepSeek balance exhaustion
+        no longer stops Neo."""
+        cfg = Config()
+        cfg.deepseek_base_url = "http://127.0.0.1:8790"
+        cfg.validate()  # should not raise
+
+    def test_validate_accepts_tailnet_bridge_url(self) -> None:
+        """Same bridge on the tailnet address (how Neo reaches it)."""
+        cfg = Config()
+        cfg.deepseek_base_url = "http://100.64.112.103:8790"
+        cfg.validate()  # should not raise
+
+    def test_validate_rejects_unknown_local_gateway(self) -> None:
+        """A random localhost port is NOT the bridge — only the approved
+        endpoints pass."""
+        cfg = Config()
+        cfg.deepseek_base_url = "http://127.0.0.1:9999"
+        with pytest.raises(ValueError, match="deepseek_base_url"):
+            cfg.validate()
+
+    def test_validate_rejects_public_anthropic_clone(self) -> None:
+        """Any other Anthropic-wire host is rejected."""
+        cfg = Config()
+        cfg.deepseek_base_url = "https://api.example.com/anthropic"
+        with pytest.raises(ValueError, match="deepseek_base_url"):
+            cfg.validate()
 
     def test_validate_rejects_stale_prefixed_model(self) -> None:
         """The old OpenRouter model slug (deepseek/... prefix) must be
@@ -1241,3 +1324,67 @@ sys.exit(0)
             for _p in (_py_path, _bat_path):
                 if _os.path.exists(_p):
                     _os.unlink(_p)
+
+def test_parse_output_accepts_completed_terminal_reason():
+    """Claude CLI auto-updated to return terminal_reason='completed' for
+    successful runs. _parse_output must accept it (not raise MalformedStream)."""
+    import json as _json
+    from types import SimpleNamespace
+    from src.agent_claude import ClaudeAgent
+
+    agent = ClaudeAgent(
+        claude_bin="/usr/bin/true",
+        api_key="sk-test",
+        base_url="https://example.com",
+        model="test-model",
+        effort="max",
+        max_tokens=1000,
+        timeout=10,
+        gh_token="ghp_test",
+    )
+    mock_proc = SimpleNamespace(
+        returncode=0,
+        stdout=_json.dumps({
+            "type": "result", "subtype": "success", "is_error": False,
+            "result": "VERDICT: ACCEPT-MERGED",
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+            "num_turns": 1, "stop_reason": "end_turn",
+            "terminal_reason": "completed",
+            "permission_denials": [],
+        }),
+        stderr="",
+    )
+    usage, verdict = agent._parse_output(mock_proc)
+    assert verdict == "ACCEPT-MERGED", f"expected ACCEPT-MERGED, got {verdict!r}"
+    assert usage["input_tokens"] == 10
+
+
+def test_parse_output_rejects_unknown_terminal_reason():
+    """An unrecognized terminal_reason must still raise MalformedStream
+    (fail-closed — don't silently accept unknown states)."""
+    import json as _json
+    from types import SimpleNamespace
+    from src.agent_claude import ClaudeAgent, MalformedStream
+
+    agent = ClaudeAgent(
+        claude_bin="/usr/bin/true", api_key="sk-test",
+        base_url="https://example.com", model="test-model",
+        effort="max", max_tokens=1000, timeout=10, gh_token="ghp_test",
+    )
+    mock_proc = SimpleNamespace(
+        returncode=0,
+        stdout=_json.dumps({
+            "type": "result", "subtype": "success", "is_error": False,
+            "result": "VERDICT: ACCEPT-MERGED",
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+            "num_turns": 1, "stop_reason": "end_turn",
+            "terminal_reason": "something_unexpected",
+            "permission_denials": [],
+        }),
+        stderr="",
+    )
+    try:
+        agent._parse_output(mock_proc)
+        assert False, "should have raised MalformedStream"
+    except MalformedStream as e:
+        assert "non-terminal" in str(e), f"wrong error: {e}"

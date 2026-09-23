@@ -81,8 +81,32 @@ def run_neo(cfg: Config, state: NeoState, wake: dict) -> None:
         return
 
     # --- loop / thrash guard ------------------------------------------------
-    if state.already_acted(repo, pr, sha, "triage"):
-        log.info("already triaged %s#%s@%s — skip (idempotent)", repo, pr, sha[:8])
+    # Keyed on verdict COLOR, not sha alone. A green verdict arriving after a
+    # red triage of the same head (the reviewer re-ran and passed it) is new
+    # decision input and must not be swallowed by the old idempotency skip --
+    # that skip is what left green-reviewed PRs open (green-stall) while the
+    # red triage sat as their only record. Missing color on old rows counts
+    # as red so a first green wake still re-triggers.
+    green = bool(wake.get("green"))
+
+    # Already merged: never re-open a head Neo merged. Checked before the claim
+    # so we don't write a triage marker for a head that is already resolved.
+    if state.already_acted(repo, pr, sha, "merged"):
+        log.info("%s#%s@%s already merged by Neo — skip", repo, pr, sha[:8])
+        return
+
+    # ATOMIC CLAIM: already_acted() is a read, so two workers handling the same
+    # wake concurrently could both pass it before either writes its triage
+    # marker -- duplicate agent runs plus conflicting GitHub mutations for one
+    # SHA. claim_action() does the check-and-insert under an advisory lock, so
+    # exactly one caller wins; the loser skips. It also writes the triage
+    # marker with the wake's context and color, replacing the separate
+    # record("triage") call that used to follow the guard.
+    if not state.claim_action(repo, pr, sha, "triage", green=green,
+                              detail={"context": wake.get("context"),
+                                      "green": wake.get("green")}):
+        log.info("already triaged %s#%s@%s (green=%s) — skip (idempotent)",
+                 repo, pr, sha[:8], green)
         return
     rounds = state.builder_rounds(repo, pr)
 
@@ -98,9 +122,6 @@ def run_neo(cfg: Config, state: NeoState, wake: dict) -> None:
         return
     auto_merge = bool(inst.get("auto_merge") or cfg.auto_merge_default)
 
-    state.record(repo, pr, sha, "triage", detail={"context": wake.get("context"),
-                                                   "green": wake.get("green")})
-
     # --- run the Neo protocol headless via Claude Code CLI --------------------
     brief = neo_protocol.build_brief(
         repo=repo, pr=pr, head_sha=sha,
@@ -110,6 +131,17 @@ def run_neo(cfg: Config, state: NeoState, wake: dict) -> None:
     )
     agent = ClaudeAgent.from_config(cfg)
     usage, verdict = _run_agent(agent, brief)
+    if not verdict:
+        # The triage marker above is written BEFORE the agent runs, and
+        # already_acted() treats it as done. So an agent that dies -- provider
+        # 402, timeout, malformed stream -- used to strand this PR at this head
+        # forever: every later wake for the same sha hit "already triaged --
+        # skip". Clear it so the next wake retries. (2026-09-21: DeepSeek ran
+        # out of credit mid-triage and capturd#40 stranded exactly this way.)
+        state.clear(repo, pr, sha, "triage")
+        log.warning("%s#%s@%s agent produced no verdict — triage marker cleared, "
+                    "next wake retries", repo, pr, sha[:8])
+        return
     is_builder = verdict.startswith("BOUNCE-BUILDER")
     credits = credits_for(usage, builder=is_builder)
     phase = {

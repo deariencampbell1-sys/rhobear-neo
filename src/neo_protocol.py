@@ -27,15 +27,22 @@ def build_brief(*, repo: str, pr: int, head_sha: str, reviewer_context: str,
         f"You have already spent {builder_round}/{max_builder_rounds} builder rounds on this PR. "
         + (f"You may dispatch ONE more Claude Code CLI agent (same {builder_model} model/tool loop) for a substantial fix."
            if builder_round < max_builder_rounds else
-           "You are OUT of builder rounds — do NOT dispatch another builder. If it is still not green, "
-           "ESCALATE with the outstanding findings.")
+           "You are OUT of builder rounds — do NOT dispatch another builder. Report what is still "
+           "outstanding as BOUNCE-BUILDER with the findings; the lane keeps the PR actionable "
+           "and the owner-proxy re-arms it. Running out of rounds is NOT an escalation.")
     )
 
     return f"""You are Neo, RHOBEAR's review-and-MERGE gate. Follow your canon EXACTLY — the
 canon is inlined below.
 
 TARGET: PR #{pr} in {repo} at head {head_sha[:12]}.
-REVIEWER: `{reviewer_context}` reported {'GREEN' if reviewer_green else 'NOT green (changes requested / failing)'}.
+REVIEWER: `{reviewer_context}` reported {'GREEN' if reviewer_green else 'NOT green (changes requested / failing)'} on this head
+({'commit status success' if reviewer_green else 'commit status failure/pending'}).
+GREEN means the reviewer's COMMIT STATUS is `success` on this exact head. A reviewer verdict
+line of `COMMENT` delivered with that success status is GREEN with non-blocking notes only —
+triage the notes, fix or flag anything real, and you may ACCEPT+merge when no CRITICAL/HIGH is
+open; do not escalate on the verdict word `COMMENT` alone. `REQUEST_CHANGES` is never green,
+even when an older status on the same head says success.
 
 SETUP: You are in an empty working directory with `gh` authed. To read the PR you only need `gh`. If you
 must edit files (a fix-forward, or to prep a builder), first: `gh repo clone {repo} repo && cd repo &&
@@ -47,16 +54,24 @@ CANON (do exactly this):
 2. Pull the reviewer's findings: `gh pr view {pr} -R {repo} --json reviews,statusCheckRollup,comments`
    and `gh api repos/{repo}/commits/{head_sha}/status`. Triage each finding real vs false-positive.
 3. Decide a VERDICT:
-   - ACCEPT  → reviewer green + no open CRITICAL/HIGH + required checks pass. {merge_clause}
+   - ACCEPT  → reviewer green (commit status success on this head) + no open CRITICAL/HIGH +
+     required checks pass. COMMENT-with-success notes are advisory by the reviewer's own gate;
+     a note that is CRITICAL or HIGH is an open finding and still blocks. {merge_clause}
    - FIX-FORWARD → TRIVIAL only (wrong import, typo, missing constant, a test expectation). Fix it
      yourself, commit to the PR branch, push. Your push re-triggers the reviewer → you'll be re-invoked.
    - BOUNCE (substantial bug) → {builder_clause}
      To dispatch a builder: write a precise brief (file · line · observed · expected · smallest fix) and
      run the same Claude Code CLI agent (same {builder_model} model/tool loop) in a checkout of {repo}@the PR
      branch; it fixes + pushes. Its push re-triggers reviewer → you'll be re-invoked to re-check.
-   - ESCALATE → owner-gated fork ONLY (cost, secrets/signing certs, blast radius, brand) or genuinely
-     can't decide, OR out of builder rounds and still not green. Label `neo:escalate`, post the exact
-     decision needed, ping the owner. NEVER auto-merge an escalation.
+   - ESCALATE → LAST RESORT, and it is a HANDOFF to the owner-proxy agent, not a stop. It is read by
+     an agent holding the owner's standing authority who will adjudicate and keep the chain moving.
+     Reserve it for what is genuinely irreversible or outside any agent's authority: spending money,
+     rotating or issuing secrets/signing certs, a public launch, deleting production data.
+     "Brand" alone is NOT sufficient. If the repo states a rule, APPLY it. If the repo contradicts
+     itself, state which reading you take and why, then proceed — a contradiction is a judgement call,
+     not an owner-gated fork. Running out of builder rounds is NOT an escalation (see above).
+     When you do escalate: label `neo:escalate` and post the EXACT decision needed with the options
+     enumerated (A1/A2 style) so it is answerable in one word. NEVER auto-merge an escalation.
 4. GUARDRAILS: never merge with open CRITICAL/HIGH, out of order (a PR depending on an unmerged one),
    with expanded/undeclared scope, without test evidence when code changed, or bypassing the repo's
    OWN branch protection / required reviewers. Honor what the repo owner set.

@@ -78,7 +78,11 @@ class Config:
     # deliberately NOT read here — validate() rejects any non-direct base URL.
     deepseek_base_url: str = field(default_factory=lambda: _get(
         "NEO_DEEPSEEK_BASE_URL", "https://api.deepseek.com/anthropic"))
-    deepseek_key: str = field(default_factory=lambda: _get("DEEPSEEK_API_KEY"))
+    # Client credential for the agent. Direct DeepSeek uses the DeepSeek key;
+    # when the local Claude-wire bridge is the base URL, this is the bridge's
+    # shared handshake value and the bridge holds the real provider keys.
+    deepseek_key: str = field(default_factory=lambda: (
+        _get("NEO_DEEPSEEK_API_KEY") or _get("DEEPSEEK_API_KEY")))
     deepseek_model: str = field(default_factory=lambda: _get(
         "NEO_DEEPSEEK_MODEL", "deepseek-v4-flash"))
     deepseek_reasoning_effort: str = field(default_factory=lambda: _get(
@@ -90,6 +94,13 @@ class Config:
 
     # --- claude binary path (on the VPS: /usr/bin/claude) ---
     claude_bin: str = field(default_factory=lambda: _get("NEO_CLAUDE_BIN", "/usr/bin/claude"))
+
+    # --- builder lane engine (Hermes) ---
+    # neo_builder.dispatch_one reads all three; without them it raises
+    # AttributeError and the service crash-loops without ever dispatching a fix.
+    hermes_bin: str = field(default_factory=lambda: _get("NEO_HERMES_BIN", "/opt/rhobear-hermes/bin/hermes"))
+    hermes_provider: str = field(default_factory=lambda: _get("NEO_HERMES_PROVIDER", "zai"))
+    hermes_model: str = field(default_factory=lambda: _get("NEO_HERMES_MODEL", "glm-5.3-flash"))
 
     # --- merge behaviour (the ONE per-install button) ---
     # Off  -> drive to green, fix-forward, dispatch builder, label neo:ready, STOP.
@@ -108,7 +119,7 @@ class Config:
     def require(self) -> "Config":
         missing = [n for n, v in {
             "RHOBEAR_NEO_WEBHOOK_SECRET": self.webhook_secret,
-            "DEEPSEEK_API_KEY": self.deepseek_key,
+            "DEEPSEEK_API_KEY/NEO_DEEPSEEK_API_KEY": self.deepseek_key,
             "DATABASE_URL": self.database_url,
             "GH_TOKEN": self.gh_token,
         }.items() if not v]
@@ -117,11 +128,19 @@ class Config:
         return self
 
     def validate(self) -> "Config":
-        """Strict startup validation — DeepSeek Direct only, no fallback.
+        """Strict startup validation — approved DeepSeek wire endpoints only.
+
+        Two endpoints are approved:
+          - https://api.deepseek.com/anthropic (DeepSeek Direct, native wire)
+          - the local Claude-wire bridge (127.0.0.1:8790 or the tailnet
+            100.64.112.103:8790), which serves DeepSeek primary with a
+            Bedrock fallback when the balance runs out.
+
+        Any other host (OpenRouter, bare api.deepseek.com, arbitrary URLs) is
+        rejected so a stale env var can never silently select a route.
 
         Verifies:
-          - base_url exactly https://api.deepseek.com/anthropic (trailing slash
-            tolerant) — any OpenRouter or bare api.deepseek.com value is rejected
+          - base_url is one of the approved endpoints (trailing slash tolerant)
           - model exactly deepseek-v4-flash (unprefixed direct ID; a stale
             deepseek/... or [...]-suffixed value is rejected)
           - effort exactly max
@@ -131,10 +150,14 @@ class Config:
         Raises ValueError (safe to log — no secrets) on any violation.
         """
         base = self.deepseek_base_url.rstrip("/")
-        if base != "https://api.deepseek.com/anthropic":
+        if base not in {
+            "https://api.deepseek.com/anthropic",
+            "http://127.0.0.1:8790",
+            "http://100.64.112.103:8790",
+        }:
             raise ValueError(
-                f"deepseek_base_url must be https://api.deepseek.com/anthropic, "
-                f"got {self.deepseek_base_url!r}"
+                f"deepseek_base_url must be the DeepSeek direct wire or the "
+                f"local Claude-wire bridge, got {self.deepseek_base_url!r}"
             )
         if self.deepseek_model.strip() != "deepseek-v4-flash":
             raise ValueError(
