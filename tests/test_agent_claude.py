@@ -74,28 +74,8 @@ def tmp_db(tmp_path_factory: pytest.TempPathFactory) -> NeoState:
         options=f"-csearch_path={schema}",
     )
     state = NeoState(dsn)
-    # Apply schema (the CREATE TABLE IF NOT EXISTS + ALTERs are idempotent)
-    with psycopg.connect(dsn, autocommit=True) as c:
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS neo_actions (
-                id              SERIAL PRIMARY KEY,
-                repo            TEXT NOT NULL,
-                pr_number       INT NOT NULL,
-                head_sha        TEXT NOT NULL,
-                phase           TEXT NOT NULL,
-                builder_round   INT NOT NULL DEFAULT 0,
-                verdict         TEXT NOT NULL DEFAULT '',
-                detail          JSONB NOT NULL DEFAULT '{}',
-                credits         BIGINT NOT NULL DEFAULT 0,
-                created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-            );
-            CREATE INDEX IF NOT EXISTS neo_actions_pr ON neo_actions(repo, pr_number, head_sha);
-            ALTER TABLE neo_actions ADD COLUMN IF NOT EXISTS color BOOLEAN;
-            ALTER TABLE neo_actions ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ;
-            CREATE UNIQUE INDEX IF NOT EXISTS neo_actions_claim_uniq ON neo_actions(
-                repo, pr_number, head_sha, phase, COALESCE(color, false), (color IS NULL)
-            ) WHERE claimed_at IS NOT NULL;
-        """)
+    # Apply full schema via ensure_schema (includes color/claimed_at columns + index)
+    state.ensure_schema()
     return state
 
 
@@ -1353,17 +1333,33 @@ class TestMergedGuardSkip:
 class TestClaimAtomicity:
     """claim() must win exactly once under concurrent insert for the same tuple."""
 
-    @pytest.fixture
-    def state(self, tmp_db: NeoState) -> NeoState:
-        return tmp_db
-
-    def test_claim_wins_once(self, state: NeoState) -> None:
+    def test_claim_wins_once(self, tmp_path_factory: pytest.TempPathFactory) -> None:
         """First claim succeeds; second with same tuple fails."""
+        import psycopg
+        from psycopg.conninfo import make_conninfo
+        schema = "test_claim_" + str(id(self))[-8:]
+        base_dsn = make_conninfo("postgresql://neo_test@/postgres", host="/tmp/neo-pg-sock", port="55432")
+        with psycopg.connect(base_dsn, autocommit=True) as c:
+            c.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+            c.execute(f"CREATE SCHEMA {schema}")
+        dsn = make_conninfo("postgresql://neo_test@/postgres", host="/tmp/neo-pg-sock", port="55432", options=f"-csearch_path={schema}")
+        state = NeoState(dsn)
+        state.ensure_schema()
         assert state.claim("x/repo", 20, "sha20", "triage", green=True)
         assert not state.claim("x/repo", 20, "sha20", "triage", green=True)
 
-    def test_claim_different_color_wins(self, state: NeoState) -> None:
+    def test_claim_different_color_wins(self, tmp_path_factory: pytest.TempPathFactory) -> None:
         """A different color is a different claim slot."""
+        import psycopg
+        from psycopg.conninfo import make_conninfo
+        schema = "test_claim_diff" + str(id(self))[-8:]
+        base_dsn = make_conninfo("postgresql://neo_test@/postgres", host="/tmp/neo-pg-sock", port="55432")
+        with psycopg.connect(base_dsn, autocommit=True) as c:
+            c.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+            c.execute(f"CREATE SCHEMA {schema}")
+        dsn = make_conninfo("postgresql://neo_test@/postgres", host="/tmp/neo-pg-sock", port="55432", options=f"-csearch_path={schema}")
+        state = NeoState(dsn)
+        state.ensure_schema()
         assert state.claim("x/repo", 21, "sha21", "triage", green=True)
         assert state.claim("x/repo", 21, "sha21", "triage", green=False)
 
