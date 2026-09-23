@@ -101,7 +101,7 @@ def run_neo(cfg: Config, state: NeoState, wake: dict) -> None:
     state.record(repo, pr, sha, "triage", detail={"context": wake.get("context"),
                                                    "green": wake.get("green")})
 
-    # --- run the Neo protocol headless via Claude Code CLI --------------------
+    # --- run the Neo protocol headless via Hermes ------------------------------
     brief = neo_protocol.build_brief(
         repo=repo, pr=pr, head_sha=sha,
         reviewer_context=wake.get("context", "?"), reviewer_green=bool(wake.get("green")),
@@ -125,17 +125,16 @@ def run_neo(cfg: Config, state: NeoState, wake: dict) -> None:
 
 
 def _run_agent(agent: ClaudeAgent, brief: str) -> tuple[dict, str]:
-    """Run the Neo brief headless via Claude Code CLI.
+    """Run the Neo brief headless via the Claude Code CLI.
 
-    Claude Code runs with isolated config dir + per-run temp workdir, giving
-    the agent full tool access (gh, git, edit, test runner).  DeepSeek Direct
-    provides the Anthropic-compatible endpoint.
+    Single attempt — no retry. The agent may have already pushed or merged
+    changes before raising AgentError; retrying would repeat those side
+    effects. The caller records the outcome and the next reviewer/neo cycle
+    handles recovery.
 
-    Returns (normalised usage, verdict line).  On any error both are empty
-    so the caller skips merge and escalates."""
+    Returns (normalised usage, verdict line). On error returns ({}, '')."""
     try:
-        usage, verdict = agent.run(brief)
-        return usage, verdict
+        return agent.run(brief)
     except AgentError:
-        log.exception("neo claude agent run failed")
+        log.exception("neo agent run failed — no retry (side effects may exist)")
         return {}, ""
