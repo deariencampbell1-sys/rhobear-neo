@@ -81,8 +81,20 @@ def run_neo(cfg: Config, state: NeoState, wake: dict) -> None:
         return
 
     # --- loop / thrash guard ------------------------------------------------
-    if state.already_acted(repo, pr, sha, "triage"):
-        log.info("already triaged %s#%s@%s — skip (idempotent)", repo, pr, sha[:8])
+    # Keyed on verdict COLOR, not sha alone: a green verdict after a red triage
+    # (e.g. reviewer re-ran and passed the same head) is a new decision and must
+    # not be swallowed by the old idempotency skip.
+    raw_green = wake.get("green")
+    if raw_green is not None and not isinstance(raw_green, bool):
+        log.warning("invalid wake payload: green=%r is not boolean — treating as None", raw_green)
+        raw_green = None
+    green = raw_green  # bool | None, never a coerced string
+    if state.already_acted(repo, pr, sha, "triage", green=green):
+        log.info("already triaged %s#%s@%s (green=%s) — skip (idempotent)",
+                 repo, pr, sha[:8], green)
+        return
+    if state.already_acted(repo, pr, sha, "merged"):
+        log.info("%s#%s@%s already merged by Neo — skip", repo, pr, sha[:8])
         return
     rounds = state.builder_rounds(repo, pr)
 
@@ -99,12 +111,12 @@ def run_neo(cfg: Config, state: NeoState, wake: dict) -> None:
     auto_merge = bool(inst.get("auto_merge") or cfg.auto_merge_default)
 
     state.record(repo, pr, sha, "triage", detail={"context": wake.get("context"),
-                                                   "green": wake.get("green")})
+                                                   "green": green})  # preserve validated color
 
     # --- run the Neo protocol headless via Claude Code CLI --------------------
     brief = neo_protocol.build_brief(
         repo=repo, pr=pr, head_sha=sha,
-        reviewer_context=wake.get("context", "?"), reviewer_green=bool(wake.get("green")),
+        reviewer_context=wake.get("context", "?"), reviewer_green=bool(green),
         auto_merge=auto_merge, builder_round=rounds,
         max_builder_rounds=cfg.max_builder_rounds, builder_model=cfg.deepseek_model,
     )
