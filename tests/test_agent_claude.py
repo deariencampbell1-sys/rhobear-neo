@@ -935,41 +935,76 @@ class TestConfigValidate:
         """Trailing slash on the base URL should be tolerated."""
         cfg = Config()
         cfg.deepseek_base_url = "https://api.deepseek.com/anthropic/"
-        cfg.validate()  # should not raise
+        cfg.claude_bin = "/usr/bin/claude"
+
+        with patch("src.config.os.name", "posix"), \
+             patch("src.config.shutil.which", return_value=None), \
+             patch("src.config.os.path.isfile", return_value=True):
+            cfg.validate()  # should not raise
 
     def test_validate_rejects_stale_prefixed_model(self) -> None:
         """The old OpenRouter model slug (deepseek/... prefix) must be
         rejected — the direct ID is unprefixed."""
         cfg = Config()
+        cfg.deepseek_base_url = "https://api.deepseek.com/anthropic"
         cfg.deepseek_model = "deepseek/deepseek-v4-flash"
-        with pytest.raises(ValueError, match="deepseek_model"):
-            cfg.validate()
+        cfg.claude_bin = "/usr/bin/claude"
+
+        with patch("src.config.os.name", "posix"), \
+             patch("src.config.shutil.which", return_value=None), \
+             patch("src.config.os.path.isfile", return_value=True):
+            with pytest.raises(ValueError, match="deepseek_model"):
+                cfg.validate()
 
     def test_validate_rejects_context_suffixed_model(self) -> None:
         """A [1m]-suffixed model must be rejected — that suffix was an
         OpenRouter CLI hint and has no meaning on the direct route."""
         cfg = Config()
+        cfg.deepseek_base_url = "https://api.deepseek.com/anthropic"
         cfg.deepseek_model = "deepseek-v4-flash[1m]"
-        with pytest.raises(ValueError, match="deepseek_model"):
-            cfg.validate()
+        cfg.claude_bin = "/usr/bin/claude"
+
+        with patch("src.config.os.name", "posix"), \
+             patch("src.config.shutil.which", return_value=None), \
+             patch("src.config.os.path.isfile", return_value=True):
+            with pytest.raises(ValueError, match="deepseek_model"):
+                cfg.validate()
 
     def test_validate_wrong_model(self) -> None:
         cfg = Config()
+        cfg.deepseek_base_url = "https://api.deepseek.com/anthropic"
         cfg.deepseek_model = "deepseek-chat"
-        with pytest.raises(ValueError, match="deepseek_model"):
-            cfg.validate()
+        cfg.claude_bin = "/usr/bin/claude"
+
+        with patch("src.config.os.name", "posix"), \
+             patch("src.config.shutil.which", return_value=None), \
+             patch("src.config.os.path.isfile", return_value=True):
+            with pytest.raises(ValueError, match="deepseek_model"):
+                cfg.validate()
 
     def test_validate_wrong_effort(self) -> None:
         cfg = Config()
+        cfg.deepseek_base_url = "https://api.deepseek.com/anthropic"
         cfg.deepseek_reasoning_effort = "high"
-        with pytest.raises(ValueError, match="deepseek_reasoning_effort"):
-            cfg.validate()
+        cfg.claude_bin = "/usr/bin/claude"
+
+        with patch("src.config.os.name", "posix"), \
+             patch("src.config.shutil.which", return_value=None), \
+             patch("src.config.os.path.isfile", return_value=True):
+            with pytest.raises(ValueError, match="deepseek_reasoning_effort"):
+                cfg.validate()
 
     def test_validate_undersized_tokens(self) -> None:
         cfg = Config()
+        cfg.deepseek_base_url = "https://api.deepseek.com/anthropic"
         cfg.deepseek_max_tokens = 16000
-        with pytest.raises(ValueError, match="deepseek_max_tokens"):
-            cfg.validate()
+        cfg.claude_bin = "/usr/bin/claude"
+
+        with patch("src.config.os.name", "posix"), \
+             patch("src.config.shutil.which", return_value=None), \
+             patch("src.config.os.path.isfile", return_value=True):
+            with pytest.raises(ValueError, match="deepseek_max_tokens"):
+                cfg.validate()
 
     def test_validate_ok(self) -> None:
         """Valid config should pass validate() without error."""
@@ -978,7 +1013,12 @@ class TestConfigValidate:
         cfg.deepseek_model = "deepseek-v4-flash"
         cfg.deepseek_reasoning_effort = "max"
         cfg.deepseek_max_tokens = 32000
-        cfg.validate()  # should not raise
+        cfg.claude_bin = "/usr/bin/claude"
+
+        with patch("src.config.os.name", "posix"), \
+             patch("src.config.shutil.which", return_value=None), \
+             patch("src.config.os.path.isfile", return_value=True):
+            cfg.validate()  # should not raise
 
     def test_validate_missing_claude_bin_posix(self) -> None:
         """On POSIX, a missing claude_bin must raise ValueError.
@@ -1059,6 +1099,7 @@ class TestStartupValidation:
         cfg.deepseek_model = "deepseek-v4-flash"
         cfg.deepseek_reasoning_effort = "max"
         cfg.deepseek_max_tokens = 32000
+        cfg.claude_bin = "/usr/bin/claude"
         for k, v in overrides.items():
             setattr(cfg, k, v)
         return cfg
@@ -1074,23 +1115,35 @@ class TestStartupValidation:
 
     def test_startup_wrong_model_raises(self) -> None:
         cfg = self._make_invalid_cfg(deepseek_model="deepseek/deepseek-v4-flash")
-        with pytest.raises(ValueError, match="deepseek_model"):
-            cfg.require().validate()
+        with patch("src.config.os.name", "posix"), \
+             patch("src.config.shutil.which", return_value=None), \
+             patch("src.config.os.path.isfile", return_value=True):
+            with pytest.raises(ValueError, match="deepseek_model"):
+                cfg.require().validate()
 
     def test_startup_wrong_effort_raises(self) -> None:
         cfg = self._make_invalid_cfg(deepseek_reasoning_effort="high")
-        with pytest.raises(ValueError, match="deepseek_reasoning_effort"):
-            cfg.require().validate()
+        with patch("src.config.os.name", "posix"), \
+             patch("src.config.shutil.which", return_value=None), \
+             patch("src.config.os.path.isfile", return_value=True):
+            with pytest.raises(ValueError, match="deepseek_reasoning_effort"):
+                cfg.require().validate()
 
     def test_startup_undersized_budget_raises(self) -> None:
         cfg = self._make_invalid_cfg(deepseek_max_tokens=16000)
-        with pytest.raises(ValueError, match="deepseek_max_tokens"):
-            cfg.require().validate()
+        with patch("src.config.os.name", "posix"), \
+             patch("src.config.shutil.which", return_value=None), \
+             patch("src.config.os.path.isfile", return_value=True):
+            with pytest.raises(ValueError, match="deepseek_max_tokens"):
+                cfg.require().validate()
 
     def test_startup_validate_after_require_ok(self) -> None:
         """A valid config passes require().validate() chain."""
         cfg = self._make_invalid_cfg()  # all defaults are valid
-        cfg.require().validate()  # should not raise
+        with patch("src.config.os.name", "posix"), \
+             patch("src.config.shutil.which", return_value=None), \
+             patch("src.config.os.path.isfile", return_value=True):
+            cfg.require().validate()  # should not raise
 
     def test_main_uses_validate_chain(self) -> None:
         """main() must call .validate() — verify the chain is wired."""

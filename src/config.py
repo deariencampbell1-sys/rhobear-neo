@@ -86,7 +86,7 @@ class Config:
     deepseek_max_tokens: int = field(default_factory=lambda: _get_int(
         "NEO_MAX_TOKENS", 32000))
     deepseek_timeout: int = field(default_factory=lambda: _get_int(
-        "NEO_TIMEOUT", 1800))
+        "NEO_TIMEOUT", 300))
 
     # --- claude binary path (on the VPS: /usr/bin/claude) ---
     claude_bin: str = field(default_factory=lambda: _get("NEO_CLAUDE_BIN", "/usr/bin/claude"))
@@ -142,7 +142,8 @@ class Config:
                 f"ID, no /deepseek prefix or [1m] suffix), "
                 f"got {self.deepseek_model!r}"
             )
-        if self.deepseek_reasoning_effort.strip().lower() != "max":
+        self.deepseek_reasoning_effort = self.deepseek_reasoning_effort.strip().lower()
+        if self.deepseek_reasoning_effort != "max":
             raise ValueError(
                 f"deepseek_reasoning_effort must be 'max', "
                 f"got {self.deepseek_reasoning_effort!r}"
