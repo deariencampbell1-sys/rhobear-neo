@@ -1011,12 +1011,12 @@ class TestHermesConfigFields:
 
     def test_hermes_defaults_without_env(self) -> None:
         """hermes_* fields have the expected defaults when env vars are unset."""
-        # Clear any existing env vars for a hermetic test.
-        with patch.dict(os.environ, {
-            "NEO_HERMES_BIN": "",
-            "NEO_HERMES_PROVIDER": "",
-            "NEO_HERMES_MODEL": "",
-        }, clear=False):
+        # Remove any existing env vars for a hermetic test.
+        env_patch = {
+            k: v for k, v in os.environ.items()
+            if k not in {"NEO_HERMES_BIN", "NEO_HERMES_PROVIDER", "NEO_HERMES_MODEL"}
+        }
+        with patch.dict(os.environ, env_patch, clear=True):
             cfg = Config()
         assert cfg.hermes_bin == "/opt/rhobear-hermes/bin/hermes"
         assert cfg.hermes_provider == "routegate"
