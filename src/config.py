@@ -142,11 +142,14 @@ class Config:
                 f"ID, no /deepseek prefix or [1m] suffix), "
                 f"got {self.deepseek_model!r}"
             )
-        if self.deepseek_reasoning_effort.strip().lower() != "max":
+        effort = self.deepseek_reasoning_effort.strip().lower()
+        if effort != "max":
             raise ValueError(
                 f"deepseek_reasoning_effort must be 'max', "
                 f"got {self.deepseek_reasoning_effort!r}"
             )
+        # Store canonical normalized value for downstream consumers
+        self.deepseek_reasoning_effort = effort
         if self.deepseek_max_tokens < 32000:
             raise ValueError(
                 f"deepseek_max_tokens must be >= 32000, "
