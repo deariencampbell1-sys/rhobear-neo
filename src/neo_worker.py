@@ -23,7 +23,7 @@ import os
 import subprocess
 
 from .config import Config
-from .neo_state import NeoState
+from .neo_state import NeoState, verdict_color
 from .agent_claude import ClaudeAgent, AgentError
 from . import neo_protocol
 
@@ -83,14 +83,28 @@ def run_neo(cfg: Config, state: NeoState, wake: dict) -> None:
     # --- loop / thrash guard ------------------------------------------------
     # Keyed on verdict COLOR, not sha alone: a green verdict after a red triage
     # (e.g. reviewer re-ran and passed the same head) is a new decision and must
-    # not be swallowed by the old idempotency skip.
-    green = bool(wake.get("green"))
-    if state.already_acted(repo, pr, sha, "triage", green=green):
+    # not be swallowed by the old idempotency skip. An absent/unreadable color is
+    # UNKNOWN (None), not red — see verdict_color().
+    green = verdict_color(wake.get("green"))
+
+    # Already merged by Neo on this head: never re-triage, even on a color flip.
+    # Checked before the triage claim so a merged head stops here, and read with
+    # green=None (sha-only) since the merge row's color is irrelevant.
+    if state.already_acted(repo, pr, sha, "merged"):
+        log.info("%s#%s@%s already merged by Neo — skip (delivery=%s)",
+                 repo, pr, sha[:8], wake.get("delivery") or "-")
+        return
+
+    # Claim the triage BEFORE doing any work: the check-then-act gap between
+    # already_acted() and record() let two concurrent redeliveries — the norm
+    # after a GitHub outage — both pass the guard and run triage twice, with two
+    # credit debits. claim() is a single INSERT under a unique index, so exactly
+    # one delivery wins.
+    if not state.claim(repo, pr, sha, "triage", green=green,
+                       detail={"context": wake.get("context"), "green": green,
+                               "delivery": wake.get("delivery")}):
         log.info("already triaged %s#%s@%s (green=%s) — skip (idempotent)",
                  repo, pr, sha[:8], green)
-        return
-    if state.already_acted(repo, pr, sha, "merged"):
-        log.info("%s#%s@%s already merged by Neo — skip", repo, pr, sha[:8])
         return
     rounds = state.builder_rounds(repo, pr)
 
@@ -98,7 +112,7 @@ def run_neo(cfg: Config, state: NeoState, wake: dict) -> None:
     org = repo.split("/", 1)[0]
     inst = state.install(org, org)          # dogfood: install keyed by org
     if inst.get("plan") and inst.get("credits_balance", 0) <= 0:
-        state.record(repo, pr, sha, "escalated", verdict="ESCALATE",
+        state.record(repo, pr, sha, "escalated", verdict="ESCALATE", green=green,
                      detail={"reason": "out of credits"})
         _gh(cfg, "pr", "comment", str(pr), "-R", repo,
             "--body", "Neo: this install is out of credits — top up to resume auto-fix/merge.")
@@ -106,13 +120,10 @@ def run_neo(cfg: Config, state: NeoState, wake: dict) -> None:
         return
     auto_merge = bool(inst.get("auto_merge") or cfg.auto_merge_default)
 
-    state.record(repo, pr, sha, "triage", detail={"context": wake.get("context"),
-                                                   "green": wake.get("green")})
-
     # --- run the Neo protocol headless via Claude Code CLI --------------------
     brief = neo_protocol.build_brief(
         repo=repo, pr=pr, head_sha=sha,
-        reviewer_context=wake.get("context", "?"), reviewer_green=bool(wake.get("green")),
+        reviewer_context=wake.get("context", "?"), reviewer_green=bool(green),
         auto_merge=auto_merge, builder_round=rounds,
         max_builder_rounds=cfg.max_builder_rounds, builder_model=cfg.deepseek_model,
     )
@@ -124,7 +135,10 @@ def run_neo(cfg: Config, state: NeoState, wake: dict) -> None:
         "ACCEPT-MERGED": "merged", "ACCEPT-READY": "ready", "FIX-FORWARD": "fix_forward",
         "BOUNCE-BUILDER": "builder", "ESCALATE": "escalated",
     }.get(verdict.split()[0] if verdict else "", "triage")
-    state.record(repo, pr, sha, phase, verdict=verdict,
+    # `green` is persisted here as well as on the claim row: it is what lets the
+    # next redelivery of the same color dedup instead of re-running (see
+    # NeoState.record / already_acted).
+    state.record(repo, pr, sha, phase, verdict=verdict, green=green,
                  builder_round=(rounds + 1) if is_builder else rounds, credits=credits)
     if inst.get("plan"):
         state.debit(org, credits)

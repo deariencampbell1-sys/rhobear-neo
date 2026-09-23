@@ -41,10 +41,66 @@ from src.agent_claude import (
     CANONICAL_VERDICTS,
 )
 from src.config import Config
+from src.neo_state import NeoState
+
+
+# ---------------------------------------------------------------------------
+# Temporary per-test NeoState (isolated Postgres schema)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def tmp_db(tmp_path_factory: pytest.TempPathFactory) -> NeoState:
+    """A NeoState backed by a fresh Postgres schema via the test instance.
+
+    Uses the existing local Postgres at /tmp/neo-pg-sock:55432 and creates a
+    new schema per test class (via tmp_path_factory) so color/claim tests are
+    isolated from each other and from any production tables.
+    """
+    import psycopg
+    from psycopg.conninfo import make_conninfo
+    base_dsn = make_conninfo(
+        "postgresql://neo_test@/postgres",
+        host="/tmp/neo-pg-sock",
+        port="55432",
+    )
+    schema_token = tmp_path_factory.mktemp("neo_schema")
+    schema = ("test_" + str(schema_token.name)[-12:]).replace("-", "_")
+    with psycopg.connect(base_dsn, autocommit=True) as c:
+        c.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
+    dsn = make_conninfo(
+        "postgresql://neo_test@/postgres",
+        host="/tmp/neo-pg-sock",
+        port="55432",
+        options=f"-csearch_path={schema}",
+    )
+    state = NeoState(dsn)
+    # Apply schema (the CREATE TABLE IF NOT EXISTS + ALTERs are idempotent)
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS neo_actions (
+                id              SERIAL PRIMARY KEY,
+                repo            TEXT NOT NULL,
+                pr_number       INT NOT NULL,
+                head_sha        TEXT NOT NULL,
+                phase           TEXT NOT NULL,
+                builder_round   INT NOT NULL DEFAULT 0,
+                verdict         TEXT NOT NULL DEFAULT '',
+                detail          JSONB NOT NULL DEFAULT '{}',
+                credits         BIGINT NOT NULL DEFAULT 0,
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            CREATE INDEX IF NOT EXISTS neo_actions_pr ON neo_actions(repo, pr_number, head_sha);
+            ALTER TABLE neo_actions ADD COLUMN IF NOT EXISTS color BOOLEAN;
+            ALTER TABLE neo_actions ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ;
+            CREATE UNIQUE INDEX IF NOT EXISTS neo_actions_claim_uniq ON neo_actions(
+                repo, pr_number, head_sha, phase, COALESCE(color, false), (color IS NULL)
+            ) WHERE claimed_at IS NOT NULL;
+        """)
+    return state
+
 
 # ---------------------------------------------------------------------------
 # Helpers
-# ---------------------------------------------------------------------------
 
 BASE = "https://api.deepseek.com/anthropic"
 API_KEY = "sk-test-placeholder"
@@ -1177,7 +1233,143 @@ class TestProtocolCensus:
 
 
 # ===================================================================
-# Real smoke test — full ClaudeAgent.run() lifecycle
+# verdict_color: strict parsing (never mis-treat 'false' as green)
+# ===================================================================
+
+class TestVerdictColor:
+    """The `green` field in a wake payload might be a bool, int, or string.
+
+    `verdict_color` must map ONLY recognized true/false tokens to True/False;
+    absent/unparseable values become None, never red.
+    """
+
+    def test_bool_true(self) -> None:
+        from src.neo_state import verdict_color
+        assert verdict_color(True) is True
+
+    def test_bool_false(self) -> None:
+        from src.neo_state import verdict_color
+        assert verdict_color(False) is False
+
+    def test_int_1_is_true(self) -> None:
+        from src.neo_state import verdict_color
+        assert verdict_color(1) is True
+
+    def test_int_0_is_false(self) -> None:
+        from src.neo_state import verdict_color
+        assert verdict_color(0) is False
+
+    def test_int_other_is_unknown(self) -> None:
+        from src.neo_state import verdict_color
+        assert verdict_color(2) is None
+
+    def test_string_false_lowercase(self) -> None:
+        from src.neo_state import verdict_color
+        assert verdict_color("false") is False
+
+    def test_string_false_uppercase(self) -> None:
+        from src.neo_state import verdict_color
+        assert verdict_color("FALSE") is False
+
+    def test_string_yes_is_true(self) -> None:
+        from src.neo_state import verdict_color
+        assert verdict_color("yes") is True
+
+    def test_string_junk_is_unknown(self) -> None:
+        from src.neo_state import verdict_color
+        assert verdict_color("maybe") is None
+
+    def test_missing_key_is_unknown(self) -> None:
+        from src.neo_state import verdict_color
+        assert verdict_color(None) is None
+
+    def test_empty_string_is_unknown(self) -> None:
+        from src.neo_state import verdict_color
+        assert verdict_color("") is None
+
+
+# ===================================================================
+# Color-flip re-triage: red→green must re-triage, same color must skip
+# ===================================================================
+
+class TestColorFlipReTriage:
+    """Neo must re-triage when the verdict color flips, and skip when it's the same.
+
+    These tests simulate the dedup guard by INSERT-ing a prior row and then
+    asserting the correct `already_acted` return for each scenario.
+    """
+
+    @pytest.fixture
+    def state(self, tmp_db: NeoState) -> NeoState:
+        return tmp_db
+
+    def test_red_then_green_must_retriage(self, state: NeoState) -> None:
+        """A green verdict arriving after a red one must re-triage."""
+        state.record("x/repo", 1, "sha1", "triage", green=False)
+        assert not state.already_acted("x/repo", 1, "sha1", "triage", green=True)
+
+    def test_green_then_same_green_must_skip(self, state: NeoState) -> None:
+        """A second green on the same head is a skip (idempotent)."""
+        state.record("x/repo", 2, "sha2", "triage", green=True)
+        assert state.already_acted("x/repo", 2, "sha2", "triage", green=True)
+
+    def test_green_then_red_must_retriage(self, state: NeoState) -> None:
+        """A red verdict arriving after a green one must re-triage."""
+        state.record("x/repo", 3, "sha3", "triage", green=True)
+        assert not state.already_acted("x/repo", 3, "sha3", "triage", green=False)
+
+    def test_unknown_color_matches_any_prior(self, state: NeoState) -> None:
+        """Unknown color (None) matches a prior action regardless of its color."""
+        state.record("x/repo", 4, "sha4", "triage", green=True)
+        assert state.already_acted("x/repo", 4, "sha4", "triage", green=None)
+
+
+# ===================================================================
+# Merged-phase guard: merged rows must always block triage
+# ===================================================================
+
+class TestMergedGuardSkip:
+    """A head that already has a `merged` row must never re-triage, even on color flip."""
+
+    @pytest.fixture
+    def state(self, tmp_db: NeoState) -> NeoState:
+        return tmp_db
+
+    def test_merged_blocks_redelivery(self, state: NeoState) -> None:
+        state.record("x/repo", 10, "sha10", "merged", verdict="ACCEPT-MERGED", green=True)
+        assert state.already_acted("x/repo", 10, "sha10", "merged")
+
+    def test_merged_blocks_even_on_color_flip(self, state: NeoState) -> None:
+        """The merged guard is checked before the triage claim and ignores color."""
+        state.record("x/repo", 11, "sha11", "merged", verdict="ACCEPT-MERGED", green=True)
+        # A subsequent red delivery of the SAME head with SAME sha still sees merged.
+        assert state.already_acted("x/repo", 11, "sha11", "merged")
+
+
+# ===================================================================
+# claim() atomic dedup: ON CONFLICT DO NOTHING
+# ===================================================================
+
+class TestClaimAtomicity:
+    """claim() must win exactly once under concurrent insert for the same tuple."""
+
+    @pytest.fixture
+    def state(self, tmp_db: NeoState) -> NeoState:
+        return tmp_db
+
+    def test_claim_wins_once(self, state: NeoState) -> None:
+        """First claim succeeds; second with same tuple fails."""
+        assert state.claim("x/repo", 20, "sha20", "triage", green=True)
+        assert not state.claim("x/repo", 20, "sha20", "triage", green=True)
+
+    def test_claim_different_color_wins(self, state: NeoState) -> None:
+        """A different color is a different claim slot."""
+        assert state.claim("x/repo", 21, "sha21", "triage", green=True)
+        assert state.claim("x/repo", 21, "sha21", "triage", green=False)
+
+
+# ===================================================================
+# Real smoke via monkeypatched Claude binary
 # ===================================================================
 
 class TestRealSmoke:
