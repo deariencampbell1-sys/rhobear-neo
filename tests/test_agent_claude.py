@@ -998,6 +998,75 @@ class TestConfigValidate:
             with pytest.raises(ValueError, match="claude_bin not found"):
                 cfg.validate()
 
+
+# ===================================================================
+# Hermes builder Config fields (regression test for crash-loop)
+# ===================================================================
+
+class TestHermesConfigFields:
+    """Test the three Config fields (hermes_bin, hermes_provider, hermes_model)
+    that neo_builder.dispatch_one reads. This test exists precisely because
+    the builder lane crash-looped in prod when these fields were missing from Config.
+    """
+
+    def test_hermes_defaults_without_env(self) -> None:
+        """hermes_* fields have the expected defaults when env vars are unset."""
+        # Remove any existing env vars for a hermetic test.
+        env_patch = {
+            k: v for k, v in os.environ.items()
+            if k not in {"NEO_HERMES_BIN", "NEO_HERMES_PROVIDER", "NEO_HERMES_MODEL"}
+        }
+        with patch.dict(os.environ, env_patch, clear=True):
+            cfg = Config()
+        assert cfg.hermes_bin == "/opt/rhobear-hermes/bin/hermes"
+        assert cfg.hermes_provider == "routegate"
+        assert cfg.hermes_model == "builder_top"
+
+    def test_hermes_bin_env_override(self) -> None:
+        """NEO_HERMES_BIN env var overrides the default."""
+        with patch.dict(os.environ, {"NEO_HERMES_BIN": "/custom/bin/hermes"}):
+            cfg = Config()
+        assert cfg.hermes_bin == "/custom/bin/hermes"
+
+    def test_hermes_provider_env_override(self) -> None:
+        """NEO_HERMES_PROVIDER env var overrides the default."""
+        with patch.dict(os.environ, {"NEO_HERMES_PROVIDER": "direct"}):
+            cfg = Config()
+        assert cfg.hermes_provider == "direct"
+
+    def test_hermes_model_env_override(self) -> None:
+        """NEO_HERMES_MODEL env var overrides the default."""
+        with patch.dict(os.environ, {"NEO_HERMES_MODEL": "custom-capability"}):
+            cfg = Config()
+        assert cfg.hermes_model == "custom-capability"
+
+    def test_all_hermes_fields_env_overrides(self) -> None:
+        """All three NEO_HERMES_* env vars can be set together."""
+        with patch.dict(os.environ, {
+            "NEO_HERMES_BIN": "/usr/local/bin/hermes",
+            "NEO_HERMES_PROVIDER": "zai",
+            "NEO_HERMES_MODEL": "glm-5.3-flash",
+        }):
+            cfg = Config()
+        assert cfg.hermes_bin == "/usr/local/bin/hermes"
+        assert cfg.hermes_provider == "zai"
+        assert cfg.hermes_model == "glm-5.3-flash"
+
+    def test_config_has_hermes_attributes(self) -> None:
+        """Config instances have hermes_bin, hermes_provider, hermes_model attributes.
+
+        This is a regression test: the builder lane crash-looped because dispatch_one
+        read cfg.hermes_bin etc. on a Config that didn't define them.
+        """
+        cfg = Config()
+        # Verify the attributes exist and are strings.
+        assert hasattr(cfg, "hermes_bin")
+        assert hasattr(cfg, "hermes_provider")
+        assert hasattr(cfg, "hermes_model")
+        assert isinstance(cfg.hermes_bin, str)
+        assert isinstance(cfg.hermes_provider, str)
+        assert isinstance(cfg.hermes_model, str)
+
     def test_validate_claude_bin_ok_on_windows(self) -> None:
         """On Windows, claude_bin validation is skipped (the binary is on
         the remote VPS, not the local dev box)."""
