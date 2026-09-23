@@ -88,12 +88,25 @@ def run_neo(cfg: Config, state: NeoState, wake: dict) -> None:
     # red triage sat as their only record. Missing color on old rows counts
     # as red so a first green wake still re-triggers.
     green = bool(wake.get("green"))
-    if state.already_acted(repo, pr, sha, "triage", green=green):
-        log.info("already triaged %s#%s@%s (green=%s) — skip (idempotent)",
-                 repo, pr, sha[:8], green)
-        return
+
+    # Already merged: never re-open a head Neo merged. Checked before the claim
+    # so we don't write a triage marker for a head that is already resolved.
     if state.already_acted(repo, pr, sha, "merged"):
         log.info("%s#%s@%s already merged by Neo — skip", repo, pr, sha[:8])
+        return
+
+    # ATOMIC CLAIM: already_acted() is a read, so two workers handling the same
+    # wake concurrently could both pass it before either writes its triage
+    # marker -- duplicate agent runs plus conflicting GitHub mutations for one
+    # SHA. claim_action() does the check-and-insert under an advisory lock, so
+    # exactly one caller wins; the loser skips. It also writes the triage
+    # marker with the wake's context and color, replacing the separate
+    # record("triage") call that used to follow the guard.
+    if not state.claim_action(repo, pr, sha, "triage", green=green,
+                              detail={"context": wake.get("context"),
+                                      "green": wake.get("green")}):
+        log.info("already triaged %s#%s@%s (green=%s) — skip (idempotent)",
+                 repo, pr, sha[:8], green)
         return
     rounds = state.builder_rounds(repo, pr)
 
@@ -108,9 +121,6 @@ def run_neo(cfg: Config, state: NeoState, wake: dict) -> None:
         log.info("%s#%s: install out of credits — gated", repo, pr)
         return
     auto_merge = bool(inst.get("auto_merge") or cfg.auto_merge_default)
-
-    state.record(repo, pr, sha, "triage", detail={"context": wake.get("context"),
-                                                   "green": wake.get("green")})
 
     # --- run the Neo protocol headless via Claude Code CLI --------------------
     brief = neo_protocol.build_brief(

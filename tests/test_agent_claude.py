@@ -906,6 +906,34 @@ class TestResultEnvelope:
         usage, v = agent._parse_output(proc)
         assert v == "ACCEPT-READY"
 
+    def test_terminal_reason_list_raises_malformed(self) -> None:
+        """A non-string terminal_reason must raise MalformedStream, not TypeError."""
+        output = json.dumps({
+            "type": "result", "subtype": "success", "is_error": False,
+            "result": "Analysis.\nVERDICT: ACCEPT-READY",
+            "usage": {"input_tokens": 50, "output_tokens": 20},
+            "num_turns": 1, "stop_reason": "end_turn",
+            "terminal_reason": ["error", "timeout"], "permission_denials": [],
+        })
+        proc = _fake_proc(stdout=output)
+        agent = _make_agent()
+        with pytest.raises(MalformedStream, match="terminal_reason is not a string"):
+            agent._parse_output(proc)
+
+    def test_terminal_reason_dict_raises_malformed(self) -> None:
+        """A dict terminal_reason must raise MalformedStream, not TypeError."""
+        output = json.dumps({
+            "type": "result", "subtype": "success", "is_error": False,
+            "result": "Analysis.\nVERDICT: ACCEPT-READY",
+            "usage": {"input_tokens": 50, "output_tokens": 20},
+            "num_turns": 1, "stop_reason": "end_turn",
+            "terminal_reason": {"code": "timeout"}, "permission_denials": [],
+        })
+        proc = _fake_proc(stdout=output)
+        agent = _make_agent()
+        with pytest.raises(MalformedStream, match="terminal_reason is not a string"):
+            agent._parse_output(proc)
+
     def test_api_error_status_present_fails(self) -> None:
         """Non-null api_error_status should raise MalformedStream."""
         output = json.dumps({

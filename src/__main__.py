@@ -35,7 +35,13 @@ def main() -> None:
     # (already_acted, color-aware) dedups on (repo, pr, sha, green), so the
     # rare concurrent duplicate for the same sha is a wasted agent run, not a
     # correctness issue.
-    max_workers = max(1, int(os.environ.get("NEO_MAX_WORKERS", "8")))
+    _workers_env = os.environ.get("NEO_MAX_WORKERS", "8")
+    try:
+        max_workers = max(1, int(_workers_env))
+    except ValueError:
+        log.warning("NEO_MAX_WORKERS=%r is not an integer, defaulting to 8",
+                    _workers_env)
+        max_workers = 8
     executor = concurrent.futures.ThreadPoolExecutor(
         max_workers=max_workers, thread_name_prefix="neo-worker",
     )

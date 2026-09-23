@@ -12,6 +12,25 @@ class FakeState:
     """
     def __init__(self):
         self.rows = []
+    def claim_action(self, repo, pr, sha, phase, *, green=None, detail=None):
+        """In-memory simulation of NeoState.claim_action(). Returns True if not already acted."""
+        if green is None:
+            for r in self.rows:
+                if r[:4] == (repo, pr, sha, phase):
+                    return False
+        else:
+            for r in self.rows:
+                if r[:4] != (repo, pr, sha, phase):
+                    continue
+                if r[4] is None:
+                    if green is False:
+                        return False
+                    continue
+                if bool(r[4]) == bool(green):
+                    return False
+        # Not found: claim the slot.
+        self.rows.append((repo, pr, sha, phase, green, ""))
+        return True
     def already_acted(self, repo, pr, sha, phase, green=None):
         for r in self.rows:
             if r[:4] != (repo, pr, sha, phase):
