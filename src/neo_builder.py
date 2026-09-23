@@ -125,15 +125,21 @@ def prepare_worktree(cfg: Config, repo: str, pr: int) -> tuple[str, str]:
     """clone + checkout the PR head; returns (worktree_path, head_branch)."""
     dest = WORKTREES / f"{repo.replace('/', '-')}-{pr}"
     url = f"https://x-access-token:{cfg.gh_token}@github.com/{repo}.git"
-    if dest.exists():
-        subprocess.run(["rm", "-rf", str(dest)], check=True)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["git", "clone", "-q", "--no-checkout", url, str(dest)],
-                   check=True, timeout=600)
-    subprocess.run(["git", "-C", str(dest), "fetch", "-q", "origin", f"pull/{pr}/head:pr-{pr}"],
-                   check=True, timeout=300)
-    subprocess.run(["git", "-C", str(dest), "checkout", "-q", "-b", f"fix-pr-{pr}", f"pr-{pr}"],
-                   check=True, timeout=120)
+    lock_dir = Path("/tmp/rhobear-wt-locks")
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / f"{repo.replace('/', '-')}-{pr}.lock"
+    import fcntl
+    with open(lock_path, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if dest.exists():
+            subprocess.run(["rm", "-rf", str(dest)], check=True)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "clone", "-q", "--no-checkout", url, str(dest)],
+                       check=True, timeout=600)
+        subprocess.run(["git", "-C", str(dest), "fetch", "-q", "origin", f"pull/{pr}/head:pr-{pr}"],
+                       check=True, timeout=300)
+        subprocess.run(["git", "-C", str(dest), "checkout", "-q", "-b", f"fix-pr-{pr}", f"pr-{pr}"],
+                       check=True, timeout=120)
     state = pr_state(cfg, repo, pr)
     head_branch = state.split("\t")[-1] if "\t" in state else state or ""
     return str(dest), head_branch
@@ -189,7 +195,18 @@ this PR branch. Do NOT merge, do NOT deploy, do NOT touch main.
 - Repo: {repo}
 - PR: #{pr} (head sha {sha}, builder round {round_})
 - Push target: branch `{head_branch}` (the PR head) — commit + push there.
-- Your cwd is the repo worktree; run the repo's own test suite before pushing.
+- Before fixing: if the PR is CONFLICTING with its base branch, merge the base branch
+  into the branch and resolve conflicts first (keep both sides' intent; prefer the PR's
+  feature change on conflicts with generated files). Then do the findings.
+
+TIME BUDGET (hard): work in small increments. Fix the HIGHEST-severity finding first,
+run ONLY the focused tests for the files you changed (never the full monorepo suite --
+it can eat the whole budget), then commit and push. Your FIRST PUSH should happen
+within 30 minutes of starting. If findings remain, keep going and push again; if you
+cannot fix something, report NO-CHANGE for it and push whatever is fixed. A push
+re-arms the reviewer and Neo immediately -- partial progress is valuable, a silent
+90-minute timeout is not.
+- Your cwd is the repo worktree. Focused tests only; never the full monorepo suite.
 
 Findings (reviewer JSON):
 {findings or "(none available — apply the review timeline comments on the PR)"}
@@ -234,7 +251,7 @@ def dispatch_one(cfg: Config, row: dict) -> None:
     agent = BuilderAgent(
         work_dir=worktree,
         hermes_bin=cfg.hermes_bin, provider=cfg.hermes_provider, model=cfg.hermes_model,
-        timeout=cfg.deepseek_timeout, gh_token=cfg.gh_token,
+        timeout=int(os.environ.get("NEO_BUILDER_TIMEOUT") or cfg.deepseek_timeout), gh_token=cfg.gh_token,
     )
     try:
         usage, verdict = agent.run(brief)
@@ -295,34 +312,68 @@ def main() -> int:
         max_workers=CONCURRENCY, thread_name_prefix="neo-builder")
     log.info("builder lane up: concurrency=%d poll=%ds allowlist=%s",
              CONCURRENCY, POLL_SECS, ",".join(cfg.repo_allowlist) or "(none)")
-    last_ids: set[int] = set()
+    parked: dict[int, float] = {}
+    inflight: dict[concurrent.futures.Future, dict] = {}
     while True:
-        rows = queued(conn, repo_filter, limit=CONCURRENCY,
-                      allowlist=cfg.repo_allowlist)
-        ids = {r["id"] for r in rows}
-        if rows and dry:
+        if dry:
+            rows = queued(conn, repo_filter, limit=CONCURRENCY,
+                          allowlist=cfg.repo_allowlist)
             for row in rows:
                 log.info("dry-run: would dispatch %s#%s@%s round=%s",
                          row["repo"], row["pr_number"], row["head_sha"][:8],
                          row["builder_round"])
-        elif rows:
+            if once:
+                break
+            if not rows:
+                time.sleep(POLL_SECS)
+            continue
+
+        # Keep the pool FULL: claim replacements as soon as a slot frees.
+        # The old wave design (submit 8, block until all 8 finish, then claim
+        # the next 8) parked the whole backlog behind its slowest fixer -- one
+        # 90-minute round left seven slots idle and the remaining 40 PRs
+        # waiting behind it.
+        now = time.time()
+        while len(inflight) < CONCURRENCY:
+            rows = queued(conn, repo_filter, limit=CONCURRENCY - len(inflight),
+                          allowlist=cfg.repo_allowlist)
+            rows = [r for r in rows if parked.get(r["id"], 0) < now]
+            inflight_keys = {(r["repo"], r["pr_number"]) for r in inflight.values()}
+            rows = [r for r in rows
+                    if (r["repo"], r["pr_number"]) not in inflight_keys]
+            if not rows:
+                break
             log.info("claiming %d row(s) across %d repo(s)",
                      len(rows), len({r["repo"] for r in rows}))
-            futs = [pool.submit(dispatch_one, cfg, row) for row in rows]
-            for fut in concurrent.futures.as_completed(futs):
-                try:
-                    fut.result()
-                except Exception:
-                    log.exception("dispatch worker crashed")
-        if once:
-            break
-        # Sleep only when there is nothing to do, or when the batch made no
-        # progress. dispatch_one returns WITHOUT marking the row if worktree
-        # prep fails, so an unfixable row would otherwise spin a tight loop;
-        # an identical id set two passes running is exactly that condition.
-        if not rows or ids == last_ids:
+            for row in rows:
+                inflight[pool.submit(dispatch_one, cfg, row)] = row
+
+        if not inflight:
+            if once:
+                break
             time.sleep(POLL_SECS)
-        last_ids = ids
+            continue
+
+        done, _ = concurrent.futures.wait(
+            list(inflight), return_when=concurrent.futures.FIRST_COMPLETED)
+        for fut in done:
+            row = inflight.pop(fut)
+            try:
+                fut.result()
+            except Exception:
+                log.exception("dispatch worker crashed for %s#%s",
+                              row["repo"], row["pr_number"])
+            # dispatch_one returns WITHOUT marking the row when worktree prep
+            # fails. Park the id for a cooldown so it cannot spin a tight
+            # loop, but never forever -- a transient failure retries.
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM neo_actions WHERE id=%s "
+                    "AND NOT (detail ? 'brief_dispatched')", (row["id"],))
+                if cur.fetchone() is not None:
+                    parked[row["id"]] = time.time() + max(POLL_SECS * 5, 600)
+        if once and not inflight:
+            break
     conn.close()
     return 0
 

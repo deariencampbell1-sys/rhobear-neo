@@ -96,9 +96,12 @@ def test_concurrency_is_configurable_and_above_one():
 def test_loop_does_not_sleep_after_a_productive_batch():
     import inspect
     src = inspect.getsource(nb.main)
-    assert "if not rows or ids == last_ids:" in src, (
-        "main() must only idle when the queue is empty or stalled; an "
-        "unconditional sleep costs POLL_SECS of wall clock per PR")
+    assert "FIRST_COMPLETED" in src, (
+        "main() must keep the pool full and replace slots as they free; "
+        "blocking on an entire batch parks the backlog behind its slowest "
+        "fixer (a 90-minute round held seven slots idle)")
+    assert "if not inflight:" in src, (
+        "main() idles only when nothing is in flight and the queue is empty")
 
 
 def test_findings_fall_back_to_pr_timeline(monkeypatch):
