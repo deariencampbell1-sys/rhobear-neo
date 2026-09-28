@@ -87,12 +87,15 @@ def _jev_for_pr(cfg: Config, repo: str, pr: int) -> JevAssessment:
         return JevAssessment(False, reason="review evidence unavailable")
     try:
         data = json.loads(raw)
-        # GitHub status arrives after the review is published. Use recent
-        # evidence, not the entire comment history or unrelated PR chatter.
-        items = (data.get("reviews") or [])[-5:] + (data.get("comments") or [])[-5:]
-        review = "\n\n".join(
-            str(item.get("body") or "") for item in items if item.get("body")
-        )
+        # GitHub status arrives after the review is published. The most recent
+        # formal review is more relevant than concatenating old bot output.
+        reviews = data.get("reviews") or []
+        comments = data.get("comments") or []
+        review = next((str(item.get("body")) for item in reversed(reviews)
+                       if item.get("body")), "")
+        if not review:
+            review = next((str(item.get("body")) for item in reversed(comments)
+                           if item.get("body")), "")
     except (TypeError, ValueError, AttributeError):
         return JevAssessment(False, reason="review evidence malformed")
     return jev_assess(diff, review, cfg.jev_api_key)
@@ -139,9 +142,9 @@ def run_neo(cfg: Config, state: NeoState, wake: dict) -> None:
     jev = _jev_for_pr(cfg, repo, pr)
     if jev.needs_attention:
         auto_merge = False
-    log.info("%s#%s@%s Jev available=%s risk=%s quality=%s attention=%s",
+    log.info("%s#%s@%s Jev available=%s risk=%s quality=%s partial=%s attention=%s reason=%s",
              repo, pr, sha[:8], jev.available, jev.risk,
-             jev.review_quality, jev.needs_attention)
+             jev.review_quality, jev.partial, jev.needs_attention, jev.reason)
 
     state.record(repo, pr, sha, "triage", detail={"context": wake.get("context"),
                                                    "green": wake.get("green"),

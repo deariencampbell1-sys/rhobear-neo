@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -12,6 +13,40 @@ ENDPOINT = "https://openrouter.ai/api/alpha/decisions"
 MODEL = "typesafe/jev-1.13"
 MAX_DIFF_CHARS = 56_000
 MAX_REVIEW_CHARS = 12_000
+
+
+def _bounded_diff(diff: str) -> tuple[str, bool]:
+    """Put trust-boundary/source hunks first and retain an omission marker."""
+    if len(diff) <= MAX_DIFF_CHARS:
+        return diff, False
+    sections = [part for part in re.split(r"(?=^diff --git )", diff, flags=re.MULTILINE) if part]
+    if not sections:
+        return diff[:MAX_DIFF_CHARS], True
+
+    def priority(section: str) -> tuple[int, str]:
+        header = section.split("\n", 1)[0].lower()
+        if re.search(r"auth|permission|secret|payment|sql|shell|file|network|admin|security", header):
+            return (0, header)
+        if re.search(r"\.(py|ts|tsx|js|jsx|go|rs|java|kt|swift|c|cpp|h|sh|sql)\b", header):
+            return (1, header)
+        return (2, header)
+
+    selected = []
+    remaining = MAX_DIFF_CHARS - 90
+    omitted = 0
+    for section in sorted(sections, key=priority):
+        header = section.split("\n", 1)[0].lower()
+        if any(name in header for name in ("package-lock.json", "pnpm-lock.yaml", "yarn.lock", "node_modules/")):
+            section = section.split("\n", 1)[0] + "\n[generated dependency body omitted]\n"
+            omitted += 1
+        if len(section) > remaining:
+            if remaining > 500:
+                selected.append(section[:remaining])
+            omitted += 1
+            break
+        selected.append(section)
+        remaining -= len(section)
+    return "".join(selected) + f"\n[diff budget reached; {omitted} section(s) omitted or shortened]", True
 
 
 @dataclass(frozen=True)
@@ -24,6 +59,7 @@ class JevAssessment:
     review_confidence: float = 0.0
     escalate: float = 0.0
     reason: str = ""
+    partial: bool = False
 
     @property
     def needs_attention(self) -> bool:
@@ -31,6 +67,7 @@ class JevAssessment:
         # classifications as needing the ordinary Neo investigation.
         return (
             not self.available
+            or self.partial
             or self.risk != "low"
             or self.security >= 0.20
             or self.correctness >= 0.35
@@ -46,6 +83,7 @@ class JevAssessment:
             f"Jev decisions: patch risk={self.risk}; security-surface probability={self.security:.2f}; "
             f"correctness-concern probability={self.correctness:.2f}; review quality={self.review_quality} "
             f"(confidence={self.review_confidence:.2f}); deeper-review probability={self.escalate:.2f}. "
+            f"{'The Jev input was shortened; inspect the full diff. ' if self.partial else ''}"
             "These are triage signals, not findings. Inspect the diff and verify concrete evidence."
         )
 
@@ -60,12 +98,13 @@ def assess(diff: str, review: str, api_key: str, *, timeout: float = 8.0) -> Jev
         return JevAssessment(False, reason="no OpenRouter key")
     if not diff.strip() or not review.strip():
         return JevAssessment(False, reason="diff or review missing")
-    if len(diff) > MAX_DIFF_CHARS or len(review) > MAX_REVIEW_CHARS:
-        return JevAssessment(False, reason="diff or review exceeds Jev context budget")
+    bounded_diff, diff_partial = _bounded_diff(diff)
+    review_partial = len(review) > MAX_REVIEW_CHARS
+    bounded_review = review[-MAX_REVIEW_CHARS:] if review_partial else review
 
     body = {
         "model": MODEL,
-        "state": {"diff": diff, "review": review},
+        "state": {"diff": bounded_diff, "review": bounded_review},
         "questions": {
             "risk": {
                 "type": "choice",
@@ -119,7 +158,8 @@ def assess(diff: str, review: str, api_key: str, *, timeout: float = 8.0) -> Jev
             raise ValueError("unexpected Jev choice")
         if not all(0 <= x <= 1 for x in (confidence, security, correctness, escalate)):
             raise ValueError("Jev probability outside [0, 1]")
-        return JevAssessment(True, risk, security, correctness, quality, confidence, escalate)
+        return JevAssessment(True, risk, security, correctness, quality, confidence,
+                             escalate, partial=diff_partial or review_partial)
     except (KeyError, TypeError, ValueError, OSError, urllib.error.URLError) as exc:
         # Never log response bodies or credentials from provider errors.
         return JevAssessment(False, reason=type(exc).__name__)
