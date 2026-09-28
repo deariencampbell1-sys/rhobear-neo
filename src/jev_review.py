@@ -10,6 +10,16 @@ from dataclasses import dataclass
 
 
 ENDPOINT = "https://openrouter.ai/api/alpha/decisions"
+
+# Findings that may remove automatic merge authority. Everything else Jev says
+# is a triage signal for Neo's own inspection. Per the control-plane directive,
+# a coarse adjective ("risk=high", "needs_attention") is NOT a blocking rule:
+# blocking must be a concrete finding that maps to one of these rules.
+BLOCKING_RULES: dict[str, str] = {
+    "REVIEW_INCOMPLETE": "the change surface could not be fully inspected, so review coverage cannot be established",
+    "REVIEW_NOT_ADEQUATE": "the reviewer output misses an important changed behaviour or claims an unsupported issue",
+    "REVIEW_COVERAGE_UNCLEAR": "the reviewer output lacks the specific evidence needed to establish coverage",
+}
 MODEL = "typesafe/jev-1.13"
 MAX_DIFF_CHARS = 56_000
 MAX_REVIEW_CHARS = 12_000
@@ -50,6 +60,16 @@ def _bounded_diff(diff: str) -> tuple[str, bool]:
 
 
 @dataclass(frozen=True)
+class JevFinding:
+    """One concrete Jev observation. Only `blocking` findings touch merge authority."""
+
+    rule: str
+    severity: str
+    evidence: str = ""
+    blocking: bool = False
+
+
+@dataclass(frozen=True)
 class JevAssessment:
     available: bool
     risk: str = "unknown"
@@ -60,11 +80,17 @@ class JevAssessment:
     escalate: float = 0.0
     reason: str = ""
     partial: bool = False
+    findings: tuple[JevFinding, ...] = ()
+    head_sha: str = ""
 
     @property
-    def needs_attention(self) -> bool:
-        # Jev is a classifier, not proof that a patch is safe. Treat ambiguous
-        # classifications as needing the ordinary Neo investigation.
+    def requires_full_review(self) -> bool:
+        """Signals that Neo should inspect the diff itself. Never a veto.
+
+        Jev is a classifier, not proof that a patch is safe: any trust-boundary
+        surface (auth, money, SQL, shell) lands `risk=high` with zero defects,
+        so this only asks for the ordinary Neo investigation.
+        """
         return (
             not self.available
             or self.partial
@@ -75,6 +101,48 @@ class JevAssessment:
             or self.review_confidence < 0.75
             or self.escalate >= 0.25
         )
+
+    @property
+    def needs_attention(self) -> bool:
+        """Deprecated alias for `requires_full_review` (logging/back-compat)."""
+        return self.requires_full_review
+
+    def policy_findings(self) -> tuple[JevFinding, ...]:
+        """Concrete findings. Provider findings win; otherwise policy-derived.
+
+        Policy only converts *evidence about review coverage* into blocking
+        findings. Risk adjectives alone never produce one.
+        """
+        if self.findings:
+            return self.findings
+        out: list[JevFinding] = []
+        if self.partial:
+            out.append(JevFinding(
+                "REVIEW_INCOMPLETE", "high",
+                "Jev's own input was shortened, so the change surface was not fully inspected.",
+                True,
+            ))
+        if self.available and self.review_quality == "poor":
+            out.append(JevFinding(
+                "REVIEW_NOT_ADEQUATE", "high",
+                "Jev judged the reviewer's output to miss an important changed behaviour "
+                "or to claim an unsupported issue.",
+                True,
+            ))
+        elif (self.available and self.review_quality == "unclear"
+              and self.escalate >= 0.25):
+            out.append(JevFinding(
+                "REVIEW_COVERAGE_UNCLEAR", "medium",
+                f"Jev could not establish coverage (review confidence {self.review_confidence:.2f}, "
+                f"deeper-review probability {self.escalate:.2f}).",
+                True,
+            ))
+        return tuple(out)
+
+    @property
+    def blockers(self) -> tuple[JevFinding, ...]:
+        """Findings that may remove automatic merge authority."""
+        return tuple(f for f in self.policy_findings() if f.blocking and f.rule in BLOCKING_RULES)
 
     def brief(self) -> str:
         if not self.available:
@@ -88,7 +156,29 @@ class JevAssessment:
         )
 
 
-def assess(diff: str, review: str, api_key: str, *, timeout: float = 8.0) -> JevAssessment:
+def _parse_findings(answers: dict) -> tuple[JevFinding, ...]:
+    """Read provider findings when present. Unknown rules pass through as signals."""
+    raw = answers.get("findings") or []
+    out: list[JevFinding] = []
+    if not isinstance(raw, list):
+        return ()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        rule = str(item.get("rule") or "").strip()
+        if not rule:
+            continue
+        out.append(JevFinding(
+            rule=rule,
+            severity=str(item.get("severity") or "medium"),
+            evidence=str(item.get("evidence") or "")[:300],
+            blocking=bool(item.get("blocking")) and rule in BLOCKING_RULES,
+        ))
+    return tuple(out)
+
+
+def assess(diff: str, review: str, api_key: str, *, timeout: float = 8.0,
+           head_sha: str = "") -> JevAssessment:
     """Ask one Jev call to assess the patch and whether the review covers it.
 
     Oversize or missing evidence is intentionally uncertain; cutting off the
@@ -159,7 +249,8 @@ def assess(diff: str, review: str, api_key: str, *, timeout: float = 8.0) -> Jev
         if not all(0 <= x <= 1 for x in (confidence, security, correctness, escalate)):
             raise ValueError("Jev probability outside [0, 1]")
         return JevAssessment(True, risk, security, correctness, quality, confidence,
-                             escalate, partial=diff_partial or review_partial)
+                             escalate, partial=diff_partial or review_partial,
+                             findings=_parse_findings(answers), head_sha=head_sha)
     except (KeyError, TypeError, ValueError, OSError, urllib.error.URLError) as exc:
         # Never log response bodies or credentials from provider errors.
         return JevAssessment(False, reason=type(exc).__name__)
