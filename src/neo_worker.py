@@ -76,7 +76,7 @@ def credits_for(usage: dict, builder: bool) -> int:
 
 def _jev_for_pr(cfg: Config, repo: str, pr: int) -> JevAssessment:
     """Read this PR's patch and review evidence for one cheap Jev decision."""
-    if not cfg.jev_api_key:
+    if not isinstance(cfg.jev_api_key, str) or not cfg.jev_api_key:
         return JevAssessment(False, reason="no OpenRouter key")
     rc, diff = _gh(cfg, "pr", "diff", str(pr), "-R", repo, timeout=45)
     if rc != 0:
