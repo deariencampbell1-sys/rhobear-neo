@@ -23,6 +23,7 @@ BLOCKING_RULES: dict[str, str] = {
 MODEL = "typesafe/jev-1.13"
 MAX_DIFF_CHARS = 56_000
 MAX_REVIEW_CHARS = 12_000
+MAX_CHUNKS = 12
 
 
 def _bounded_diff(diff: str) -> tuple[str, bool]:
@@ -177,67 +178,60 @@ def _parse_findings(answers: dict) -> tuple[JevFinding, ...]:
     return tuple(out)
 
 
-def assess(diff: str, review: str, api_key: str, *, timeout: float = 8.0,
-           head_sha: str = "") -> JevAssessment:
-    """Ask one Jev call to assess the patch and whether the review covers it.
 
-    Oversize or missing evidence is intentionally uncertain; cutting off the
-    end of a diff could silently omit the only dangerous hunk.
-    """
-    if not api_key:
-        return JevAssessment(False, reason="no OpenRouter key")
-    if not diff.strip() or not review.strip():
-        return JevAssessment(False, reason="diff or review missing")
-    bounded_diff, diff_partial = _bounded_diff(diff)
-    review_partial = len(review) > MAX_REVIEW_CHARS
-    bounded_review = review[-MAX_REVIEW_CHARS:] if review_partial else review
-
-    body = {
-        "model": MODEL,
-        "state": {"diff": bounded_diff, "review": bounded_review},
-        "questions": {
-            "risk": {
-                "type": "choice",
-                "instructions": "Classify the patch in `diff` by the consequence of a missed bug.",
-                "criteria": {
-                    "low": "Local or cosmetic change with no trust, data, money, or execution boundary",
-                    "medium": "Behavioral change where a bug could affect users or reliability",
-                    "high": "Auth, permissions, secrets, payments, persistence, shell, file, network, or other trust boundary",
-                },
-            },
-            "security": {
-                "type": "noul",
-                "instructions": "Does `diff` change an auth, permission, secret, payment, SQL, shell, file, network, deserialization, or data-boundary surface?",
-            },
-            "correctness": {
-                "type": "noul",
-                "instructions": "Does `diff` contain a plausible correctness problem such as broken control flow, unchecked errors, deleted validation, or a race?",
-            },
-            "review_quality": {
-                "type": "choice",
-                "instructions": "How well does `review` cover the important changed behavior in `diff`? Judge coverage, not writing style.",
-                "criteria": {
-                    "adequate": "Important behavior and plausible risks are addressed with evidence, or the patch is genuinely trivial",
-                    "unclear": "The review lacks enough specific evidence to establish coverage",
-                    "poor": "The review appears to miss an important changed behavior or claims an unsupported issue",
-                },
-            },
-            "escalate": {
-                "type": "noul",
-                "instructions": "Should a deeper code or security review inspect this `diff` given `review`, including any likely missed issue?",
+def _questions() -> dict:
+    """The fixed question set. Kept verbatim from the single-shot version."""
+    return {
+        "risk": {
+            "type": "choice",
+            "instructions": "Classify the patch in `diff` by the consequence of a missed bug.",
+            "criteria": {
+                "low": "Local or cosmetic change with no trust, data, money, or execution boundary",
+                "medium": "Behavioral change where a bug could affect users or reliability",
+                "high": "Auth, permissions, secrets, payments, persistence, shell, file, network, or other trust boundary",
             },
         },
+        "security": {
+            "type": "noul",
+            "instructions": "Does `diff` change an auth, permission, secret, payment, SQL, shell, file, network, deserialization, or data-boundary surface?",
+        },
+        "correctness": {
+            "type": "noul",
+            "instructions": "Does `diff` contain a plausible correctness problem such as broken control flow, unchecked errors, deleted validation, or a race?",
+        },
+        "review_quality": {
+            "type": "choice",
+            "instructions": "How well does `review` cover the important changed behavior in `diff`? Judge coverage, not writing style.",
+            "criteria": {
+                "adequate": "Important behavior and plausible risks are addressed with evidence, or the patch is genuinely trivial",
+                "unclear": "The review lacks enough specific evidence to establish coverage",
+                "poor": "The review appears to miss an important changed behavior or claims an unsupported issue",
+            },
+        },
+        "escalate": {
+            "type": "noul",
+            "instructions": "Should a deeper code or security review inspect this `diff` given `review`, including any likely missed issue?",
+        },
     }
+
+
+def _payload(diff_text: str, review_text: str) -> dict:
+    return {"model": MODEL,
+            "state": {"diff": diff_text, "review": review_text},
+            "questions": _questions()}
+
+
+def _ask(payload: dict, api_key: str, timeout: float) -> dict | None:
+    """One Jev call. None means the provider did not give a usable answer."""
     request = urllib.request.Request(
         ENDPOINT,
-        data=json.dumps(body, separators=(",", ":")).encode(),
+        data=json.dumps(payload, separators=(",", ":")).encode(),
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         method="POST",
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            data = json.load(response)
-        answers = data["answers"]
+            answers = json.load(response)["answers"]
         risk = answers["risk"]["choice"]
         quality = answers["review_quality"]["choice"]
         confidence = float(answers["review_quality"]["confidence"])
@@ -248,9 +242,107 @@ def assess(diff: str, review: str, api_key: str, *, timeout: float = 8.0,
             raise ValueError("unexpected Jev choice")
         if not all(0 <= x <= 1 for x in (confidence, security, correctness, escalate)):
             raise ValueError("Jev probability outside [0, 1]")
-        return JevAssessment(True, risk, security, correctness, quality, confidence,
-                             escalate, partial=diff_partial or review_partial,
-                             findings=_parse_findings(answers), head_sha=head_sha)
-    except (KeyError, TypeError, ValueError, OSError, urllib.error.URLError) as exc:
+    except (KeyError, TypeError, ValueError, OSError, urllib.error.URLError):
         # Never log response bodies or credentials from provider errors.
-        return JevAssessment(False, reason=type(exc).__name__)
+        return None
+    return {"risk": risk, "security": security, "correctness": correctness,
+            "quality": quality, "confidence": confidence, "escalate": escalate,
+            "findings": _parse_findings(answers)}
+
+
+_RISK_ORDER = {"low": 0, "medium": 1, "high": 2}
+_QUALITY_ORDER = {"adequate": 0, "unclear": 1, "poor": 2}
+
+
+def _merge(results: list[dict]) -> dict:
+    """Worst case wins: the aggregate must never look better than any chunk."""
+    findings: dict[tuple, JevFinding] = {}
+    for item in results:
+        for finding in item["findings"]:
+            findings.setdefault((finding.rule, finding.evidence[:80]), finding)
+    return {
+        "risk": max((r["risk"] for r in results), key=lambda x: _RISK_ORDER[x]),
+        "quality": max((r["quality"] for r in results), key=lambda x: _QUALITY_ORDER[x]),
+        "confidence": min(r["confidence"] for r in results),
+        "security": max(r["security"] for r in results),
+        "correctness": max(r["correctness"] for r in results),
+        "escalate": max(r["escalate"] for r in results),
+        "findings": tuple(findings.values()),
+    }
+
+
+def _split_sections(diff: str) -> list[str]:
+    return [p for p in re.split(r"(?=^diff --git )", diff, flags=re.MULTILINE) if p]
+
+
+def _chunk_diff(diff: str, budget: int = MAX_DIFF_CHARS) -> tuple[list[str], bool]:
+    """Pack file sections into bounded chunks, each carrying a full file manifest.
+
+    Returns (chunks, complete). `complete` is False only when a single file's
+    own section cannot fit in one chunk — then that surface really was cut and
+    the caller must treat the assessment as incomplete.
+    """
+    sections = _split_sections(diff)
+    if not sections:
+        return [diff[:budget]], len(diff) <= budget
+    manifest = "\n".join(s.split("\n", 1)[0] for s in sections)
+    header = f"[file manifest — {len(sections)} changed file(s), all of which are covered below]\n{manifest}\n"
+    chunks: list[str] = []
+    current = header
+    complete = True
+    for section in sections:
+        if len(section) > budget:
+            # One huge generated/lockfile-like body: keep its head, admit the cut.
+            chunks.append(header + section[:budget])
+            complete = False
+            continue
+        if len(current) + len(section) > budget and len(current) > len(header):
+            chunks.append(current)
+            current = header + section
+        else:
+            current += section
+    if len(current) > len(header):
+        chunks.append(current)
+    return chunks, complete
+
+
+def assess(diff: str, review: str, api_key: str, *, timeout: float = 8.0,
+           head_sha: str = "") -> JevAssessment:
+    """Assess the patch and the review's coverage of it.
+
+    Small diffs are one call. Large diffs are split into bounded chunks with a
+    file manifest so every changed file is inspected; incompleteness is then
+    reported only when a chunk really could not be examined.
+    """
+    if not api_key:
+        return JevAssessment(False, reason="no OpenRouter key")
+    if not diff.strip() or not review.strip():
+        return JevAssessment(False, reason="diff or review missing")
+
+    review_partial = len(review) > MAX_REVIEW_CHARS
+    bounded_review = review[-MAX_REVIEW_CHARS:] if review_partial else review
+
+    if len(diff) <= MAX_DIFF_CHARS:
+        chunks, complete = [diff], True
+    else:
+        chunks, complete = _chunk_diff(diff)
+        if len(chunks) > MAX_CHUNKS:
+            # More surface than the caller is willing to pay for: keep the
+            # single-shot priority view and stay honest about the cut.
+            bounded, _ = _bounded_diff(diff)
+            chunks, complete = [bounded], False
+
+    results = [r for r in (_ask(_payload(chunk, bounded_review), api_key, timeout)
+                           for chunk in chunks) if r is not None]
+    if not results:
+        return JevAssessment(False, reason="jev call failed")
+
+    merged = _merge(results)
+    partial = (review_partial
+               or not complete
+               or len(results) < len(chunks))
+    return JevAssessment(
+        True, merged["risk"], merged["security"], merged["correctness"],
+        merged["quality"], merged["confidence"], merged["escalate"],
+        partial=partial, findings=merged["findings"], head_sha=head_sha,
+    )
