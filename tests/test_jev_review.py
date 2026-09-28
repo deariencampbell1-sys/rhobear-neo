@@ -35,8 +35,16 @@ def test_missing_or_oversize_evidence_cannot_auto_merge():
         "diff --git a/package-lock.json b/package-lock.json\n" + "+x\n" * 20_000
         + "diff --git a/src/auth.py b/src/auth.py\n-    require_admin()\n"
     )
-    assert partial and "require_admin" in compact
+    assert "require_admin" in compact
+    # Directive §7: a lockfile body is replaced by a deterministic summary and
+    # counts as covered; only a real source section too big to carry is a cut.
     assert "generated dependency body omitted" in compact
+    assert partial is False
+    cut, cut_partial = _bounded_diff(
+        "diff --git a/src/huge-generated-client.ts b/src/huge-generated-client.ts\n"
+        + "+y\n" * 40_000
+    )
+    assert cut_partial and cut
     assert JevAssessment(True, "low", 0.01, 0.01, "poor", 0.95, 0.01).needs_attention
     assert JevAssessment(True, "low", 0.21, 0.01, "adequate", 0.95, 0.01).needs_attention
     assert JevAssessment(True, "low", 0.01, 0.01, "adequate", 0.95, 0.01,

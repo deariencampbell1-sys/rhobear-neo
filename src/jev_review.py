@@ -24,6 +24,49 @@ MODEL = "typesafe/jev-1.13"
 MAX_DIFF_CHARS = 56_000
 MAX_REVIEW_CHARS = 12_000
 MAX_CHUNKS = 12
+GENERATED_BODY_RE = re.compile(
+    r"package-lock\.json|pnpm-lock\.yaml|yarn\.lock|node_modules/|bun\.lockb?"
+)
+_LOCK_PKG_RE = re.compile(r'^[+-]\s{2,6}"node_modules/([^"]+)": \{', re.MULTILINE)
+_LOCK_HOST_RE = re.compile(r'^[+]\s+"resolved":\s+"https?://([^/"]+)', re.MULTILINE)
+
+
+def _is_generated(header: str) -> bool:
+    return bool(GENERATED_BODY_RE.search(header))
+
+
+def dependency_summary(section: str) -> str:
+    """Deterministic description of a generated dependency section.
+
+    Names, registry hosts and install scripts are what a reviewer can actually
+    judge here; the hundreds of kilobytes of integrity hashes are not. The body
+    stays in the repository for targeted inspection.
+    """
+    header = section.split("\n", 1)[0]
+    added = sorted(set(_LOCK_PKG_RE.findall(section.split("\n")[0] + section)))
+    plus = set(_LOCK_PKG_RE.findall("\n".join(l for l in section.split("\n") if l.startswith("+"))))
+    minus = set(_LOCK_PKG_RE.findall("\n".join(l for l in section.split("\n") if l.startswith("-"))))
+    hosts = sorted(set(_LOCK_HOST_RE.findall(section)))
+    scripts = section.count('"hasInstallScript": true')
+    lines = [
+        f"[generated dependency body omitted — {len(section)} bytes, available for targeted inspection]",
+        f"entries added: {len(plus)}; entries removed: {len(minus)}",
+    ]
+    if plus:
+        lines.append("added: " + ", ".join(sorted(plus)[:20])
+                     + (" …" if len(plus) > 20 else ""))
+    if minus:
+        lines.append("removed: " + ", ".join(sorted(minus)[:20])
+                     + (" …" if len(minus) > 20 else ""))
+    if hosts:
+        lines.append("registry hosts: " + ", ".join(hosts))
+    if scripts:
+        lines.append(f"packages with install/postinstall scripts: {scripts}")
+    if not plus and not minus and added:
+        lines.append("touched entries: " + ", ".join(added[:20]))
+    lines.append(f"({header.split(' b/')[-1]})")
+    return "\n".join(lines) + "\n"
+
 
 
 def _bounded_diff(diff: str) -> tuple[str, bool]:
@@ -45,11 +88,12 @@ def _bounded_diff(diff: str) -> tuple[str, bool]:
     selected = []
     remaining = MAX_DIFF_CHARS - 90
     omitted = 0
+    summarized = False
     for section in sorted(sections, key=priority):
         header = section.split("\n", 1)[0].lower()
-        if any(name in header for name in ("package-lock.json", "pnpm-lock.yaml", "yarn.lock", "node_modules/")):
-            section = section.split("\n", 1)[0] + "\n[generated dependency body omitted]\n"
-            omitted += 1
+        if _is_generated(header):
+            section = section.split("\n", 1)[0] + "\n" + dependency_summary(section)
+            summarized = True
         if len(section) > remaining:
             if remaining > 500:
                 selected.append(section[:remaining])
@@ -57,6 +101,10 @@ def _bounded_diff(diff: str) -> tuple[str, bool]:
             break
         selected.append(section)
         remaining -= len(section)
+    if summarized and not omitted:
+        # Every oversize body was a generated one, and each has a deterministic
+        # summary above; nothing about the change surface is hidden.
+        return "".join(selected), False
     return "".join(selected) + f"\n[diff budget reached; {omitted} section(s) omitted or shortened]", True
 
 
@@ -291,8 +339,22 @@ def _chunk_diff(diff: str, budget: int = MAX_DIFF_CHARS) -> tuple[list[str], boo
     current = header
     complete = True
     for section in sections:
+        section_header = section.split("\n", 1)[0]
+        if _is_generated(section_header):
+            # Directive §7: the summary is the review surface for a generated
+            # body; the raw section stays in the repo for targeted inspection.
+            summary = section_header + "\n" + dependency_summary(section)
+            if len(summary) > budget:
+                chunks.append(header + summary[:budget])
+                complete = False
+            elif len(current) + len(summary) > budget and len(current) > len(header):
+                chunks.append(current)
+                current = header + summary
+            else:
+                current += summary
+            continue
         if len(section) > budget:
-            # One huge generated/lockfile-like body: keep its head, admit the cut.
+            # A real source file bigger than one chunk: keep its head, admit the cut.
             chunks.append(header + section[:budget])
             complete = False
             continue

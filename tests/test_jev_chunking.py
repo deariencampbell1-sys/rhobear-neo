@@ -73,9 +73,9 @@ def test_large_diff_is_chunked_and_complete(monkeypatch):
     assert result.requires_full_review is False
 
 
-def test_a_cut_surface_still_blocks(monkeypatch):
-    """One file larger than a chunk budget cannot be hidden by chunking."""
-    diff = ("diff --git a/package-lock.json b/package-lock.json\n"
+def test_a_cut_source_surface_still_blocks(monkeypatch):
+    """A real source file larger than a chunk budget cannot hide behind chunking."""
+    diff = ("diff --git a/src/huge-generated-client.ts b/src/huge-generated-client.ts\n"
             + "+x\n" * 90_000
             + "diff --git a/src/auth.ts b/src/auth.ts\n+requireAdmin()\n")
     calls = []
@@ -83,6 +83,30 @@ def test_a_cut_surface_still_blocks(monkeypatch):
     result = assess(diff, "Reviewed.", "k")
     assert result.partial is True
     assert [f.rule for f in result.blockers] == ["REVIEW_INCOMPLETE"]
+
+
+def test_lockfile_body_is_summarized_not_hidden(monkeypatch):
+    """Directive §7: 300k of integrity hashes must not block a reviewed PR."""
+    diff = ("diff --git a/mobile-native/package-lock.json b/mobile-native/package-lock.json\n"
+            + "".join(
+                f'+    "node_modules/pkg{i}": {{\n+      "version": "1.0.{i}",\n'
+                f'+      "resolved": "https://registry.npmjs.org/pkg{i}/-/pkg{i}-1.0.{i}.tgz",\n'
+                + '+      "hasInstallScript": true,\n'
+                + "+      " + '"integrity": "' + "sha512-" + "A" * 200 + '",\n'
+                + "+    },\n"
+                for i in range(700))
+            + "diff --git a/mobile-native/src/api.ts b/mobile-native/src/api.ts\n+const t = 1;\n")
+    assert len(diff) > MAX_DIFF_CHARS * 4
+    calls = []
+    _mock(monkeypatch, calls)
+    result = assess(diff, "Reviewed the client change.", "k")
+    assert result.partial is False, "a summarized generated body is covered"
+    assert result.blockers == ()
+    joined = "".join(c["state"]["diff"] for c in calls)
+    assert "generated dependency body omitted" in joined
+    assert "registry hosts: registry.npmjs.org" in joined
+    assert "install/postinstall scripts" in joined
+    assert "a/mobile-native/src/api.ts" in joined
 
 
 def test_provider_failure_on_any_chunk_blocks(monkeypatch):
