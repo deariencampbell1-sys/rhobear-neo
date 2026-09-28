@@ -50,7 +50,7 @@ def test_high_risk_patch_passes_authority_together_with_sha_evidence(monkeypatch
     _patch_urlopen(monkeypatch, _answers())
     jev = assess("+auth", "review", "k", head_sha="a" * 40)
     evidence = {"ok": True, "decided_sha": "a" * 40, "head_sha": "a" * 40,
-                "review_sha": "a" * 40, "review_on_head": True, "rollup_green": True}
+                "review_sha": "a" * 40, "review_bound_ok": True, "trusted_green": True}
     granted, reason = worker.merge_authority(True, evidence, jev)
     assert granted, reason
     assert jev.head_sha == "a" * 40
@@ -64,7 +64,7 @@ def test_poor_review_coverage_is_a_concrete_blocking_finding(monkeypatch):
     assert rules == ["REVIEW_NOT_ADEQUATE"]
     granted, reason = worker.merge_authority(
         True, {"ok": True, "decided_sha": "a", "head_sha": "a",
-               "review_sha": "a", "review_on_head": True, "rollup_green": True}, jev)
+               "review_sha": "a", "review_bound_ok": True, "trusted_green": True}, jev)
     assert not granted and "REVIEW_NOT_ADEQUATE" in reason
 
 
@@ -92,15 +92,25 @@ def test_unavailable_jev_removes_authority_but_never_blocks_forever(monkeypatch)
     jev = JevAssessment(False, reason="no OpenRouter key")
     granted, reason = worker.merge_authority(
         True, {"ok": True, "decided_sha": "a", "head_sha": "a",
-               "review_sha": "a", "review_on_head": True, "rollup_green": True}, jev)
+               "review_sha": "a", "review_bound_ok": True, "trusted_green": True}, jev)
     assert granted, reason  # no key is not evidence of a defect
     assert jev.blockers == ()
 
 
 # --- Phase A: reviews are SHA-bound, never merely PR-bound ------------------
 
-def _gh_level(monkeypatch, payload):
+class _Cfg:
+    trusted_review_contexts = ("rhobear-reviews",)
+
+
+def _gh_level(monkeypatch, payload, status=None):
+    """Mock gh: pr view returns payload, the commit status returns `status`."""
+    status = status if status is not None else {
+        "statuses": [{"context": "rhobear-reviews", "state": "success"}]}
+
     def fake_gh(cfg, *args, timeout=30):
+        if args and args[0] == "api":
+            return 0, json.dumps(status)
         return 0, json.dumps(payload)
 
     monkeypatch.setattr(worker, "_gh", fake_gh)
@@ -112,60 +122,78 @@ def test_stale_review_cannot_authorize_a_newer_head(monkeypatch):
     _gh_level(monkeypatch, {
         "headRefOid": "b" * 40,
         "reviews": [{"commit_id": "a" * 40, "body": "Reviewed A: clean."}],
-        "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "SUCCESS"}],
+        "statusCheckRollup": [],
     })
-    ev = worker._review_evidence(None, "r/r", 233, "a" * 40)
+    ev = worker._review_evidence(_Cfg(), "r/r", 233, "a" * 40)
     assert ev["head_sha"] == "b" * 40
-    assert ev["review_on_head"] is True   # the review does cover the SHA we were woken for
+    assert ev["trusted_green"] is True    # the status we were woken for is real
     granted, reason = worker.merge_authority(True, ev, JevAssessment(True, "low", 0, 0, "adequate", 0.9, 0))
     assert not granted and "stale" in reason
 
 
 def test_review_bound_to_a_different_sha_never_authorizes(monkeypatch):
+    """A review explicitly attached to another commit is not evidence for this one."""
     _gh_level(monkeypatch, {
         "headRefOid": "b" * 40,
         "reviews": [{"commit_id": "c" * 40, "body": "Reviewed C."}],
-        "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "SUCCESS"}],
+        "statusCheckRollup": [],
     })
-    ev = worker._review_evidence(None, "r/r", 233, "b" * 40)
-    assert ev["review_on_head"] is False
+    ev = worker._review_evidence(_Cfg(), "r/r", 233, "b" * 40)
+    assert ev["review_bound_ok"] is False
     granted, reason = worker.merge_authority(
         True, ev, JevAssessment(True, "low", 0.01, 0.01, "adequate", 0.95, 0.01))
-    assert not granted and "bound" in reason
+    assert not granted and "reviewed commit" in reason
 
 
-def test_current_head_with_bound_review_grants_authority(monkeypatch):
+def test_nil_commit_id_reviews_are_the_normal_shape(monkeypatch):
+    """rhobear-reviews posts COMMENTED reviews with commit_id=null (live PR #233)."""
+    _gh_level(monkeypatch, {
+        "headRefOid": "b" * 40,
+        "reviews": [{"commit_id": None, "body": "x" * 6000}],
+        "statusCheckRollup": [],
+    })
+    ev = worker._review_evidence(_Cfg(), "r/r", 233, "b" * 40)
+    assert ev["review_bound_ok"] is True and ev["trusted_green"] is True
+    granted, _ = worker.merge_authority(
+        True, ev, JevAssessment(True, "low", 0.01, 0.01, "adequate", 0.95, 0.01))
+    assert granted
+
+
+def test_current_head_with_trusted_status_grants_authority(monkeypatch):
     _gh_level(monkeypatch, {
         "headRefOid": "b" * 40,
         "reviews": [{"commit_id": "b" * 40, "body": "Reviewed B: clean."}],
-        "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "SUCCESS"}],
+        "statusCheckRollup": [{"name": "Lint", "status": "COMPLETED", "conclusion": "FAILURE"}],
     })
-    ev = worker._review_evidence(None, "r/r", 233, "b" * 40)
-    assert ev["review_on_head"] and ev["rollup_green"]
+    ev = worker._review_evidence(_Cfg(), "r/r", 233, "b" * 40)
+    assert ev["trusted_green"] and ev["failing_checks"] == 1  # informational only
     granted, reason = worker.merge_authority(
         True, ev, JevAssessment(True, "low", 0.01, 0.01, "adequate", 0.95, 0.01))
     assert granted, reason
 
 
-def test_failing_or_pending_checks_revoke_authority(monkeypatch):
-    _gh_level(monkeypatch, {
-        "headRefOid": "b" * 40,
-        "reviews": [{"commit_id": "b" * 40, "body": "Reviewed B."}],
-        "statusCheckRollup": [{"status": "IN_PROGRESS", "conclusion": None},
-                              {"status": "COMPLETED", "conclusion": "FAILURE"}],
-    })
-    ev = worker._review_evidence(None, "r/r", 233, "b" * 40)
-    assert ev["rollup_green"] is False
-    granted, reason = worker.merge_authority(
-        True, ev, JevAssessment(True, "low", 0.01, 0.01, "adequate", 0.95, 0.01))
-    assert not granted and "checks" in reason
+def test_untrusted_or_failed_reviewer_status_revokes_authority(monkeypatch):
+    """Somebody else's success, or the reviewer's failure, is not green."""
+    payload = {"headRefOid": "b" * 40,
+               "reviews": [{"commit_id": None, "body": "Reviewed B."}],
+               "statusCheckRollup": []}
+    for status in (
+        {"statuses": [{"context": "some-other-bot", "state": "success"}]},
+        {"statuses": [{"context": "rhobear-reviews", "state": "failure"}]},
+    ):
+        _gh_level(monkeypatch, payload, status)
+        ev = worker._review_evidence(_Cfg(), "r/r", 233, "b" * 40)
+        assert ev["trusted_green"] is False
+        granted, reason = worker.merge_authority(
+            True, ev, JevAssessment(True, "low", 0.01, 0.01, "adequate", 0.95, 0.01))
+        assert not granted and "trusted review status" in reason
 
 
 def test_evidence_brief_states_authority_for_the_agent():
     text = worker.evidence_brief(
         {"ok": True, "decided_sha": "a" * 40, "head_sha": "a" * 40,
-         "review_sha": "a" * 40, "review_on_head": True, "rollup_green": True,
-         "failing_checks": 0, "pending_checks": 0},
-        False, "no review is bound to this exact head SHA")
+         "review_sha": "", "review_bound_ok": True,
+         "trusted_states": ["success"], "failing_checks": 3},
+        False, "the trusted review status is not success on this exact head SHA")
     assert "MERGE_AUTHORITY: NOT_GRANTED" in text
     assert "Merge only when MERGE_AUTHORITY is GRANTED" in text

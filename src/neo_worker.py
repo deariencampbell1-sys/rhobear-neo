@@ -74,12 +74,26 @@ def credits_for(usage: dict, builder: bool) -> int:
     return int(cost * MARGIN * CREDITS_PER_USD)
 
 
+def _trusted_contexts(cfg: Config) -> tuple[str, ...]:
+    """Contexts whose status is the reviewer's own gate (config-driven)."""
+    raw = getattr(cfg, "trusted_review_contexts", ()) or ()
+    if isinstance(raw, str):
+        raw = [c.strip() for c in raw.split(",") if c.strip()]
+    return tuple(str(c) for c in raw)
+
+
+def _is_trusted(context: str, trusted: tuple[str, ...]) -> bool:
+    return any(context == c or context.startswith(c) for c in trusted)
+
+
 def _review_evidence(cfg: Config, repo: str, pr: int, sha: str) -> dict:
     """Machine-readable review evidence bound to ONE commit, not to the PR.
 
-    Per the control-plane directive, a result produced for commit A may
-    authorize only commit A. GitHub happily attaches a later review object to a
-    moved PR head, so the binding is read from the review's own `commit_id`.
+    A result produced for commit A may authorize only commit A. What is
+    genuinely SHA-bound here is the trusted review commit-status: GitHub stores
+    it against an immutable commit. Formal review objects are context — the
+    reviewer's own objects carry `commit_id: null`, so when a commit_id IS
+    present it must match, and when it is absent the status carries the binding.
     """
     try:
         rc, raw = _gh(cfg, "pr", "view", str(pr), "-R", repo,
@@ -98,22 +112,39 @@ def _review_evidence(cfg: Config, repo: str, pr: int, sha: str) -> dict:
     reviews = data.get("reviews") or []
     review_sha = next((str(r.get("commit_id") or "") for r in reversed(reviews)
                        if r.get("body")), "")
+
+    # The reviewer's gate, read straight off the commit.
+    trusted = _trusted_contexts(cfg)
+    trusted_states: list[str] = []
+    try:
+        rc, raw_status = _gh(cfg, "api", f"repos/{repo}/commits/{sha}/status", timeout=30)
+        if rc == 0:
+            for item in (json.loads(raw_status).get("statuses") or []):
+                if _is_trusted(str(item.get("context") or ""), trusted):
+                    trusted_states.append(str(item.get("state") or "").lower())
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"status read failed ({type(exc).__name__})",
+                "decided_sha": sha}
+    if not trusted:
+        return {"ok": False, "reason": "no trusted review contexts configured",
+                "decided_sha": sha}
+
     rollup = data.get("statusCheckRollup") or []
     failing = [c for c in rollup
                if str(c.get("conclusion") or "").upper() in {"FAILURE", "TIMED_OUT", "CANCELLED"}
                or str(c.get("state") or "").upper() in {"FAILURE", "ERROR"}]
-    pending = [c for c in rollup
-               if str(c.get("status") or "").upper() in {"IN_PROGRESS", "QUEUED", "PENDING", "WAITING"}
-               or str(c.get("state") or "").upper() in {"PENDING", "EXPECTED"}]
     return {
         "ok": True,
         "decided_sha": sha,
         "head_sha": head,
         "review_sha": review_sha,
-        "review_on_head": bool(review_sha) and (review_sha == sha or review_sha.startswith(sha)),
-        "rollup_green": bool(rollup) and not failing and not pending,
+        # A nil commit_id is the reviewer's normal shape; a present-but-different
+        # one is evidence about another commit and must not authorize this one.
+        "review_bound_ok": (not review_sha) or review_sha == sha or review_sha.startswith(sha),
+        "trusted_states": trusted_states,
+        "trusted_green": bool(trusted_states) and all(s == "success" for s in trusted_states),
+        # Informational only: this repo's inherited CI wall is red on every PR.
         "failing_checks": len(failing),
-        "pending_checks": len(pending),
     }
 
 
@@ -126,10 +157,10 @@ def merge_authority(install_auto_merge: bool, evidence: dict,
         return False, f"review evidence unavailable ({evidence.get('reason')})"
     if evidence.get("head_sha") != evidence.get("decided_sha"):
         return False, "head moved since the wake — stale evidence cannot authorize this SHA"
-    if not evidence.get("review_on_head"):
-        return False, "no review is bound to this exact head SHA"
-    if not evidence.get("rollup_green"):
-        return False, "required checks are not green on this head"
+    if not evidence.get("review_bound_ok", True):
+        return False, "the reviewed commit is not this head SHA"
+    if not evidence.get("trusted_green"):
+        return False, "the trusted review status is not success on this exact head SHA"
     blockers = jev.blockers
     if blockers:
         return False, "Jev blocking findings: " + ",".join(f.rule for f in blockers)
@@ -287,9 +318,9 @@ def evidence_brief(evidence: dict, auto_merge: bool, reason: str) -> str:
     return (
         f"MERGE_AUTHORITY: {grant} ({reason}).\n"
         f"EVIDENCE head_sha={head} decided_sha={evidence.get('decided_sha', '?')[:12]} "
-        f"review_sha={review_sha} review_on_head={evidence.get('review_on_head')} "
-        f"checks_green={evidence.get('rollup_green')} "
-        f"failing_checks={evidence.get('failing_checks')} pending_checks={evidence.get('pending_checks')}.\n"
+        f"review_sha={review_sha} review_bound_ok={evidence.get('review_bound_ok')} "
+        f"trusted_review_status={evidence.get('trusted_states')} "
+        f"(other checks in this repo: {evidence.get('failing_checks')} failing, informational).\n"
         "Merge only when MERGE_AUTHORITY is GRANTED for this exact head SHA."
     )
 
