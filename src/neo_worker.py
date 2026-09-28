@@ -26,6 +26,7 @@ from .config import Config
 from .neo_state import NeoState
 from .agent_claude import ClaudeAgent, AgentError
 from . import neo_protocol
+from .jev_review import JevAssessment, assess as jev_assess
 
 log = logging.getLogger("rhobear_neo.worker")
 
@@ -73,6 +74,30 @@ def credits_for(usage: dict, builder: bool) -> int:
     return int(cost * MARGIN * CREDITS_PER_USD)
 
 
+def _jev_for_pr(cfg: Config, repo: str, pr: int) -> JevAssessment:
+    """Read this PR's patch and review evidence for one cheap Jev decision."""
+    if not cfg.jev_api_key:
+        return JevAssessment(False, reason="no OpenRouter key")
+    rc, diff = _gh(cfg, "pr", "diff", str(pr), "-R", repo, timeout=45)
+    if rc != 0:
+        return JevAssessment(False, reason="PR diff unavailable")
+    rc, raw = _gh(cfg, "pr", "view", str(pr), "-R", repo,
+                  "--json", "reviews,comments", timeout=45)
+    if rc != 0:
+        return JevAssessment(False, reason="review evidence unavailable")
+    try:
+        data = json.loads(raw)
+        # GitHub status arrives after the review is published. Use recent
+        # evidence, not the entire comment history or unrelated PR chatter.
+        items = (data.get("reviews") or [])[-5:] + (data.get("comments") or [])[-5:]
+        review = "\n\n".join(
+            str(item.get("body") or "") for item in items if item.get("body")
+        )
+    except (TypeError, ValueError, AttributeError):
+        return JevAssessment(False, reason="review evidence malformed")
+    return jev_assess(diff, review, cfg.jev_api_key)
+
+
 def run_neo(cfg: Config, state: NeoState, wake: dict) -> None:
     repo, sha = wake["repo"], wake["sha"]
     pr = resolve_pr(cfg, repo, sha, wake.get("pr_number"))
@@ -109,8 +134,19 @@ def run_neo(cfg: Config, state: NeoState, wake: dict) -> None:
         return
     auto_merge = bool(inst.get("auto_merge") or cfg.auto_merge_default)
 
+    # Jev never supplies a green verdict. It may only remove automatic merge
+    # authority and focus Neo's own inspection of the trusted review.
+    jev = _jev_for_pr(cfg, repo, pr)
+    if jev.needs_attention:
+        auto_merge = False
+    log.info("%s#%s@%s Jev available=%s risk=%s quality=%s attention=%s",
+             repo, pr, sha[:8], jev.available, jev.risk,
+             jev.review_quality, jev.needs_attention)
+
     state.record(repo, pr, sha, "triage", detail={"context": wake.get("context"),
-                                                   "green": wake.get("green")})
+                                                   "green": wake.get("green"),
+                                                   "jev": jev.brief(),
+                                                   "jev_attention": jev.needs_attention})
 
     # --- run the Neo protocol headless via Claude Code CLI --------------------
     brief = neo_protocol.build_brief(
@@ -118,6 +154,7 @@ def run_neo(cfg: Config, state: NeoState, wake: dict) -> None:
         reviewer_context=wake.get("context", "?"), reviewer_green=bool(wake.get("green")),
         auto_merge=auto_merge, builder_round=rounds,
         max_builder_rounds=cfg.max_builder_rounds, builder_model=cfg.deepseek_model,
+        jev_context=jev.brief(),
     )
     agent = ClaudeAgent.from_config(cfg)
     usage, verdict = _run_agent(agent, brief)
