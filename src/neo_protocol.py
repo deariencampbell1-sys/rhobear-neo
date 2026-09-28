@@ -14,7 +14,8 @@ from __future__ import annotations
 
 def build_brief(*, repo: str, pr: int, head_sha: str, reviewer_context: str,
                 reviewer_green: bool, auto_merge: bool, builder_round: int,
-                max_builder_rounds: int, builder_model: str) -> str:
+                max_builder_rounds: int, builder_model: str,
+                jev_context: str = "") -> str:
     merge_clause = (
         "If ACCEPT and the reviewer is GREEN and all required checks pass and the PR is in order, "
         "MERGE it now: `gh pr merge {pr} -R {repo} --squash --delete-branch`."
@@ -36,6 +37,7 @@ def build_brief(*, repo: str, pr: int, head_sha: str, reviewer_context: str,
 canon is inlined below.
 
 TARGET: PR #{pr} in {repo} at head {head_sha[:12]}.
+JEV TRIAGE: {jev_context or 'No Jev assessment available.'}
 REVIEWER: `{reviewer_context}` reported {'GREEN' if reviewer_green else 'NOT green (changes requested / failing)'} on this head
 ({'commit status success' if reviewer_green else 'commit status failure/pending'}).
 GREEN means the reviewer's COMMIT STATUS is `success` on this exact head. A reviewer verdict

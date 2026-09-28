@@ -116,6 +116,11 @@ class Config:
     # --- github auth (App token preferred; gh-cli token fallback) ---
     gh_token: str = field(default_factory=lambda: _get("GH_TOKEN"))
 
+    # Optional Jev review-of-the-reviewer call. This is a separate OpenRouter
+    # credential from the Claude-wire DeepSeek route above.
+    jev_api_key: str = field(default_factory=lambda: (
+        _get("NEO_OPENROUTER_API_KEY") or _get("OPENROUTER_API_KEY")))
+
     def require(self) -> "Config":
         missing = [n for n, v in {
             "RHOBEAR_NEO_WEBHOOK_SECRET": self.webhook_secret,
