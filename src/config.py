@@ -164,9 +164,13 @@ class Config:
                 f"deepseek_base_url must be the DeepSeek direct wire or the "
                 f"local Claude-wire bridge, got {self.deepseek_base_url!r}"
             )
-        if self.deepseek_model.strip() != "deepseek-v4-flash":
+        # Owner 2026-10-04: the loop runs on GLM 5.3 Flash (Z.ai direct), which
+        # only the local Claude-wire bridge can speak to Claude Code.
+        if self.deepseek_model.strip() == "glm-5.3-flash" and base != "https://api.deepseek.com/anthropic":
+            pass
+        elif self.deepseek_model.strip() != "deepseek-v4-flash":
             raise ValueError(
-                f"deepseek_model must be 'deepseek-v4-flash' (DeepSeek Direct "
+                f"deepseek_model must be 'deepseek-v4-flash' (DeepSeek Direct) or 'glm-5.3-flash' via the bridge "
                 f"ID, no /deepseek prefix or [1m] suffix), "
                 f"got {self.deepseek_model!r}"
             )
