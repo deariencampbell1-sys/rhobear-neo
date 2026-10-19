@@ -33,6 +33,8 @@ from .config import Config
 log = logging.getLogger("rhobear_neo.builder")
 
 WORKTREES = Path("/opt/rhobear/neo-builder-worktrees")
+# Reads the token from the environment when git needs it; nothing secret is stored.
+GIT_CREDENTIAL_HELPER = '!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f'
 BRIEFS = Path("/opt/rhobear/neo-builder-briefs")
 POLL_SECS = int(os.environ.get("NEO_BUILDER_POLL_SECS", "120"))
 # Fan-out width. The lane used to claim one row per poll and then sleep
@@ -124,7 +126,11 @@ def pr_state(cfg: Config, repo: str, pr: int) -> str:
 def prepare_worktree(cfg: Config, repo: str, pr: int) -> tuple[str, str]:
     """clone + checkout the PR head; returns (worktree_path, head_branch)."""
     dest = WORKTREES / f"{repo.replace('/', '-')}-{pr}"
-    url = f"https://x-access-token:{cfg.gh_token}@github.com/{repo}.git"
+    # The token never goes in a URL: a failed clone's error text (logged) and
+    # .git/config (on disk) would both carry it. The helper reads GH_TOKEN from
+    # the environment at use time; the fixer agent gets GH_TOKEN the same way.
+    url = f"https://github.com/{repo}.git"
+    env = {**os.environ, "GH_TOKEN": cfg.gh_token}
     lock_dir = Path("/tmp/rhobear-wt-locks")
     lock_dir.mkdir(parents=True, exist_ok=True)
     lock_path = lock_dir / f"{repo.replace('/', '-')}-{pr}.lock"
@@ -134,10 +140,13 @@ def prepare_worktree(cfg: Config, repo: str, pr: int) -> tuple[str, str]:
         if dest.exists():
             subprocess.run(["rm", "-rf", str(dest)], check=True)
         dest.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run(["git", "clone", "-q", "--no-checkout", url, str(dest)],
-                       check=True, timeout=600)
+        subprocess.run(["git", "-c", f"credential.helper={GIT_CREDENTIAL_HELPER}",
+                        "clone", "-q", "--no-checkout", url, str(dest)],
+                       check=True, timeout=600, env=env)
+        subprocess.run(["git", "-C", str(dest), "config", "credential.helper", GIT_CREDENTIAL_HELPER],
+                       check=True, timeout=30)
         subprocess.run(["git", "-C", str(dest), "fetch", "-q", "origin", f"pull/{pr}/head:pr-{pr}"],
-                       check=True, timeout=300)
+                       check=True, timeout=300, env=env)
         subprocess.run(["git", "-C", str(dest), "checkout", "-q", "-b", f"fix-pr-{pr}", f"pr-{pr}"],
                        check=True, timeout=120)
     state = pr_state(cfg, repo, pr)
@@ -234,7 +243,9 @@ def dispatch_one(cfg: Config, row: dict) -> None:
     try:
         worktree, head_branch = prepare_worktree(cfg, repo, pr)
     except Exception as e:
-        log.error("worktree prep failed %s#%s: %s", repo, pr, e)
+        # Never log e itself: a subprocess error carries the whole command line.
+        log.error("worktree prep failed %s#%s: %s (rc=%s)", repo, pr,
+                  type(e).__name__, getattr(e, "returncode", None))
         return
     findings = fetch_findings(cfg, repo, pr)
     brief = build_brief(repo, pr, sha, round_, head_branch, findings)
