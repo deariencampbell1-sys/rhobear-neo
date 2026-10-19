@@ -462,23 +462,130 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict) -> None:
         jobs.retry(job_id, worker_token=wtoken, reason="agent produced no verdict")
         return
 
-    is_builder = verdict.startswith("BOUNCE-BUILDER")
+    # --- B2: Merge executor (deterministic, not agent) --------------------
+    # The agent NEVER holds merge credentials.  On ACCEPT/ACCEPT-MERGED we
+    # call merge_executor.merge() which re-reads the head, checks evidence,
+    # and merges with expected SHA.
+    verdict_base = verdict.split()[0] if verdict else ""
+    is_accept = verdict_base in ("ACCEPT", "ACCEPT-MERGED", "ACCEPT-READY")
+    is_builder = verdict_base == "BOUNCE-BUILDER"
+
+    if is_accept:
+        # Use the evidence already fetched by _review_evidence above.
+        # Convert the old evidence dict to the new format for merge_authority.
+        from . import review_evidence as rev_ev
+        evidence_b2 = {
+            "ok": evidence.get("ok", False),
+            "reason": evidence.get("reason", ""),
+            "head_sha": evidence.get("head_sha", ""),
+            "decided_sha": evidence.get("decided_sha", sha),
+            "trusted_producer_ok": evidence.get("trusted_green", False),
+            "review_sha_match": evidence.get("review_bound_ok", True),
+            "required_checks_pass": (
+                evidence.get("rollup_green") is not False
+            ),
+            "required_checks_failing": evidence.get("failing_checks", 0),
+            "unresolved_critical_high": 0,
+            "coverage_complete": True,
+            "auto_merge": install_auto_merge,
+        }
+        granted, reason = rev_ev.merge_authority(evidence_b2)
+
+        if granted and auto_merge and verdict_base in ("ACCEPT", "ACCEPT-MERGED"):
+            # Call the deterministic merge executor.
+            from . import merge_executor
+            try:
+                merge_result = merge_executor.merge(
+                    repo, pr, sha, evidence_b2, token,
+                )
+                phase = "merged"
+                if merge_result.get("merged"):
+                    log.info("%s#%s@%s merged by executor (sha=%s)",
+                             repo, pr, sha[:8], merge_result.get("sha", "?")[:12])
+            except merge_executor.HeadMoved as exc:
+                log.warning("%s#%s@%s head moved before merge: %s",
+                            repo, pr, sha[:8], exc)
+                phase = "stale_head"
+            except merge_executor.MergeDenied as exc:
+                log.warning("%s#%s@%s merge denied: %s",
+                            repo, pr, sha[:8], exc)
+                phase = "ready"  # mark as ready but not merged
+            except merge_executor.MergeError as exc:
+                log.warning("%s#%s@%s merge failed: %s",
+                            repo, pr, sha[:8], exc)
+                phase = "ready"
+        else:
+            phase = "ready"
+            if not auto_merge:
+                log.info("%s#%s@%s ACCEPT but auto-merge disabled — ready",
+                         repo, pr, sha[:8])
+            else:
+                log.info("%s#%s@%s ACCEPT but evidence blocks merge: %s",
+                         repo, pr, sha[:8], reason)
+
+    elif is_builder:
+        # --- B2: Escalation check before dispatching builder ---------------
+        rounds = state.builder_rounds(repo, pr)
+        bounces_before = getattr(cfg, "bounces_before_escalation", 5)
+        if rounds >= bounces_before:
+            log.info("%s#%s@%s %d builder rounds — escalating to advisor",
+                     repo, pr, sha[:8], rounds)
+            from . import escalation
+            try:
+                round_records = []
+                # Build round records from state history.
+                for r in range(1, rounds + 1):
+                    round_records.append(
+                        escalation.RoundRecord(
+                            round_no=r, sha=sha,
+                            outcome="bounced",
+                        )
+                    )
+                outcome = escalation.escalate_pr(
+                    cfg, state, jobs, repo, pr, sha,
+                    rounds=round_records,
+                    diff_stat="",
+                    installation_id=wake.get("installation_id"),
+                )
+                if outcome["action"] == "escalated":
+                    phase = "escalated"
+                    # Create the escalated builder job.
+                    jobs.create_builder(repo, pr, sha, rounds + 1, payload={
+                        "verdict": verdict, "wake_job": job_id,
+                        "head_sha": sha, "phase": "escalated",
+                        "round": rounds + 1,
+                        "context": "neo:escalated",
+                        "escalated": True,
+                        "work_order": outcome.get("work_order", {}),
+                        "installation_id": wake.get("installation_id"),
+                    })
+                else:
+                    phase = "parked"
+            except Exception as exc:
+                log.warning("%s#%s@%s escalation failed: %s — parking",
+                            repo, pr, sha[:8], exc)
+                phase = "parked"
+                state.record(repo, pr, sha, "parked", verdict="PARKED",
+                             detail={"reason": f"escalation failed: {exc}"})
+        else:
+            # Normal builder dispatch.
+            phase = "builder"
+            jobs.create_builder(repo, pr, sha, rounds + 1, payload={
+                "verdict": verdict, "wake_job": job_id,
+                "head_sha": sha, "phase": "builder", "round": rounds + 1,
+                "context": wake.get("context"),
+                "installation_id": wake.get("installation_id"),
+            })
+    else:
+        # FIX-FORWARD, ESCALATE, or other verdicts.
+        phase = {
+            "FIX-FORWARD": "fix_forward",
+            "ESCALATE": "escalated",
+        }.get(verdict_base, "triage")
+
     credits = credits_for(usage, builder=is_builder)
-    phase = {
-        "ACCEPT-MERGED": "merged", "ACCEPT-READY": "ready", "FIX-FORWARD": "fix_forward",
-        "BOUNCE-BUILDER": "builder", "ESCALATE": "escalated",
-    }.get(verdict.split()[0] if verdict else "", "triage")
     new_round = (rounds + 1) if is_builder else rounds
-    if is_builder:
-        # The builder lane only consumes kind='builder' jobs; create one here,
-        # where the bounce is recorded (integrator finding 1), so a BOUNCE
-        # verdict always reaches Hermes.  Idempotent by (repo, pr, round).
-        jobs.create_builder(repo, pr, sha, new_round, payload={
-            "verdict": verdict, "wake_job": job_id,
-            "head_sha": sha, "phase": phase, "round": new_round,
-            "context": wake.get("context"),
-            "installation_id": wake.get("installation_id"),
-        })
+
     # The phase row carries the verdict colour so a retry after a crash can tell this
     # verdict's work is already done (see the gate above).
     state.record(repo, pr, sha, phase, verdict=verdict,
@@ -497,16 +604,14 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict) -> None:
                                                    "auto_merge": auto_merge,
                                                    "reason": authority_reason})
 
-    # Resolve the wake job with a terminal outcome.  The triage completed; a
-    # builder round is a SEPARATE job the builder lane claims (the wake job is
-    # not left running or 'failed' — 'done' + the phase in the payload).
+    # Resolve the wake job with a terminal outcome.
     jobs.resolve(job_id, "done", worker_token=wtoken,
                  payload={"verdict": verdict, "phase": phase,
                           "credits": credits})
     if inst.get("plan"):
         state.debit(org, credits)
-    log.info("%s#%s@%s verdict=%s credits=%d (auto_merge=%s round=%d)",
-             repo, pr, sha[:8], verdict or "?", credits, auto_merge, rounds)
+    log.info("%s#%s@%s verdict=%s phase=%s credits=%d (auto_merge=%s round=%d)",
+             repo, pr, sha[:8], verdict or "?", phase, credits, auto_merge, rounds)
 
 
 

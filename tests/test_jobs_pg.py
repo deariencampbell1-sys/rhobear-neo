@@ -50,7 +50,7 @@ class _FakeGitHubApp:
     def __init__(self, token="test-ghs-token"):
         self._token = token
 
-    def token_for_repo(self, repo, installation_id=None):
+    def token_for_repo(self, repo, installation_id=None, permissions=None):
         return self._token
 
 DSN = os.environ.get("NEO_TEST_DSN", "")
@@ -537,6 +537,12 @@ class TestIdempotencyGate:
         state = NeoState(DSN)
         cfg = _cfg()
         cfg.auto_merge_default = True
+        # B2: merge executor requires auto_merge.  Ensure the install has it.
+        state.install('o', 'o')  # create the install row (auto_merge=false default)
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute(
+                "UPDATE neo_installs SET auto_merge = true WHERE install_id = 'o'",
+            )
         wake = {"repo": "o/r", "sha": SHA1, "green": True,
                 "context": "rhobear-reviews", "pr_number": 5}
         agent_calls: list[int] = []
@@ -545,12 +551,35 @@ class TestIdempotencyGate:
             agent_calls.append(1)
             return {"input_tokens": 1, "output_tokens": 1}, "ACCEPT-MERGED"
 
+        import json as _json
+        def fake_merge_gh(token, *args, **kw):
+            """Fake _gh for merge_executor that returns a successful PR view + merge."""
+            if args[:3] == ("pr", "view", "5"):
+                data = {
+                    "headRefOid": SHA1,
+                    "state": "OPEN",
+                    "mergeable": "MERGEABLE",
+                    "reviews": [
+                        {"body": "Looks good. COVERAGE: COMPLETE",
+                         "commit_id": SHA1,
+                         "author": {"type": "Bot"}},
+                    ],
+                    "statusCheckRollup": [
+                        {"context": "ci/test", "conclusion": "SUCCESS"},
+                    ],
+                }
+                return 0, _json.dumps(data)
+            if args[:3] == ("pr", "merge", "5"):
+                return 0, "Merge successful"
+            raise AssertionError(f"unexpected merge _gh call: {args}")
+
         from src.neo_worker import run_neo
         with patch("src.neo_worker.resolve_pr", return_value=5), \
              patch("src.neo_worker._review_evidence", return_value=_evidence(SHA1)), \
              patch("src.neo_worker._jev_for_pr",
                    return_value=JevAssessment(False, reason="no key")), \
-             patch("src.neo_worker._run_agent", side_effect=fake_agent):
+             patch("src.neo_worker._run_agent", side_effect=fake_agent), \
+             patch("src.merge_executor._gh", side_effect=fake_merge_gh):
             run_neo(cfg, state, jobs, wake)   # first delivery: merge
             run_neo(cfg, state, jobs, wake)   # duplicate: gate -> no_change
         assert len(agent_calls) == 1, agent_calls
@@ -882,7 +911,7 @@ class TestCrashWindows:
 class _NoInstallApp:
     """Fake GitHub App that reports no installation for any repo."""
 
-    def token_for_repo(self, repo, installation_id=None):
+    def token_for_repo(self, repo, installation_id=None, permissions=None):
         raise NoInstallation(f"repo {repo} has no GitHub App installation")
 
 

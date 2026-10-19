@@ -658,8 +658,10 @@ class TestCanonicalSet:
 
     def test_exact_set(self) -> None:
         # Production adds FIXED as a builder alias for ACCEPT-READY.
+        # B2 adds ACCEPT (agent no longer merges, returns ACCEPT).
         assert CANONICAL_VERDICTS == {
             "FIXED",
+            "ACCEPT",
             "ACCEPT-MERGED",
             "ACCEPT-READY",
             "FIX-FORWARD",

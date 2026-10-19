@@ -34,7 +34,8 @@ log = logging.getLogger("rhobear_neo.agent")
 # Canonical Neo verdicts — anything else is rejected.
 CANONICAL_VERDICTS = frozenset({
     "FIXED",  # builder alias for ACCEPT-READY
-    "ACCEPT-MERGED",
+    "ACCEPT-MERGED",  # backward compat — old agents may still emit this
+    "ACCEPT",         # B2: agent no longer merges, returns ACCEPT
     "ACCEPT-READY",
     "FIX-FORWARD",
     "BOUNCE-BUILDER",
