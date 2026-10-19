@@ -11,7 +11,7 @@ TOKEN = "ghs_SECRETtoken123"
 
 class _FakeGHApp:
     """Fake GitHubApp that returns the test token for any repo."""
-    def token_for_repo(self, repo, installation_id=None):
+    def token_for_repo(self, repo, installation_id=None, permissions=None):
         return TOKEN
 
 

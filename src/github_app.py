@@ -182,24 +182,35 @@ class GitHubApp:
         return installation_id
 
     def installation_token(
-        self, installation_id: int, *, now: float | None = None
+        self, installation_id: int, *, now: float | None = None,
+        permissions: dict | None = None,
     ) -> str:
         """A 1-hour installation token for `installation_id`.
+
+        `permissions`, when given, requests a token with ONLY those permissions
+        (e.g. {"contents": "read", "pull_requests": "read"} for a read-only
+        token used by the escalation advisor).  The cache key includes the
+        permissions dict so a read-only and a write token for the same
+        installation are distinct entries.
 
         Cached and refreshed 5 minutes before expiry. The HTTP fetch happens
         OUTSIDE the lock so a slow token-mint does not stall all workers.
         """
         now = self._time() if now is None else now
         inst = int(installation_id)
+        cache_key = (inst, json.dumps(permissions or {}, sort_keys=True))
         with self._lock:
-            cached = self._token_cache.get(inst)
+            cached = self._token_cache.get(cache_key)
             if cached and cached[1] - now > self._token_refresh_lead:
                 return cached[0]
         # Cache miss — fetch outside the lock.
+        body: dict = {}
+        if permissions:
+            body["permissions"] = permissions
         status, raw = self._api(
             "POST",
             f"/app/installations/{inst}/access_tokens",
-            body={},
+            body=body,
         )
         if status != 201:
             raise GitHubAppError(
@@ -209,7 +220,7 @@ class GitHubApp:
         token = str(data["token"])
         expires = _parse_iso(str(data["expires_at"]))
         with self._lock:
-            self._token_cache[inst] = (token, expires)
+            self._token_cache[cache_key] = (token, expires)
         return token
 
     def token_for_repo(
@@ -218,16 +229,19 @@ class GitHubApp:
         installation_id: int | None = None,
         *,
         now: float | None = None,
+        permissions: dict | None = None,
     ) -> str:
         """The installation token to use when acting on `repo`.
 
         `installation_id`, when known (the webhook payload carries
         installation.id), is used directly; otherwise it is resolved from the
-        repo. Raises NoInstallation when the repo has no installation.
+        repo. `permissions` scopes the token (default: full installation
+        permissions). Raises NoInstallation when the repo has no installation.
         """
         if installation_id is None:
             installation_id = self.installation_for_repo(repo, now=now)
-        return self.installation_token(installation_id, now=now)
+        return self.installation_token(installation_id, now=now,
+                                       permissions=permissions)
 
     # ------------------------------------------------------------------
     # Internal: HTTPS
@@ -298,13 +312,19 @@ def github_app_for(cfg) -> GitHubApp | None:
     return app
 
 
-def repo_token(cfg, repo: str, installation_id: int | None = None) -> str:
+def repo_token(cfg, repo: str, installation_id: int | None = None,
+               permissions: dict | None = None) -> str:
     """The installation token to use when acting on `repo`.
 
     Every GitHub action for a repo uses THAT repo's installation token
     (minted by the GitHub App).  There is NO fallback to a personal token:
     a repo with no installation raises NoInstallation (terminal).  A cfg
     with no App identity raises AppNotConfigured.
+
+    `permissions` scopes the token (e.g. {"contents": "read",
+    "pull_requests": "read"} for a read-only token).  The escalation advisor
+    uses a read-only token; the merge executor uses the full installation
+    permissions.
 
     Callers that need a token for tests inject a fake GitHubApp (set it on
     the cfg via the `_rhobear_github_app` attribute or a fixture) instead
@@ -316,4 +336,5 @@ def repo_token(cfg, repo: str, installation_id: int | None = None) -> str:
             f"no GitHub identity for {repo} (GitHub App not configured; "
             "personal GH_TOKEN is never used as an identity)"
         )
-    return app.token_for_repo(repo, installation_id=installation_id)
+    return app.token_for_repo(repo, installation_id=installation_id,
+                              permissions=permissions)

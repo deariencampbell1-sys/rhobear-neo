@@ -110,6 +110,15 @@ class Config:
     # --- safety floors ---
     max_builder_rounds: int = field(default_factory=lambda: _get_int("NEO_MAX_BUILDER_ROUNDS", 2))
 
+    # --- bounce / escalation ---
+    # Number of builder bounces before escalation to a frontier advisor.
+    bounces_before_escalation: int = field(default_factory=lambda: _get_int(
+        "NEO_BOUNCES_BEFORE_ESCALATION", 5))
+    # Advisor service URL (tailnet, on the build box).  Fail closed if unset.
+    advisor_url: str = field(default_factory=lambda: _get("NEO_ADVISOR_URL"))
+    # Bearer token for the advisor service.
+    advisor_token: str = field(default_factory=lambda: _get("NEO_ADVISOR_TOKEN"))
+
     # --- state (shared VPS Postgres; Neo uses its own tables) ---
     database_url: str = field(default_factory=lambda: _get("DATABASE_URL"))
 
@@ -126,6 +135,24 @@ class Config:
     # Deprecated legacy field — kept so pre-App unit tests can pass a
     # placeholder token; production never uses it as an identity.
     gh_token: str = field(default_factory=lambda: _get("GH_TOKEN"))
+
+    # --- advisor service (on the build box) ---
+    advisor_bind_host: str = field(default_factory=lambda: _get(
+        "NEO_ADVISOR_BIND_HOST", "100.111.118.24"))
+    advisor_bind_port: int = field(default_factory=lambda: _get_int(
+        "NEO_ADVISOR_BIND_PORT", 8787))
+    advisor_routes: tuple[str, ...] = field(
+        default_factory=lambda: tuple(
+            r.strip() for r in _get(
+                "ADVISOR_ROUTES",
+                "claude:opus,codex:gpt-6.1-sol:high,codex:gpt-6-sol:high",
+            ).split(",") if r.strip()
+        )
+    )
+    advisor_queue_max: int = field(default_factory=lambda: _get_int(
+        "ADVISOR_QUEUE_MAX", 3))
+    advisor_timeout: int = field(default_factory=lambda: _get_int(
+        "ADVISOR_TIMEOUT", 1200))  # 20 minutes
 
     # Optional Jev review-of-the-reviewer call. This is a separate OpenRouter
     # credential from the Claude-wire DeepSeek route above.
