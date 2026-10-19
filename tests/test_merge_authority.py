@@ -61,12 +61,23 @@ def cfg():
     return c
 
 
+def _branch_lookups(gh_args, default="main", other_prs=""):
+    """Answers for the post-merge branch-safety lookups, or None."""
+    if gh_args[:3] == ("api", "repos/acme/a", "--jq"):
+        return 0, default
+    if gh_args[:2] == ("pr", "list"):
+        return 0, other_prs
+    return None
+
+
 def _fake_gh_success(*args, **kw):
     """Fake gh subprocess that returns success with PR data.
 
     merge_executor._gh receives (token, *gh_args).
     """
     gh_args = args[1:] if args else ()
+    if (lookup := _branch_lookups(gh_args)) is not None:
+        return lookup
     if gh_args[:3] == ("pr", "view", "1"):
         data = {
             "headRefOid": SHA1,
@@ -464,6 +475,8 @@ class TestMergeExecutor:
 
         def fake_gh(token, *args, **kw):
             gh_args = args
+            if (lookup := _branch_lookups(gh_args)) is not None:
+                return lookup
             if gh_args[:3] == ("pr", "view", "1"):
                 data = {"headRefOid": SHA1, "state": "OPEN",
                         "mergeable": "MERGEABLE",
@@ -519,6 +532,8 @@ class TestMergeBranchDeletion:
 
         def fake_gh(token, *args, **kw):
             gh_args = args
+            if (lookup := _branch_lookups(gh_args)) is not None:
+                return lookup
             if gh_args[:3] == ("pr", "view", "1"):
                 data = {"headRefOid": SHA1, "state": "OPEN",
                         "mergeable": "MERGEABLE",
@@ -546,6 +561,8 @@ class TestMergeBranchDeletion:
         is tolerated — the merge still counts as success."""
         def fake_gh(token, *args, **kw):
             gh_args = args
+            if (lookup := _branch_lookups(gh_args)) is not None:
+                return lookup
             if gh_args[:3] == ("pr", "view", "1"):
                 data = {"headRefOid": SHA1, "state": "OPEN",
                         "mergeable": "MERGEABLE",
@@ -562,6 +579,66 @@ class TestMergeBranchDeletion:
         with patch("src.merge_executor._gh", side_effect=fake_gh):
             result = merge("acme/a", 1, SHA1, evidence, "test-token")
         assert result["merged"] is True
+
+    @staticmethod
+    def _run(head_ref="topic-branch", cross=False, default="main", other_prs="",
+             delete_result=(0, ""), raise_on=None):
+        deletes: list = []
+
+        def fake_gh(token, *args, **kw):
+            if raise_on and args[:len(raise_on)] == raise_on:
+                raise subprocess.TimeoutExpired(cmd="gh", timeout=60)
+            if (lookup := _branch_lookups(args, default, other_prs)) is not None:
+                return lookup
+            if args[:3] == ("pr", "view", "1"):
+                return 0, json.dumps({"headRefOid": SHA1, "state": "OPEN", "mergeable": "MERGEABLE",
+                                      "headRefName": head_ref, "isCrossRepository": cross})
+            if args[0] == "api" and args[3] == "repos/acme/a/pulls/1/merge":
+                return 0, json.dumps({"merged": True, "sha": "M" * 40})
+            if args[:3] == ("api", "-X", "DELETE"):
+                deletes.append(args[3])
+                return delete_result
+            raise AssertionError(f"unexpected call: {args}")
+
+        evidence = {"ok": True, "head_sha": SHA1, "decided_sha": SHA1}
+        with patch("src.merge_executor._gh", side_effect=fake_gh):
+            result = merge("acme/a", 1, SHA1, evidence, "test-token")
+        return result, deletes
+
+    def test_shared_branch_with_other_open_pr_is_kept(self):
+        result, deletes = self._run(head_ref="develop", other_prs="1\n7")
+        assert result["merged"] is True
+        assert deletes == []
+
+    def test_default_branch_is_never_deleted(self):
+        result, deletes = self._run(head_ref="main", default="main")
+        assert result["merged"] is True
+        assert deletes == []
+
+    def test_fork_pr_branch_is_not_deleted(self):
+        result, deletes = self._run(head_ref="someone:topic", cross=True)
+        assert result["merged"] is True
+        assert deletes == []
+
+    def test_unknown_default_branch_keeps_the_branch(self):
+        result, deletes = self._run(default="")
+        assert result["merged"] is True
+        assert deletes == []
+
+    def test_own_branch_is_deleted_when_only_this_pr_uses_it(self):
+        result, deletes = self._run(other_prs="1")
+        assert deletes == ["repos/acme/a/git/refs/heads/topic-branch"]
+
+    def test_delete_timeout_never_undoes_a_confirmed_merge(self):
+        """A gh hang on the ref DELETE raises TimeoutExpired inside _gh; the merge
+        is already confirmed, so merge() must still return merged=True."""
+        result, _ = self._run(raise_on=("api", "-X", "DELETE"))
+        assert result == {"merged": True, "sha": SHA1, "detail": result["detail"]}
+
+    def test_lookup_timeout_never_undoes_a_confirmed_merge(self):
+        result, deletes = self._run(raise_on=("api", "repos/acme/a", "--jq"))
+        assert result["merged"] is True
+        assert deletes == []
 
     def test_merge_skips_deletion_without_head_ref(self):
         """No headRefName on the PR → no deletion attempted."""

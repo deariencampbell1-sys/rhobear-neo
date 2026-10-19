@@ -1525,6 +1525,84 @@ class TestTimeoutNoAdviceIdPG:
         assert esc == 0, "the un-pollable marker must be cleared (no infinite loop)"
         assert parked >= 1, parked
 
+    def test_legacy_marker_never_deletes_a_newer_advice(self, db):
+        """The recovery loop snapshots a legacy marker (no advice_id key at
+        all), then a new bounce submits a fresh advice for the same PR before
+        the loop acts.  The fresh advice must survive and the PR must not be
+        parked."""
+        jobs = db
+        state = NeoState(DSN)
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute(
+                "INSERT INTO neo_actions(repo,pr_number,head_sha,phase,builder_round,"
+                "verdict,credits,detail,created_at) VALUES ('o/r',96,%s,'escalating',0,"
+                "'ESCALATE',0,'{}', now() - interval '31 minutes')", (SHA1,))
+        snapshot = [r for r in state.escalating_prs() if r["pr"] == 96]
+        assert snapshot and snapshot[0]["advice_id"] == ""
+        state.record_escalating("o/r", 96, SHA2, advice_id="advice-new",
+                                installation_id=1)
+        cfg = _cfg()
+        cfg.advisor_url = "http://127.0.0.1:9"
+        cfg.advisor_token = "test-token"
+        from src.escalation import recover_escalations
+        with patch.object(state, "escalating_prs", return_value=snapshot):
+            handled = recover_escalations(cfg, state, jobs, timeout_secs=1800)
+        assert [h["action"] for h in handled] == ["dropped"], handled
+        rows = [r for r in state.escalating_prs() if r["pr"] == 96]
+        assert [r["advice_id"] for r in rows] == ["advice-new"], rows
+        with psycopg.connect(DSN, autocommit=True) as c:
+            parked = c.execute(
+                "SELECT COUNT(*) FROM neo_actions WHERE phase='parked' "
+                "AND repo='o/r' AND pr_number=96").fetchone()[0]
+            legacy = c.execute(
+                "SELECT COUNT(*) FROM neo_actions WHERE phase='escalating' "
+                "AND repo='o/r' AND pr_number=96 AND detail->>'advice_id' IS NULL"
+            ).fetchone()[0]
+        assert parked == 0, parked
+        assert legacy == 0, "the stale legacy marker is removed"
+
+
+class TestRetryKeepsTimeoutPG:
+    """A failing terminal action re-records the marker; the re-recorded marker
+    keeps the escalation's ORIGINAL start, so retries never push out the
+    give-up timeout and the PR is parked once it is exceeded."""
+
+    def test_retries_do_not_reset_the_timeout(self, db):
+        jobs = db
+        state = NeoState(DSN)
+        state.record_escalating("o/r", 97, SHA1, advice_id="advice-1",
+                                installation_id=1)
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute(
+                "UPDATE neo_actions SET created_at = now() - interval '25 minutes' "
+                "WHERE repo='o/r' AND pr_number=97")
+        original = [r for r in state.escalating_prs() if r["pr"] == 97][0]["started_at"]
+        cfg = _cfg()
+        cfg.advisor_url = "http://127.0.0.1:9"
+        cfg.advisor_token = "test-token"
+        from src.escalation import recover_escalations, AdviceStatus
+        work_order = {"route": "claude:opus", "summary": "s", "root_cause": "rc",
+                      "steps": [], "tests": [], "risks": ""}
+
+        def boom(*a, **k):
+            raise RuntimeError("create_builder keeps failing")
+
+        with patch("src.escalation.poll_advice",
+                   return_value=AdviceStatus(status="done", work_order=work_order)), \
+             patch("src.escalation.escalate_pr", side_effect=boom):
+            handled = recover_escalations(cfg, state, jobs, timeout_secs=1800)
+        assert [h["action"] for h in handled] == ["retry"], handled
+        row = [r for r in state.escalating_prs() if r["pr"] == 97][0]
+        assert abs(row["started_at"] - original) < 1, (row["started_at"], original)
+        # 25 minutes in, a 20-minute budget is already spent: the next pass
+        # parks instead of retrying forever.
+        with patch("src.escalation.poll_advice",
+                   return_value=AdviceStatus(status="done", work_order=work_order)), \
+             patch("src.escalation.escalate_pr", side_effect=boom):
+            handled2 = recover_escalations(cfg, state, jobs, timeout_secs=1200)
+        assert [h["action"] for h in handled2] == ["parked"], handled2
+        assert not [r for r in state.escalating_prs() if r["pr"] == 97]
+
 
 class TestDefaultConfigEscalationPG:
     """Defect 5 — NEO_MAX_BUILDER_ROUNDS defaults to bounces_before_escalation

@@ -39,6 +39,7 @@ from src.config import Config
 from src.github_app import (
     AppNotConfigured,
     GitHubApp,
+    GitHubAppError,
     NoInstallation,
     github_app_for,
     load_app_key,
@@ -92,11 +93,13 @@ class FakeGitHubHTTP:
     """
 
     def __init__(self, installations=None, tokens=None, *, clock=None,
-                 token_ttl=3600, token_404s=None, listed_installations=None):
+                 token_ttl=3600, token_404s=None, listed_installations=None,
+                 link_header_name="Link"):
         self.installations = dict(installations or {})  # repo -> installation id
         self.tokens = dict(tokens or {})                # installation id -> token text
         self.token_404s = set(token_404s or ())         # token POST 404s for these ids
         self.listed_installations = listed_installations  # None | [{"id": n}, ...]
+        self.link_header_name = link_header_name          # HTTP/2 sends lowercase
         self.clock = clock or FakeClock()
         self.token_ttl = token_ttl
         self.calls: list[tuple[str, str]] = []          # (method, path)
@@ -124,7 +127,7 @@ class FakeGitHubHTTP:
                        f"{per_page}&page={page + 1}>; rel=\"next\"")
             else:
                 nxt = ""
-            return 200, raw, {"Link": nxt}
+            return 200, raw, {self.link_header_name: nxt}
         if method == "POST" and path.endswith("/access_tokens"):
             inst = int(path.split("/")[3])
             if inst in self.token_404s:
@@ -372,6 +375,21 @@ class TestUninstalledApp:
         assert len(listing_calls) == 2, listing_calls
         assert "per_page=100" in listing_calls[0]
         assert "page=2" in listing_calls[1]
+
+    def test_list_installations_paginates_with_lowercase_link(self, rsa_key):
+        """HTTP/2 delivers header names in lowercase (`link`); pagination must
+        still follow it instead of silently stopping after page 1."""
+        http = FakeGitHubHTTP(
+            listed_installations=[{"id": i} for i in range(1, 103)],
+            clock=FakeClock(), link_header_name="link",
+        )
+        assert len(_make_app(rsa_key, http).list_installations()) == 102
+
+    def test_list_installations_malformed_item_is_app_error(self, rsa_key):
+        http = FakeGitHubHTTP(listed_installations=[{"id": 1}, {"no_id": 2}],
+                              clock=FakeClock())
+        with pytest.raises(GitHubAppError):
+            _make_app(rsa_key, http).list_installations()
 
 
 class TestRepoTokenGlue:
