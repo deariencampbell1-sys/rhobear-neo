@@ -1,27 +1,29 @@
-"""Escalation — 5-bounce escalation to a frontier advisor.
+"""Escalation — 5-bounce escalation to a frontier advisor (async).
 
 When a PR has bounced NEO_BOUNCES_BEFORE_ESCALATION (default 5) builder rounds
 across any head SHAs, Neo escalates to a frontier advisor on the build box
 instead of a 6th cheap round.
 
-Flow:
+Flow (asynchronous — Neo never waits on the advisor):
   1. Count builder rounds per PR across head SHAs.
-  2. When round >= bounces_before_escalation, the PR goes to `escalating`.
-  3. Neo calls the advisor on the build box over the tailnet:
-     POST http://100.111.118.24:8787/v1/advise
-     Body: {repo, pr, head_sha, rounds: [...], diff_stat, read_token}
-     where `read_token` is a new installation token minted with
-     permissions: {contents: read, pull_requests: read}.
-  4. The advisor returns a work order (JSON).
-  5. Neo turns the work order into a 6th Builder round whose brief is the
-     work order plus the round history, marked `escalated`.
-  6. If that round also bounces, or the advisor fails/times out, the PR is
-     parked for the owner with a one-line reason.
+  2. When round >= bounces_before_escalation, the PR goes to `escalating`:
+     `submit_escalation` mints a read-only installation token
+     (permissions: {contents: read, pull_requests: read} — never the write
+     token), POSTs to the advisor, stores the `advice_id` on the PR's state
+     row (phase='escalating') and returns immediately.
+  3. The recovery loop (`__main__.py`) polls each `escalating` PR every
+     `escalation_poll_secs` s (give up after `escalation_timeout_secs` →
+     park with a one-line reason) and on `done` calls `escalate_pr` to
+     create the ONE escalated builder round whose brief is the work order
+     plus the round history, marked `escalated`.
+  4. If that round also bounces, or the advisor fails/times out, the PR is
+     parked for the owner with a one-line reason (no more rounds).
 """
 from __future__ import annotations
 
 import json
 import logging
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -98,6 +100,27 @@ class WorkOrder:
             lines.append(f"Risks: {self.risks}")
         return "\n".join(lines)
 
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "WorkOrder":
+        """Build a WorkOrder from a raw advisor JSON dict (poll response)."""
+        data = data or {}
+        return cls(
+            route=str(data.get("route", "") or ""),
+            summary=str(data.get("summary", "") or ""),
+            root_cause=str(data.get("root_cause", "") or ""),
+            steps=data.get("steps") or [],
+            tests=data.get("tests") or [],
+            risks=str(data.get("risks", "") or ""),
+        )
+
+
+@dataclass
+class AdviceStatus:
+    """The advisor's poll result for one advice_id."""
+    status: str = ""                    # queued|running|done|failed
+    work_order: dict | None = None      # when done
+    error: str = ""                     # when failed
+
 
 def count_builder_rounds(state, repo: str, pr: int) -> int:
     """Count total builder rounds for a PR across all head SHAs."""
@@ -128,7 +151,14 @@ def _read_token(cfg, repo: str, installation_id: int | None = None) -> str:
     )
 
 
-def call_advisor(
+def _headers(cfg: Config, token: str) -> dict:
+    return {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}",
+    }
+
+
+def _post_advise(
     cfg: Config,
     repo: str,
     pr: int,
@@ -136,11 +166,11 @@ def call_advisor(
     rounds: list[RoundRecord],
     diff_stat: str,
     read_token: str,
-) -> WorkOrder:
-    """Call the advisor on the build box.
+) -> str:
+    """POST /v1/advise and return the advice_id.
 
-    POST http://<advisor_url>/v1/advise with bearer auth.
-    Fail closed if advisor_url or advisor_token is unset.
+    The advisor responds 202 immediately (the agent runs in the background);
+    this never waits for the work order.  Fail closed if url/token unset.
     """
     url = cfg.advisor_url
     token = cfg.advisor_token
@@ -169,10 +199,7 @@ def call_advisor(
         url.rstrip("/") + "/v1/advise",
         data=body,
         method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {token}",
-        },
+        headers=_headers(cfg, token),
     )
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
@@ -190,18 +217,51 @@ def call_advisor(
         data = json.loads(raw)
     except (TypeError, ValueError) as exc:
         raise AdvisorFailed(f"advisor returned malformed JSON: {exc}")
+    advice_id = str(data.get("advice_id", "") or "")
+    if not advice_id:
+        raise AdvisorFailed("advisor returned no advice_id")
+    return advice_id
 
-    return WorkOrder(
-        route=str(data.get("route", "")),
-        summary=str(data.get("summary", "")),
-        root_cause=str(data.get("root_cause", "")),
-        steps=data.get("steps") or [],
-        tests=data.get("tests") or [],
-        risks=str(data.get("risks", "")),
+
+def poll_advice(cfg: Config, advice_id: str) -> AdviceStatus:
+    """GET /v1/advise/<advice_id> — the advisor's async status.
+
+    Returns {queued|running|done|failed} with the work_order when done or the
+    error when failed.  Raises EscalationError on transport/auth failure.
+    """
+    url = cfg.advisor_url
+    token = cfg.advisor_token
+    if not url or not token:
+        raise AdvisorUnavailable("NEO_ADVISOR_URL or NEO_ADVISOR_TOKEN not configured")
+
+    req = urllib.request.Request(
+        url.rstrip("/") + "/v1/advise/" + advice_id,
+        method="GET",
+        headers=_headers(cfg, token),
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            raise AdvisorFailed(f"advisor has no record for advice_id {advice_id}")
+        raise AdvisorRefused(f"advisor poll returned HTTP {exc.code}")
+    except urllib.error.URLError as exc:
+        raise AdvisorUnavailable(f"advisor unreachable: {exc.reason}")
+
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise AdvisorFailed(f"advisor poll returned malformed JSON: {exc}")
+
+    return AdviceStatus(
+        status=str(data.get("status", "") or ""),
+        work_order=data.get("work_order"),
+        error=str(data.get("error", "") or ""),
     )
 
 
-def escalate_pr(
+def submit_escalation(
     cfg: Config,
     state,
     jobs,
@@ -212,38 +272,64 @@ def escalate_pr(
     diff_stat: str,
     installation_id: int | None = None,
 ) -> dict:
-    """Escalate a PR to the frontier advisor.
+    """Submit an escalation to the advisor and record it on the PR state row.
 
-    Returns the outcome dict:
-      {"action": "escalated" | "parked", "reason": "...", "work_order": ...}
+    Mints a READ-ONLY token, POSTs (which returns 202 immediately), stores the
+    advice_id on the PR's state row (phase='escalating'), and returns — never
+    waits for the work order.
 
-    Flow:
-      1. Mint a read-only token for the advisor.
-      2. Call the advisor.
-      3. If the advisor returns a work order, create an escalated builder round.
-      4. If the advisor fails, park the PR with a one-line reason.
+    Returns:
+      {"action": "escalating", "advice_id": ...} on success, or
+      {"action": "parked", "reason": ...} when the advisor cannot be reached
+      (fail closed).
     """
     try:
         read_token = _read_token(cfg, repo, installation_id)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         reason = f"cannot mint read token: {type(exc).__name__}"
         log.warning("%s#%s@%s %s", repo, pr, head_sha[:8], reason)
         return _park_pr(state, jobs, repo, pr, head_sha, reason)
 
     try:
-        work_order = call_advisor(
-            cfg, repo, pr, head_sha, rounds, diff_stat, read_token,
-        )
+        advice_id = _post_advise(cfg, repo, pr, head_sha, rounds, diff_stat,
+                                 read_token)
     except EscalationError as exc:
         reason = f"advisor unavailable: {exc}"
         log.warning("%s#%s@%s %s", repo, pr, head_sha[:8], reason)
         return _park_pr(state, jobs, repo, pr, head_sha, reason)
 
-    if not work_order.steps:
+    state.record(repo, pr, head_sha, "escalating", verdict="ESCALATE",
+                 detail={
+                     "advice_id": advice_id,
+                     "installation_id": installation_id,
+                     "advisor_url": cfg.advisor_url or "",
+                 })
+    log.info("escalating %s#%s@%s advice_id=%s (async — poll for done)",
+             repo, pr, head_sha[:8], advice_id)
+    return {"action": "escalating", "advice_id": advice_id}
+
+
+def escalate_pr(
+    cfg: Config,
+    state,
+    jobs,
+    repo: str,
+    pr: int,
+    head_sha: str,
+    work_order: WorkOrder,
+    installation_id: int | None = None,
+) -> dict:
+    """Create the ONE escalated builder round from a completed work order.
+
+    The round is marked `escalated`, carries the work order in its payload
+    (and in its brief), and is exempt from the max-builder-rounds cap.
+
+    Returns {"action": "escalated", ...} or {"action": "parked", ...}.
+    """
+    if not work_order or not work_order.steps:
         reason = "advisor returned empty work order (no steps)"
         return _park_pr(state, jobs, repo, pr, head_sha, reason)
 
-    # Turn the work order into an escalated builder round.
     brief = work_order.to_builder_brief(repo, pr, head_sha)
     new_round = count_builder_rounds(state, repo, pr) + 1
 
@@ -282,8 +368,8 @@ def escalate_pr(
         })
 
     log.info("escalated %s#%s@%s route=%s round=%d steps=%d",
-             repo, pr, head_sha[:8], work_order.route, new_round, len(work_order.steps))
-
+             repo, pr, head_sha[:8], work_order.route, new_round,
+             len(work_order.steps))
     return {
         "action": "escalated",
         "reason": "escalated to frontier advisor",
@@ -297,6 +383,72 @@ def escalate_pr(
         },
         "round": new_round,
     }
+
+
+def recover_escalations(
+    cfg: Config,
+    state,
+    jobs,
+    timeout_secs: int = 1800,
+) -> list[dict]:
+    """Poll every escalating PR; advance it one step (called by the recovery
+    loop in __main__).
+
+    For each `escalating` PR:
+      - waited too long  -> park with a one-line reason
+      - advisor `done`   -> escalate_pr creates the ONE escalated builder round
+      - advisor `failed` -> park with the advisor's error
+      - queued/running   -> keep waiting (next poll)
+      - transient poll error -> keep waiting (next poll; bounded by timeout)
+
+    Returns the list of handled rows for the caller/tests.
+    """
+    handled: list[dict] = []
+    for row in state.escalating_prs():
+        repo = row["repo"]
+        pr = row["pr"]
+        head_sha = row["head_sha"]
+        advice_id = row.get("advice_id", "")
+        waited = time.time() - row["created_at"].timestamp()
+
+        if waited > timeout_secs:
+            reason = f"advisor did not finish within {timeout_secs}s"
+            _park_pr(state, jobs, repo, pr, head_sha, reason)
+            state.clear_escalating(repo, pr)
+            handled.append({"repo": repo, "pr": pr, "action": "parked",
+                            "reason": reason})
+            continue
+        if not advice_id:
+            # No advice_id recorded yet — transient; next poll (timeout bounds).
+            continue
+
+        try:
+            status = poll_advice(cfg, advice_id)
+        except EscalationError as exc:
+            log.warning("poll escalation %s#%s: %s (retry next poll)",
+                        repo, pr, exc)
+            continue
+
+        if status.status == "done":
+            work_order = WorkOrder.from_dict(status.work_order)
+            outcome = escalate_pr(
+                cfg, state, jobs, repo, pr, head_sha, work_order,
+                installation_id=row.get("installation_id"),
+            )
+            state.clear_escalating(repo, pr)
+            handled.append({"repo": repo, "pr": pr,
+                            "action": outcome["action"]})
+        elif status.status == "failed":
+            reason = f"advisor failed: {status.error or 'unknown'}"
+            _park_pr(state, jobs, repo, pr, head_sha, reason)
+            state.clear_escalating(repo, pr)
+            handled.append({"repo": repo, "pr": pr, "action": "parked",
+                            "reason": reason})
+        else:
+            # queued / running — keep waiting.
+            log.debug("escalation %s#%s@%s status=%s (waiting)",
+                      repo, pr, head_sha[:8], status.status)
+    return handled
 
 
 def _park_pr(state, jobs, repo, pr, head_sha, reason: str) -> dict:

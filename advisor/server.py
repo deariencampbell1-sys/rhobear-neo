@@ -5,10 +5,14 @@ Receives escalation requests from Neo at POST /v1/advise:
   Body: {repo, pr, head_sha, rounds: [...], diff_stat, read_token}
   Auth: Bearer <NEO_ADVISOR_TOKEN>
 
-  Returns: {route, summary, root_cause, steps: [{file, change, why}],
-            tests: [...], risks}
+  Returns 202 {"advice_id": "<uuid>"} immediately.  The agent runs in a
+  background thread (one agent at a time; at most 3 queued, then 429).
 
-Flow:
+  GET /v1/advise/<advice_id> (same bearer) returns
+    {status: queued|running|done|failed, work_order?, error?}
+  Results are kept 24 h.
+
+Flow behind a submission:
   1. Check bearer token.
   2. Enqueue the request (one at a time; max 3 queued, then 429).
   3. Clone the repo read-only at head_sha using read_token via credential
@@ -17,10 +21,11 @@ Flow:
      First available of ADVISOR_ROUTES:
        - claude: claude -p --model opus --permission-mode plan
        - codex: codex exec -m <model> -c model_reasoning_effort=<effort>
-  5. Return a work order (strict JSON; one repair retry, then fail).
+  5. Produce a work order (strict JSON; one repair retry, then fail).
   6. Delete the temp dir.
 
-Deployed on the build box as a capped systemd service (not on prod).
+Deployed on the build box as a capped systemd service (not on prod).  The
+advisor NEVER pushes, comments, or merges.
 """
 from __future__ import annotations
 
@@ -30,9 +35,14 @@ import os
 import subprocess
 import tempfile
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import time
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 log = logging.getLogger("rhobear_neo.advisor.server")
+
+# Advice records are kept for 24 h, then pruned.
+RECORD_TTL_SECS = 24 * 60 * 60
 
 
 class AdvisorError(Exception):
@@ -79,8 +89,12 @@ def _check_cli(engine: str) -> bool:
         return False
 
 
-def _run_agent(engine: str, params: dict, brief: str, timeout: int = 1200) -> str:
+def _run_agent(engine: str, params: dict, brief: str, timeout: int = 1200,
+               cwd: str | None = None) -> str:
     """Run a read-only frontier agent and return its raw output.
+
+    `cwd` is the read-only checkout at head_sha (the agent's working
+    directory), so the agent's HEAD equals the PR head it was asked about.
 
     Engine-specific commands:
       - claude: claude -p <brief> --model <model> --permission-mode plan
@@ -110,6 +124,7 @@ def _run_agent(engine: str, params: dict, brief: str, timeout: int = 1200) -> st
             cmd,
             capture_output=True, text=True,
             timeout=timeout,
+            cwd=cwd,
         )
     except subprocess.TimeoutExpired:
         raise AgentFailed(f"agent timed out after {timeout}s")
@@ -128,7 +143,8 @@ def _run_agent(engine: str, params: dict, brief: str, timeout: int = 1200) -> st
 def _parse_work_order(raw: str) -> dict:
     """Parse the agent's output as a JSON work order.
 
-    Attempts one repair retry (strip markdown fences) before failing.
+    Attempts one repair retry (strip markdown fences / extract embedded JSON)
+    before failing.
     """
     # First attempt: direct JSON parse.
     for attempt in range(2):
@@ -161,6 +177,55 @@ def _parse_work_order(raw: str) -> dict:
     raise AgentFailed("cannot parse work order after repair attempt")
 
 
+def _clone_head(tmpdir: str, repo: str, head_sha: str, read_token: str,
+                origin_url: str | None = None) -> str:
+    """Clone `repo` read-only and check out `head_sha` (detached).
+
+    `git init <dir>`; `git -C <dir> fetch --depth 1 origin <head_sha>` with the
+    read token via the env credential helper (never in a URL or .git/config);
+    `git -C <dir> checkout --detach FETCH_HEAD`.  Every returncode is checked.
+
+    A failure raises AgentFailed with the git stderr (token redacted).  The
+    agent's working directory is the checkout, so its HEAD equals `head_sha`
+    regardless of the remote's default branch.
+
+    `origin_url` overrides the origin URL (tests point it at a local bare
+    repo); default is the GitHub URL with NO token in it.
+    """
+    repo_url = origin_url or f"https://github.com/{repo}.git"
+    clone_dir = os.path.join(tmpdir, "repo")
+
+    # Credential helper: GIT_ASKPASS echoes the read_token.  The token never
+    # appears in the URL or .git/config.
+    askpass_path = os.path.join(tmpdir, "git-askpass.sh")
+    with open(askpass_path, "w") as f:
+        f.write("#!/bin/sh\n")
+        f.write(f'echo "{read_token}"\n')
+    os.chmod(askpass_path, 0o700)
+    env = {**os.environ, "GIT_ASKPASS": askpass_path,
+           "GIT_TERMINAL_PROMPT": "0"}
+
+    steps = [
+        ["git", "init", clone_dir],
+        ["git", "-C", clone_dir, "remote", "add", "origin", repo_url],
+        ["git", "-C", clone_dir, "fetch", "--depth", "1", "origin", head_sha],
+        ["git", "-C", clone_dir, "checkout", "--detach", "FETCH_HEAD"],
+    ]
+    for step in steps:
+        try:
+            proc = subprocess.run(
+                step, capture_output=True, text=True, timeout=120, env=env,
+            )
+        except subprocess.TimeoutExpired:
+            raise AgentFailed(f"git {' '.join(step)} timed out")
+        if proc.returncode != 0:
+            stderr = (proc.stderr or "").replace(read_token, "[REDACTED]")
+            raise AgentFailed(
+                f"git {' '.join(step)} failed: {stderr[:500]}"
+            )
+    return clone_dir
+
+
 def run_advisor(
     repo: str,
     pr: int,
@@ -170,50 +235,19 @@ def run_advisor(
     read_token: str,
     routes: tuple[str, ...],
     timeout: int = 1200,
+    origin_url: str | None = None,
 ) -> dict:
     """Run the advisor for one escalation request.
 
-    Clones the repo read-only, runs the first available frontier agent,
-    and returns a work order.
+    Clones the repo read-only at head_sha, runs the first available frontier
+    agent with cwd = the checkout, and returns a work order.
 
     The read_token is used via git credential helper pattern (never in URL
     or .git/config).
     """
     with tempfile.TemporaryDirectory(prefix="advisor-") as tmpdir:
-        # --- Clone the repo read-only using credential helper ------------
-        # We set GIT_ASKPASS to a script that returns the read_token.
-        # This avoids putting the token in the URL or .git/config.
-        askpass_path = os.path.join(tmpdir, "git-askpass.sh")
-        with open(askpass_path, "w") as f:
-            f.write("#!/bin/sh\n")
-            f.write(f'echo "{read_token}"\n')
-        os.chmod(askpass_path, 0o700)
-
-        repo_url = f"https://x-access-token@github.com/{repo}.git"
-        clone_dir = os.path.join(tmpdir, "repo")
-
-        try:
-            subprocess.run(
-                ["git", "clone", "--depth=1", repo_url, clone_dir],
-                capture_output=True, text=True,
-                timeout=120,
-                env={**os.environ, "GIT_ASKPASS": askpass_path,
-                     "GIT_TERMINAL_PROMPT": "0"},
-            )
-        except subprocess.TimeoutExpired:
-            raise AgentFailed("git clone timed out")
-        except subprocess.CalledProcessError as exc:
-            raise AgentFailed(f"git clone failed: {exc.stderr[:500]}")
-
-        # Checkout the specific head SHA.
-        try:
-            subprocess.run(
-                ["git", "-C", clone_dir, "checkout", head_sha],
-                capture_output=True, text=True,
-                timeout=30,
-            )
-        except subprocess.CalledProcessError as exc:
-            raise AgentFailed(f"git checkout {head_sha[:12]} failed: {exc.stderr[:500]}")
+        clone_dir = _clone_head(tmpdir, repo, head_sha, read_token,
+                                origin_url=origin_url)
 
         # --- Build the brief for the frontier agent ---------------------
         brief = _build_advisor_brief(repo, pr, head_sha, rounds, diff_stat, clone_dir)
@@ -226,7 +260,8 @@ def run_advisor(
                 log.info("route %s unavailable (CLI not found), trying next", route_spec)
                 continue
             try:
-                raw = _run_agent(engine, params, brief, timeout=timeout)
+                raw = _run_agent(engine, params, brief, timeout=timeout,
+                                 cwd=clone_dir)
                 work_order = _parse_work_order(raw)
                 work_order["route"] = route_spec
                 return work_order
@@ -297,14 +332,144 @@ This will be given directly to a Builder agent as its task brief.
 """
 
 
-class AdvisorRequestHandler(BaseHTTPRequestHandler):
-    """HTTP handler for the advisor service."""
+class AdvisorService:
+    """Holds advice records, the wait queue, and the active flag.
 
-    # Class-level state for queue management.
-    queue: list[dict] = []
-    queue_lock = threading.Lock()
-    active = False
-    active_lock = threading.Lock()
+    One agent runs at a time; at most `queue_max` wait, then QueueFull (429).
+    Records are kept 24 h.  Thread-safe: submit/status/_next all use `_lock`.
+    """
+
+    def __init__(self, routes: tuple[str, ...] = ("claude:opus",),
+                 timeout: int = 1200, queue_max: int = 3,
+                 origin_url: str | None = None) -> None:
+        self._lock = threading.Lock()
+        self._records: dict[str, dict] = {}
+        self._queue: list[str] = []
+        self._active = False
+        self.routes = routes
+        self.timeout = timeout
+        self.queue_max = queue_max
+        self.origin_url = origin_url
+
+    # ------------------------------------------------------------------
+    def submit(self, payload: dict) -> str:
+        """Queue or start the advisor for `payload`.
+
+        Returns the advice_id.  Raises QueueFull when already active and the
+        wait queue is full.  Never blocks on the agent.
+        """
+        advice_id = uuid.uuid4().hex
+        with self._lock:
+            self._prune_locked()
+            if self._active:
+                if len(self._queue) >= self.queue_max:
+                    raise QueueFull("queue full")
+                self._records[advice_id] = {
+                    "status": "queued",
+                    "payload": payload,
+                    "work_order": None,
+                    "error": "",
+                    "created_at": time.time(),
+                }
+                self._queue.append(advice_id)
+                return advice_id
+            self._active = True
+            self._records[advice_id] = {
+                "status": "running",
+                "payload": payload,
+                "work_order": None,
+                "error": "",
+                "created_at": time.time(),
+            }
+        threading.Thread(target=self._worker, args=(advice_id, payload),
+                         daemon=True).start()
+        return advice_id
+
+    def status(self, advice_id: str) -> dict | None:
+        """The record for `advice_id`, or None when unknown/expired."""
+        with self._lock:
+            self._prune_locked()
+            rec = self._records.get(advice_id)
+            if rec is None:
+                return None
+            return {
+                "status": rec["status"],
+                "work_order": rec.get("work_order"),
+                "error": rec.get("error", ""),
+            }
+
+    # ------------------------------------------------------------------
+    def _worker(self, advice_id: str, payload: dict) -> None:
+        """Run the agent for one advice and record the outcome."""
+        try:
+            work_order = run_advisor(
+                str(payload.get("repo", "")),
+                int(payload.get("pr", 0) or 0),
+                str(payload.get("head_sha", "")),
+                payload.get("rounds") or [],
+                str(payload.get("diff_stat", "") or ""),
+                str(payload.get("read_token", "") or ""),
+                routes=self.routes,
+                timeout=self.timeout,
+                origin_url=self.origin_url,
+            )
+            with self._lock:
+                rec = self._records.get(advice_id)
+                if rec is not None:
+                    rec["status"] = "done"
+                    rec["work_order"] = work_order
+                    rec["error"] = ""
+        except AgentFailed as exc:
+            log.warning("advisor failed %s: %s", advice_id, exc)
+            with self._lock:
+                rec = self._records.get(advice_id)
+                if rec is not None:
+                    rec["status"] = "failed"
+                    rec["error"] = str(exc)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("advisor worker crashed %s", advice_id)
+            with self._lock:
+                rec = self._records.get(advice_id)
+                if rec is not None:
+                    rec["status"] = "failed"
+                    rec["error"] = f"internal error: {type(exc).__name__}"
+        finally:
+            self._next()
+
+    def _next(self) -> None:
+        """Start the next queued advice, or free the active slot."""
+        payload = None
+        advice_id = None
+        with self._lock:
+            self._prune_locked()
+            while self._queue:
+                candidate = self._queue.pop(0)
+                rec = self._records.get(candidate)
+                if rec is not None:
+                    advice_id = candidate
+                    rec["status"] = "running"
+                    payload = rec["payload"]
+                    break
+            if advice_id is None:
+                self._active = False
+                return
+        threading.Thread(target=self._worker, args=(advice_id, payload),
+                         daemon=True).start()
+
+    def _prune_locked(self) -> None:
+        """Drop records older than 24 h (caller holds `_lock`)."""
+        cutoff = time.time() - RECORD_TTL_SECS
+        stale = [aid for aid, rec in self._records.items()
+                 if rec["created_at"] < cutoff]
+        for aid in stale:
+            del self._records[aid]
+        # Queue entries whose record was pruned cannot be served.
+        if stale:
+            self._queue = [aid for aid in self._queue if aid in self._records]
+
+
+class AdvisorRequestHandler(BaseHTTPRequestHandler):
+    """HTTP handler for the advisor service (ThreadingHTTPServer)."""
 
     def log_message(self, *a):
         pass  # silence default stderr spam
@@ -315,104 +480,59 @@ class AdvisorRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(body).encode("utf-8"))
 
+    def _authorized(self) -> bool:
+        auth = self.headers.get("Authorization", "")
+        expected_token = getattr(self.server, "advisor_token", "")
+        return bool(expected_token) and auth.startswith("Bearer ") \
+            and auth[7:] == expected_token
+
     def do_POST(self):
         if self.path != "/v1/advise":
             return self._reply(404, {"error": "not found"})
-
-        # --- Auth -----------------------------------------------------------
-        auth = self.headers.get("Authorization", "")
-        expected_token = getattr(self.server, "advisor_token", "")
-        if not auth.startswith("Bearer ") or auth[7:] != expected_token:
+        if not self._authorized():
             return self._reply(401, {"error": "unauthorized"})
 
-        # --- Parse body -----------------------------------------------------
+        # --- Parse body -------------------------------------------------
         length = int(self.headers.get("Content-Length", 0) or 0)
         body = self.rfile.read(length) if length else b""
         try:
             payload = json.loads(body or b"{}")
         except json.JSONDecodeError:
             return self._reply(400, {"error": "bad json"})
+        if not isinstance(payload, dict):
+            return self._reply(400, {"error": "bad json"})
 
         repo = payload.get("repo", "")
         pr = payload.get("pr", 0)
         head_sha = payload.get("head_sha", "")
-        rounds = payload.get("rounds", [])
-        diff_stat = payload.get("diff_stat", "")
         read_token = payload.get("read_token", "")
-
         if not repo or not pr or not head_sha or not read_token:
             return self._reply(400, {"error": "missing required fields"})
 
-        # --- Queue management -----------------------------------------------
-        with self.queue_lock:
-            if self.active:
-                if len(self.queue) >= getattr(self.server, "advisor_queue_max", 3):
-                    return self._reply(429, {"error": "queue full"})
-                self.queue.append(payload)
-                return self._reply(202, {"status": "queued"})
-
-            self.active = True
-
-        # --- Process (outside lock) -----------------------------------------
+        # --- Queue / start (never waits on the agent) -------------------
+        service = getattr(self.server, "advisor_service", None)
+        if service is None:
+            return self._reply(500, {"error": "advisor service not configured"})
         try:
-            routes = getattr(self.server, "advisor_routes", ("claude:opus",))
-            timeout = getattr(self.server, "advisor_timeout", 1200)
-            work_order = run_advisor(
-                repo, pr, head_sha, rounds, diff_stat, read_token,
-                routes=routes, timeout=timeout,
-            )
-            self._reply(200, work_order)
-        except AgentFailed as exc:
-            self._reply(500, {"error": str(exc)})
-        except Exception as exc:
-            log.exception("advisor failed on %s#%s", repo, pr)
-            self._reply(500, {"error": f"internal error: {type(exc).__name__}"})
-        finally:
-            # Process next in queue.
-            with self.queue_lock:
-                if self.queue:
-                    next_req = self.queue.pop(0)
-                    # Spawn a thread to process the next request.
-                    t = threading.Thread(
-                        target=self._process,
-                        args=(next_req,),
-                        daemon=True,
-                    )
-                    t.start()
-                else:
-                    self.active = False
+            advice_id = service.submit(payload)
+        except QueueFull:
+            return self._reply(429, {"error": "queue full"})
+        return self._reply(202, {"advice_id": advice_id})
 
-    def _process(self, payload: dict):
-        """Process a queued request in a background thread."""
-        repo = payload.get("repo", "")
-        pr = payload.get("pr", 0)
-        head_sha = payload.get("head_sha", "")
-        rounds = payload.get("rounds", [])
-        diff_stat = payload.get("diff_stat", "")
-        read_token = payload.get("read_token", "")
-        try:
-            routes = getattr(self.server, "advisor_routes", ("claude:opus",))
-            timeout = getattr(self.server, "advisor_timeout", 1200)
-            work_order = run_advisor(
-                repo, pr, head_sha, rounds, diff_stat, read_token,
-                routes=routes, timeout=timeout,
-            )
-            log.info("advisor completed %s#%s route=%s", repo, pr,
-                     work_order.get("route", "?"))
-        except Exception as exc:
-            log.error("advisor failed on queued %s#%s: %s", repo, pr, exc)
-        finally:
-            with self.queue_lock:
-                if self.queue:
-                    next_req = self.queue.pop(0)
-                    t = threading.Thread(
-                        target=self._process,
-                        args=(next_req,),
-                        daemon=True,
-                    )
-                    t.start()
-                else:
-                    self.active = False
+    def do_GET(self):
+        prefix = "/v1/advise/"
+        if not self.path.startswith(prefix):
+            return self._reply(404, {"error": "not found"})
+        if not self._authorized():
+            return self._reply(401, {"error": "unauthorized"})
+        advice_id = self.path[len(prefix):].strip("/")
+        service = getattr(self.server, "advisor_service", None)
+        if service is None:
+            return self._reply(500, {"error": "advisor service not configured"})
+        record = service.status(advice_id)
+        if record is None:
+            return self._reply(404, {"error": "unknown advice_id"})
+        return self._reply(200, record)
 
 
 def serve(
@@ -422,13 +542,17 @@ def serve(
     advisor_routes: tuple[str, ...] = ("claude:opus",),
     advisor_queue_max: int = 3,
     advisor_timeout: int = 1200,
+    origin_url: str | None = None,
 ) -> None:
-    """Start the advisor HTTP server."""
-    server = HTTPServer((bind_host, bind_port), AdvisorRequestHandler)
+    """Start the advisor HTTP server (ThreadingHTTPServer + AdvisorService)."""
+    server = ThreadingHTTPServer((bind_host, bind_port), AdvisorRequestHandler)
     server.advisor_token = advisor_token
-    server.advisor_routes = advisor_routes
-    server.advisor_queue_max = advisor_queue_max
-    server.advisor_timeout = advisor_timeout
+    server.advisor_service = AdvisorService(
+        routes=advisor_routes,
+        timeout=advisor_timeout,
+        queue_max=advisor_queue_max,
+        origin_url=origin_url,
+    )
     log.info("advisor listening on %s:%d (routes=%s queue_max=%d)",
              bind_host, bind_port, advisor_routes, advisor_queue_max)
     server.serve_forever()

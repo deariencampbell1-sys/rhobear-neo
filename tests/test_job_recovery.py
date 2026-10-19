@@ -320,6 +320,7 @@ class TestDefect3AgentErrors:
         state.builder_rounds.return_value = 0
         state.install.return_value = {"auto_merge": False, "plan": None, "credits_balance": 100}
         state.already_acted.return_value = False   # per-SHA idempotency gate must not short-circuit
+        state.already_escalated.return_value = False  # PR has not escalated yet
         wake = {"repo": "o/r", "sha": "a" * 40, "green": True,
                 "context": "test", "pr_number": 1, "job_id": 42}
         with patch("src.neo_worker.resolve_pr", return_value=1), \
@@ -450,6 +451,7 @@ class TestGLM2BuilderCreated:
         state.builder_rounds.return_value = 1   # one round already spent
         state.install.return_value = {"auto_merge": False, "plan": None, "credits_balance": 100}
         state.already_acted.return_value = False   # per-SHA idempotency gate must not short-circuit
+        state.already_escalated.return_value = False  # PR has not escalated yet
         jobs = MagicMock(spec=Jobs)
         jobs.create_wake.return_value = 42
         jobs.claim.return_value = 42
@@ -516,6 +518,7 @@ class TestGLM6LeaseRenewal:
         state.builder_rounds.return_value = 0
         state.install.return_value = {"auto_merge": False, "plan": None, "credits_balance": 100}
         state.already_acted.return_value = False   # per-SHA idempotency gate must not short-circuit
+        state.already_escalated.return_value = False  # PR has not escalated yet
         jobs = MagicMock(spec=Jobs)
         jobs.create_wake.return_value = 42
         jobs.claim.return_value = 42

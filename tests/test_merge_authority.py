@@ -27,6 +27,7 @@ import os
 import subprocess
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -36,8 +37,8 @@ from src.config import Config
 from src.merge_executor import merge, HeadMoved, MergeDenied, MergeError
 from src.review_evidence import build_evidence, merge_authority, evidence_brief
 from src.escalation import (
-    RoundRecord, WorkOrder, should_escalate, call_advisor, escalate_pr,
-    EscalationError, AdvisorUnavailable, AdvisorRefused,
+    RoundRecord, WorkOrder, should_escalate, escalate_pr, submit_escalation,
+    poll_advice, AdviceStatus, EscalationError, AdvisorUnavailable, AdvisorRefused,
 )
 
 SHA1 = "a" * 40
@@ -114,136 +115,189 @@ def _fake_gh_head_moved(*args, **kw):
 # Review evidence tests
 # ---------------------------------------------------------------------------
 
-class TestBuildEvidence:
-    """build_evidence — trusted producer, SHA match, required checks, findings."""
+# ---------------------------------------------------------------------------
+# Review evidence tests
+# ---------------------------------------------------------------------------
 
-    def test_trusted_producer_and_sha_match(self):
-        """A review from our App with matching SHA passes."""
-        pr_data = {
-            "headRefOid": SHA1,
-            "reviews": [
-                {"body": "Looks good. COVERAGE: COMPLETE",
-                 "commit_id": SHA1,
-                 "author": {"type": "Bot"}},
-            ],
-            "statusCheckRollup": [
-                {"context": "ci/test", "conclusion": "SUCCESS"},
-            ],
-            "installation_auto_merge": True,
-        }
-        ev = build_evidence(Config(), pr_data, SHA1)
+TRUSTED_APP = "12345"
+UNTRUSTED_APP = "99999"
+
+
+def _app_cfg():
+    """Config with the trusted Reviews App id set (item 3)."""
+    c = Config()
+    c.trusted_reviewer_app_id = TRUSTED_APP
+    return c
+
+
+def _check_run(sha: str, app_id: str = TRUSTED_APP, summary: str | None = None,
+               conclusion: str = "success") -> dict:
+    """One check run as returned by GET /repos/{repo}/commits/{sha}/check-runs.
+
+    `summary` is the Reviews App's output.summary JSON
+    ({"unresolved_critical_high": n, "coverage": "complete|partial"}).
+    """
+    if summary is None:
+        summary = '{"unresolved_critical_high": 0, "coverage": "complete"}'
+    return {
+        "name": "rhobear-reviews",
+        "head_sha": sha,
+        "app": {"id": app_id, "slug": "rhobear-reviews"},
+        "conclusion": conclusion,
+        "output": {"summary": summary},
+    }
+
+
+def _pr_data(head: str, *, check_runs=None, reviews=None, rollup=None,
+             install_auto_merge=None) -> dict:
+    data = {
+        "headRefOid": head,
+        "reviews": reviews or [],
+        "statusCheckRollup": rollup if rollup is not None else [],
+        "check_runs": check_runs if check_runs is not None else [],
+    }
+    if install_auto_merge is not None:
+        data["installation_auto_merge"] = install_auto_merge
+    return data
+
+
+def _green_rollup():
+    return [{"context": "ci/test", "conclusion": "SUCCESS"}]
+
+
+class TestBuildEvidence:
+    """build_evidence — trusted producer = the Reviews App's check run on the
+    exact head SHA; unresolved/coverage come from that run's output.summary."""
+
+    def test_no_trusted_app_id_fails_closed(self):
+        """NEO_TRUSTED_REVIEWER_APP_ID unset → evidence unavailable → no merge."""
+        pr_data = _pr_data(SHA1, check_runs=[_check_run(SHA1)],
+                           rollup=_green_rollup(), install_auto_merge=True)
+        ev = build_evidence(Config(), pr_data, SHA1)  # no trusted app id
+        assert ev["ok"] is False
+        granted, reason = merge_authority(ev)
+        assert granted is False
+        assert "app id" in reason.lower()
+
+    def test_author_self_review_ignored(self):
+        """A review by the PR author (even with COVERAGE: COMPLETE) is not a
+        trusted producer — no check run from the App → no merge (item 3)."""
+        c = _app_cfg()
+        pr_data = _pr_data(
+            SHA1,
+            reviews=[{"body": "Looks good. COVERAGE: COMPLETE",
+                      "commit_id": SHA1, "author": {"type": "User", "login": "author"}}],
+            check_runs=[],
+            rollup=_green_rollup(),
+            install_auto_merge=True,
+        )
+        ev = build_evidence(c, pr_data, SHA1)
+        assert ev["trusted_producer_ok"] is False
+        granted, reason = merge_authority(ev)
+        assert granted is False
+
+    def test_right_app_wrong_sha_ignored(self):
+        """A check run from the trusted App on a DIFFERENT sha does not
+        authorize this head — no merge (item 3)."""
+        c = _app_cfg()
+        pr_data = _pr_data(SHA1, check_runs=[_check_run(SHA2)],
+                           rollup=_green_rollup(), install_auto_merge=True)
+        ev = build_evidence(c, pr_data, SHA1)
+        assert ev["trusted_producer_ok"] is False
+        assert ev["review_sha_match"] is False
+        granted, reason = merge_authority(ev)
+        assert granted is False
+
+    def test_wrong_app_right_sha_ignored(self):
+        """A check run from another App on this sha is ignored (item 3)."""
+        c = _app_cfg()
+        pr_data = _pr_data(SHA1, check_runs=[_check_run(SHA1, app_id=UNTRUSTED_APP)],
+                           rollup=_green_rollup(), install_auto_merge=True)
+        ev = build_evidence(c, pr_data, SHA1)
+        assert ev["trusted_producer_ok"] is False
+        assert merge_authority(ev)[0] is False
+
+    def test_right_app_right_sha_evidence_ok(self):
+        """Trusted App check run on this exact head with a complete summary
+        → evidence ok (item 3)."""
+        c = _app_cfg()
+        pr_data = _pr_data(SHA1, check_runs=[_check_run(SHA1)],
+                           rollup=_green_rollup(), install_auto_merge=True)
+        ev = build_evidence(c, pr_data, SHA1)
         assert ev["ok"] is True
         assert ev["trusted_producer_ok"] is True
         assert ev["review_sha_match"] is True
-        assert ev["required_checks_pass"] is True
+        assert ev["unresolved_critical_high"] == 0
         assert ev["coverage_complete"] is True
-        assert ev["auto_merge"] is True
-
-    def test_no_reviews_means_no_trusted_producer(self):
-        """No reviews → trusted_producer_ok is False."""
-        pr_data = {
-            "headRefOid": SHA1,
-            "reviews": [],
-            "statusCheckRollup": [],
-            "installation_auto_merge": True,
-        }
-        ev = build_evidence(Config(), pr_data, SHA1)
-        assert ev["trusted_producer_ok"] is False
-        assert ev["review_sha_match"] is False
-
-    def test_review_sha_mismatch(self):
-        """Review on a different SHA → review_sha_match is False."""
-        pr_data = {
-            "headRefOid": SHA1,
-            "reviews": [
-                {"body": "Review on old head",
-                 "commit_id": SHA2,  # different
-                 "author": {"type": "Bot"}},
-            ],
-            "statusCheckRollup": [],
-            "installation_auto_merge": True,
-        }
-        ev = build_evidence(Config(), pr_data, SHA1)
-        assert ev["review_sha_match"] is False
+        granted, reason = merge_authority(ev)
+        assert granted is True
 
     def test_failing_required_checks(self):
         """A failing required check blocks authority."""
-        pr_data = {
-            "headRefOid": SHA1,
-            "reviews": [
-                {"body": "COVERAGE: COMPLETE",
-                 "commit_id": SHA1,
-                 "author": {"type": "Bot"}},
-            ],
-            "statusCheckRollup": [
-                {"context": "ci/test", "conclusion": "FAILURE"},
-            ],
-            "installation_auto_merge": True,
-        }
-        ev = build_evidence(Config(), pr_data, SHA1)
+        c = _app_cfg()
+        pr_data = _pr_data(SHA1, check_runs=[_check_run(SHA1)],
+                           rollup=[{"context": "ci/test", "conclusion": "FAILURE"}],
+                           install_auto_merge=True)
+        ev = build_evidence(c, pr_data, SHA1)
         assert ev["required_checks_pass"] is False
         assert ev["required_checks_failing"] == 1
+        assert merge_authority(ev)[0] is False
 
     def test_unresolved_critical_findings(self):
-        """CRITICAL/HIGH findings block authority."""
-        pr_data = {
-            "headRefOid": SHA1,
-            "reviews": [
-                {"body": "CRITICAL: security vulnerability in auth.py\n"
-                         "HIGH: performance issue in loop\n"
-                         "COVERAGE: COMPLETE",
-                 "commit_id": SHA1,
-                 "author": {"type": "Bot"}},
-            ],
-            "statusCheckRollup": [
-                {"context": "ci/test", "conclusion": "SUCCESS"},
-            ],
-            "installation_auto_merge": True,
-        }
-        ev = build_evidence(Config(), pr_data, SHA1)
+        """CRITICAL/HIGH findings from the trusted check run's output block
+        authority (item 4: taken from output, not hard-coded)."""
+        c = _app_cfg()
+        pr_data = _pr_data(
+            SHA1,
+            check_runs=[_check_run(SHA1, summary='{"unresolved_critical_high": 2, "coverage": "complete"}')],
+            rollup=_green_rollup(),
+            install_auto_merge=True,
+        )
+        ev = build_evidence(c, pr_data, SHA1)
         assert ev["unresolved_critical_high"] == 2
-        assert len(ev["findings"]) == 2
+        assert merge_authority(ev)[0] is False
 
-    def test_incomplete_coverage(self):
-        """Missing COVERAGE: COMPLETE → coverage not complete."""
-        pr_data = {
-            "headRefOid": SHA1,
-            "reviews": [
-                {"body": "Looks fine",
-                 "commit_id": SHA1,
-                 "author": {"type": "Bot"}},
-            ],
-            "statusCheckRollup": [
-                {"context": "ci/test", "conclusion": "SUCCESS"},
-            ],
-            "installation_auto_merge": True,
-        }
-        ev = build_evidence(Config(), pr_data, SHA1)
+    def test_partial_coverage(self):
+        """coverage: partial from the output → coverage not complete (item 4)."""
+        c = _app_cfg()
+        pr_data = _pr_data(
+            SHA1,
+            check_runs=[_check_run(SHA1, summary='{"unresolved_critical_high": 0, "coverage": "partial"}')],
+            rollup=_green_rollup(),
+            install_auto_merge=True,
+        )
+        ev = build_evidence(c, pr_data, SHA1)
         assert ev["coverage_complete"] is False
+        assert merge_authority(ev)[0] is False
+
+    def test_missing_output_summary_denies(self):
+        """No output.summary on the trusted check run → unresolved is None,
+        coverage incomplete → merge denied (item 4)."""
+        c = _app_cfg()
+        cr = _check_run(SHA1)
+        cr["output"] = {"summary": ""}
+        pr_data = _pr_data(SHA1, check_runs=[cr], rollup=_green_rollup(),
+                           install_auto_merge=True)
+        ev = build_evidence(c, pr_data, SHA1)
+        assert ev["unresolved_critical_high"] is None
+        assert ev["coverage_complete"] is False
+        granted, reason = merge_authority(ev)
+        assert granted is False
 
     def test_explicit_false_beats_true_default(self):
         """Explicit installation auto_merge=false beats cfg default true."""
-        c = Config()
+        c = _app_cfg()
         c.auto_merge_default = True
-        pr_data = {
-            "headRefOid": SHA1,
-            "reviews": [],
-            "statusCheckRollup": [],
-            "installation_auto_merge": False,  # explicit false
-        }
+        pr_data = _pr_data(SHA1, check_runs=[_check_run(SHA1)],
+                           install_auto_merge=False)  # explicit false
         ev = build_evidence(c, pr_data, SHA1)
         assert ev["auto_merge"] is False
 
     def test_no_installation_setting_uses_default(self):
         """No installation auto_merge setting → uses cfg default."""
-        c = Config()
+        c = _app_cfg()
         c.auto_merge_default = False
-        pr_data = {
-            "headRefOid": SHA1,
-            "reviews": [],
-            "statusCheckRollup": [],
-            # installation_auto_merge not set
-        }
+        pr_data = _pr_data(SHA1, check_runs=[_check_run(SHA1)])  # no install setting
         ev = build_evidence(c, pr_data, SHA1)
         assert ev["auto_merge"] is False
 
@@ -310,6 +364,17 @@ class TestMergeAuthority:
         granted, reason = merge_authority(ev)
         assert granted is False
         assert "coverage" in reason.lower()
+
+    def test_missing_unresolved_denies(self):
+        """Item 4: unresolved_findings missing (not 0) → merge denied — the
+        value must come from the trusted check run's output."""
+        ev = {"ok": True, "head_sha": SHA1, "decided_sha": SHA1,
+              "trusted_producer_ok": True, "review_sha_match": True,
+              "required_checks_pass": True, "unresolved_critical_high": None,
+              "coverage_complete": True, "auto_merge": True}
+        granted, reason = merge_authority(ev)
+        assert granted is False
+        assert "unresolved" in reason.lower() or "summary" in reason.lower()
 
     def test_auto_merge_disabled(self):
         ev = {"ok": True, "head_sha": SHA1, "decided_sha": SHA1,
@@ -425,10 +490,13 @@ class TestWorkOrder:
         assert "tests/test_auth.py" in brief
 
 
-class TestCallAdvisor:
-    """call_advisor — HTTP call to the advisor service."""
+class TestSubmitAndPoll:
+    """Async advisor contract — submit returns advice_id (202), never waits;
+    poll returns the status (item 1)."""
 
-    def test_successful_call(self):
+    def test_submit_returns_advice_id_from_202(self):
+        """POST returns 202 {"advice_id": ...}; submit returns it without
+        waiting for the work order."""
         cfg = SimpleNamespace(
             advisor_url="http://100.111.118.24:8787",
             advisor_token="test-token",
@@ -441,30 +509,25 @@ class TestCallAdvisor:
             def __exit__(self, *a):
                 pass
             def read(self):
-                return json.dumps({
-                    "summary": "Auth bug",
-                    "root_cause": "Missing validation",
-                    "steps": [{"file": "src/auth.py", "change": "Add validation", "why": ""}],
-                    "tests": [],
-                    "risks": "Low",
-                }).encode()
+                return json.dumps({"advice_id": "advice-abc"}).encode()
 
         def fake_urlopen(req, **kw):
             return FakeResp()
 
+        from src.escalation import _post_advise
         with patch("src.escalation.urllib.request.urlopen", side_effect=fake_urlopen):
-            wo = call_advisor(cfg, "acme/a", 1, SHA1, rounds, "", "read-token")
-        # route is set from the response; default when not in response
-        assert wo.route == ""  # not in the response body
-        assert wo.summary == "Auth bug"
-        assert wo.root_cause == "Missing validation"
+            advice_id = _post_advise(cfg, "acme/a", 1, SHA1, rounds, "", "read-token")
+        assert advice_id == "advice-abc"
 
     def test_unconfigured_raises(self):
+        """Unset advisor_url/token fails closed."""
         cfg = SimpleNamespace(advisor_url="", advisor_token="")
+        from src.escalation import _post_advise
         with pytest.raises(AdvisorUnavailable):
-            call_advisor(cfg, "acme/a", 1, SHA1, [], "", "read-token")
+            _post_advise(cfg, "acme/a", 1, SHA1, [], "", "read-token")
 
     def test_429_queue_full(self):
+        """Advisor queue full (429) → AdvisorRefused."""
         cfg = SimpleNamespace(
             advisor_url="http://100.111.118.24:8787",
             advisor_token="test-token",
@@ -477,9 +540,97 @@ class TestCallAdvisor:
                 429, "Too Many Requests", {}, None,
             )
 
+        from src.escalation import _post_advise
         with patch("src.escalation.urllib.request.urlopen", side_effect=fake_urlopen):
             with pytest.raises(AdvisorRefused):
-                call_advisor(cfg, "acme/a", 1, SHA1, [], "", "read-token")
+                _post_advise(cfg, "acme/a", 1, SHA1, [], "", "read-token")
+
+    def test_poll_parses_done_with_work_order(self):
+        """GET /v1/advise/<id> done → AdviceStatus with the work order."""
+        cfg = SimpleNamespace(
+            advisor_url="http://100.111.118.24:8787",
+            advisor_token="test-token",
+        )
+
+        class FakeResp:
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                pass
+            def read(self):
+                return json.dumps({
+                    "status": "done",
+                    "work_order": {"summary": "Auth bug", "root_cause": "rc",
+                                    "steps": [{"file": "src/a.py", "change": "x", "why": ""}],
+                                    "tests": [], "risks": ""},
+                }).encode()
+
+        def fake_urlopen(req, **kw):
+            return FakeResp()
+
+        with patch("src.escalation.urllib.request.urlopen", side_effect=fake_urlopen):
+            st = poll_advice(cfg, "advice-abc")
+        assert st.status == "done"
+        assert st.work_order["summary"] == "Auth bug"
+
+    def test_poll_parses_failed(self):
+        """GET failed → AdviceStatus with the error."""
+        cfg = SimpleNamespace(
+            advisor_url="http://100.111.118.24:8787",
+            advisor_token="test-token",
+        )
+
+        class FakeResp:
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                pass
+            def read(self):
+                return json.dumps({"status": "failed", "error": "agent timed out"}).encode()
+
+        def fake_urlopen(req, **kw):
+            return FakeResp()
+
+        with patch("src.escalation.urllib.request.urlopen", side_effect=fake_urlopen):
+            st = poll_advice(cfg, "advice-abc")
+        assert st.status == "failed"
+        assert "timed out" in st.error
+
+    def test_submit_escalation_stores_advice_id_and_returns(self):
+        """submit_escalation mints a read token, POSTs, stores phase
+        'escalating' with the advice_id, and returns without waiting."""
+        state = MagicMock()
+        jobs = MagicMock()
+        cfg = SimpleNamespace(advisor_url="http://100.111.118.24:8787",
+                              advisor_token="test-token")
+        rounds = [RoundRecord(round_no=1, sha=SHA1, outcome="bounced")]
+        from src.escalation import submit_escalation, _read_token
+        with patch("src.escalation._read_token", return_value="read-token"), \
+             patch("src.escalation._post_advise", return_value="advice-xyz"):
+            out = submit_escalation(cfg, state, jobs, "acme/a", 1, SHA1,
+                                    rounds, "", installation_id=7)
+        assert out == {"action": "escalating", "advice_id": "advice-xyz"}
+        # The PR's state row records the advice_id with phase 'escalating'.
+        rec = state.record.call_args
+        assert rec[0][3] == "escalating"
+        assert rec.kwargs["detail"]["advice_id"] == "advice-xyz"
+        assert rec.kwargs["detail"]["installation_id"] == 7
+
+    def test_submit_escalation_parks_when_advisor_unreachable(self):
+        """Advisor unreachable → fail closed, PR parked, no wait."""
+        state = MagicMock()
+        jobs = MagicMock()
+        cfg = SimpleNamespace(advisor_url="http://100.111.118.24:8787",
+                              advisor_token="test-token")
+        from src.escalation import submit_escalation, _read_token
+        with patch("src.escalation._read_token", return_value="read-token"), \
+             patch("src.escalation._post_advise",
+                   side_effect=AdvisorUnavailable("down")):
+            out = submit_escalation(cfg, state, jobs, "acme/a", 1, SHA1,
+                                    [], "")
+        assert out["action"] == "parked"
+        parked = [c for c in state.record.call_args_list if c[0][3] == "parked"]
+        assert parked
 
 
 class TestReadTokenPermissions:
@@ -530,169 +681,321 @@ class TestEvidenceBrief:
         assert "NOT_GRANTED" in brief
 
 
+# ---------------------------------------------------------------------------
+# Advisor server — new async API (ThreadingHTTPServer + AdvisorService)
+# ---------------------------------------------------------------------------
+
+def _git(*args, cwd=None, check=True):
+    import subprocess as _sp
+    return _sp.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=check)
+
+
+def _make_bare_repo(tmp_path):
+    """A local repo with a default branch that DIFFERS from the PR head sha.
+
+    Returns (bare_path, sha_default, sha_head).  `git clone --bare` of the
+    source after switching back to the default branch, so the bare repo's
+    HEAD is the default branch, not the head_sha.
+    """
+    work = tmp_path / "src"
+    work.mkdir()
+    _git("init", "-b", "main", str(work))
+    _git("-C", str(work), "config", "user.email", "t@t")
+    _git("-C", str(work), "config", "user.name", "t")
+    (work / "a.txt").write_text("one\n")
+    _git("-C", str(work), "add", ".")
+    _git("-C", str(work), "commit", "-m", "c1")
+    sha_default = _git("-C", str(work), "rev-parse", "HEAD").stdout.strip()
+    # PR head: a second commit on a topic branch.
+    _git("-C", str(work), "checkout", "-b", "topic")
+    (work / "a.txt").write_text("two\n")
+    _git("-C", str(work), "add", ".")
+    _git("-C", str(work), "commit", "-m", "c2")
+    sha_head = _git("-C", str(work), "rev-parse", "HEAD").stdout.strip()
+    _git("-C", str(work), "checkout", "main")
+    bare = tmp_path / "bare.git"
+    _git("clone", "--bare", str(work), str(bare))
+    return str(bare), sha_default, sha_head
+
+
+def _fake_cli(tmp_path, name="claude", delay=0, body=None):
+    """A fake agent CLI on PATH.  `delay` sleeps to keep the slot busy."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    script = bin_dir / name
+    body = body or (
+        '{"summary":"fix auth","root_cause":"input validation",'
+        '"steps":[{"file":"src/a.py","change":"add check","why":"security"}],'
+        '"tests":["tests/test_a.py::test_x"],"risks":"low"}'
+    )
+    lines = ["#!/bin/sh"]
+    if delay:
+        lines.append(f"sleep {delay}")
+    lines += [f"cat <<'EOF'", body, "EOF"]
+    script.write_text("\n".join(lines) + "\n")
+    script.chmod(0o755)
+    os.environ["PATH"] = str(bin_dir) + os.pathsep + os.environ.get("PATH", "")
+    return bin_dir
+
+
+def _fake_cli_checks_head(tmp_path, head_sha, name="claude"):
+    """A fake agent CLI that FAILS unless its cwd HEAD equals head_sha."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    script = bin_dir / name
+    script.write_text(
+        "#!/bin/sh\n"
+        "head=$(git rev-parse HEAD 2>/dev/null)\n"
+        f'if [ "$head" != "{head_sha}" ]; then\n'
+        '  echo "WRONG HEAD $head" >&2\n'
+        "  exit 1\n"
+        "fi\n"
+        "cat <<'EOF'\n"
+        '{"summary":"head ok","root_cause":"rc",'
+        '"steps":[{"file":"f","change":"c","why":"w"}],"tests":[],"risks":""}\n'
+        "EOF\n"
+    )
+    script.chmod(0o755)
+    os.environ["PATH"] = str(bin_dir) + os.pathsep + os.environ.get("PATH", "")
+    return bin_dir
+
+
+def _free_port():
+    import socket as _s
+    s = _s.socket(_s.AF_INET, _s.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
 class TestAdvisorServer:
-    """Advisor HTTP server — auth, queue, bind address."""
+    """Advisor HTTP server — auth, bind address, queue (new async API)."""
 
-    def test_bind_address_is_tailnet(self):
-        """Advisor binds to the configured address.
-
-        Starts the real server on 127.0.0.1 with a free port,
-        sends a POST, and asserts the server responds (it binds
-        to the given address correctly).
-        """
-        from advisor.server import AdvisorRequestHandler, HTTPServer
-        import threading
-        import socket
-
-        # Find a free port.
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]
-        s.close()
-
-        server = HTTPServer(("127.0.0.1", port), AdvisorRequestHandler)
+    @staticmethod
+    def _start(tmp_path, bare="", delay=30):
+        from advisor.server import ThreadingHTTPServer, AdvisorRequestHandler, AdvisorService
+        if bare:
+            _fake_cli(tmp_path, delay=delay)
+        port = _free_port()
+        server = ThreadingHTTPServer(("127.0.0.1", port), AdvisorRequestHandler)
         server.advisor_token = "test-secret"
-        server.advisor_routes = ()
-        server.advisor_queue_max = 3
-        server.advisor_timeout = 10
-        server.timeout = 5
-
-        t = threading.Thread(target=server.handle_request, daemon=True)
+        server.advisor_service = AdvisorService(
+            routes=("claude:opus",), timeout=120, queue_max=3,
+            origin_url=bare or None,
+        )
+        t = threading.Thread(target=server.serve_forever, daemon=True)
         t.start()
+        return server, t, port
 
+    def test_bind_address_is_tailnet(self, tmp_path):
+        """The server binds to the given address (config-driven, tailnet
+        default) — live POST without auth answers 401/400."""
         import urllib.request
         import urllib.error
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{port}/v1/advise",
-            data=b'{}',
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
+        server, t, port = self._start(tmp_path)
         try:
-            urllib.request.urlopen(req, timeout=5)
-        except urllib.error.HTTPError as exc:
-            # We expect 401 (no auth) or 400 (bad json). Both confirm the
-            # server is live on the configured address.
-            assert exc.code in (400, 401), exc.code
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/v1/advise",
+                data=b'{}',
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                urllib.request.urlopen(req, timeout=5)
+                assert False, "expected 401"
+            except urllib.error.HTTPError as exc:
+                # No auth -> 401 (or 400 bad json when auth passes); either
+                # confirms the server is live on the configured address.
+                assert exc.code in (400, 401), exc.code
         finally:
+            server.shutdown()
             server.server_close()
-
-        # Verify the default bind host matches the tailnet address
-        # (config-driven, not a hard-coded source check).
         from src.config import Config
-        c = Config()
-        assert c.advisor_bind_host == "100.111.118.24"
+        assert Config().advisor_bind_host == "100.111.118.24"
 
-    def test_auth_required(self):
-        """Request without bearer token returns 401.
-
-        Starts the real advisor server on 127.0.0.1 with a free port,
-        sends a POST without auth, and asserts 401.
-        """
-        from advisor.server import AdvisorRequestHandler, HTTPServer
-        import threading
-        import socket
-        import json
-
-        # Find a free port.
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]
-        s.close()
-
-        server = HTTPServer(("127.0.0.1", port), AdvisorRequestHandler)
-        server.advisor_token = "test-secret"
-        server.advisor_routes = ()
-        server.advisor_queue_max = 3
-        server.advisor_timeout = 10
-
-        t = threading.Thread(target=server.handle_request, daemon=True)
-        t.start()
-
+    def test_auth_required(self, tmp_path):
+        """POST without bearer token returns 401."""
         import urllib.request
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{port}/v1/advise",
-            data=b'{ "repo": "o/r", "pr": 1, "head_sha": "a" * 40, "read_token": "tok" }',
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
+        import urllib.error
+        server, t, port = self._start(tmp_path)
         try:
-            urllib.request.urlopen(req, timeout=5)
-            assert False, "expected 401"
-        except urllib.error.HTTPError as exc:
-            assert exc.code == 401, exc.code
-            body = exc.read().decode()
-            assert "unauthorized" in body.lower()
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/v1/advise",
+                data=json.dumps({"repo": "o/r", "pr": 1,
+                                 "head_sha": "a" * 40, "read_token": "tok"}).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                urllib.request.urlopen(req, timeout=5)
+                assert False, "expected 401"
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 401, exc.code
+                assert "unauthorized" in exc.read().decode().lower()
         finally:
+            server.shutdown()
             server.server_close()
 
-    def test_queue_limit(self):
-        """Queue max 3, then 429.
+    def test_queue_limit(self, tmp_path):
+        """One agent at a time; at most 3 waiting, then 429."""
+        import urllib.request
+        import urllib.error
+        bare, _, head_sha = _make_bare_repo(tmp_path)
+        server, t, port = self._start(tmp_path, bare=bare, delay=30)
+        try:
+            body = json.dumps({"repo": "o/r", "pr": 1, "head_sha": head_sha,
+                               "read_token": "tok"}).encode()
 
-        Tests the queue logic by starting the real advisor server on
-        127.0.0.1 with a free port, sending requests that get queued,
-        and verifying the 4th concurrent request gets 429.
-        """
-        from advisor.server import AdvisorRequestHandler, HTTPServer
-        import threading
-        import socket
+            def send():
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/v1/advise", data=body,
+                    headers={"Content-Type": "application/json",
+                             "Authorization": "Bearer test-secret"},
+                    method="POST",
+                )
+                return urllib.request.urlopen(req, timeout=5)
 
-        # Find a free port.
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]
-        s.close()
+            # First request starts the agent (holds the single active slot);
+            # the next 3 wait in the queue — all 202 immediately.
+            for _ in range(4):
+                resp = send()
+                assert resp.getcode() == 202, resp.getcode()
+                resp.close()
+            # 5th: queue full -> 429.
+            try:
+                send()
+                assert False, "expected 429"
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 429, exc.code
+                assert "queue full" in exc.read().decode().lower()
+        finally:
+            server.shutdown()
+            server.server_close()
 
-        server = HTTPServer(("127.0.0.1", port), AdvisorRequestHandler)
+    def test_unknown_advice_id_404(self, tmp_path):
+        """GET for an unknown advice_id returns 404 (auth checked first)."""
+        import urllib.request
+        import urllib.error
+        server, t, port = self._start(tmp_path)
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/v1/advise/nonexistent",
+                headers={"Authorization": "Bearer test-secret"},
+                method="GET",
+            )
+            try:
+                urllib.request.urlopen(req, timeout=5)
+                assert False, "expected 404"
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 404, exc.code
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_results_kept_24h(self, tmp_path):
+        """Advice records are pruned after 24 h."""
+        from advisor.server import AdvisorService
+        svc = AdvisorService(routes=("claude:opus",), timeout=60, queue_max=3)
+        aid = svc.submit({"repo": "o/r", "pr": 1, "head_sha": "a" * 40,
+                          "read_token": "tok"})
+        assert svc.status(aid)["status"] in ("queued", "running")
+        # Simulate the record ageing past 24 h.
+        with svc._lock:
+            svc._records[aid]["created_at"] -= 25 * 60 * 60
+        assert svc.status(aid) is None
+
+
+class TestAsyncAdvisor:
+    """Item 1 — the advisor is asynchronous: POST /v1/advise returns 202
+    immediately, the agent runs in a background thread, GET polls
+    running -> done, and the escalated builder round is created once."""
+
+    def test_submit_fast_poll_done_builder_once(self, tmp_path):
+        import time as _time
+        from advisor.server import ThreadingHTTPServer, AdvisorRequestHandler, \
+            AdvisorService
+        from src.escalation import submit_escalation, poll_advice, escalate_pr
+
+        bare, _, head_sha = _make_bare_repo(tmp_path)
+        _fake_cli(tmp_path, delay=2)
+        port = _free_port()
+        server = ThreadingHTTPServer(("127.0.0.1", port), AdvisorRequestHandler)
         server.advisor_token = "test-secret"
-        server.advisor_routes = ()
-        server.advisor_queue_max = 3
-        server.advisor_timeout = 10
-
-        # Start server in a background thread.
+        server.advisor_service = AdvisorService(
+            routes=("claude:opus",), timeout=60, queue_max=3, origin_url=bare)
         t = threading.Thread(target=server.serve_forever, daemon=True)
         t.start()
 
-        import urllib.request
-        import urllib.error
-
-        # Set active=true via the queue_lock so all requests queue.
-        with AdvisorRequestHandler.queue_lock:
-            AdvisorRequestHandler.active = True
-
-        def send():
-            req = urllib.request.Request(
-                f"http://127.0.0.1:{port}/v1/advise",
-                data=b'{ "repo": "o/r", "pr": 1, "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "read_token": "tok" }',
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": "Bearer test-secret",
-                },
-                method="POST",
-            )
-            return urllib.request.urlopen(req, timeout=5)
-
-        # First 3 requests: queued (202).
-        for _ in range(3):
-            resp = send()
-            assert resp.getcode() == 202, resp.getcode()
-            resp.close()
-
-        # 4th: queue full (429).
+        cfg = SimpleNamespace(advisor_url=f"http://127.0.0.1:{port}",
+                              advisor_token="test-secret")
+        state = MagicMock()
+        jobs = MagicMock()
+        rounds = [RoundRecord(round_no=1, sha=head_sha, outcome="bounced")]
         try:
-            resp4 = send()
-            assert False, f"expected 429, got {resp4.getcode()}"
-        except urllib.error.HTTPError as exc:
-            assert exc.code == 429, exc.code
-            body = exc.read().decode()
-            assert "queue full" in body.lower()
+            with patch("src.escalation._read_token", return_value="read-token"):
+                t0 = _time.monotonic()
+                out = submit_escalation(cfg, state, jobs, "o/r", 1, head_sha,
+                                        rounds, "")
+                elapsed = _time.monotonic() - t0
+            # The agent sleeps 2 s — submit must NOT wait on it.
+            assert elapsed < 1.0, f"submit took {elapsed:.2f}s"
+            assert out["action"] == "escalating"
+            advice_id = out["advice_id"]
+            assert advice_id
+            rec = state.record.call_args
+            assert rec[0][3] == "escalating"
+            assert rec.kwargs["detail"]["advice_id"] == advice_id
 
-        # Cleanup.
-        with AdvisorRequestHandler.queue_lock:
-            AdvisorRequestHandler.active = False
-            AdvisorRequestHandler.queue.clear()
-        server.shutdown()
-        server.server_close()
+            # Poll: sees running, then done.
+            seen = set()
+            final = None
+            for _ in range(80):
+                st = poll_advice(cfg, advice_id)
+                seen.add(st.status)
+                if st.status == "done":
+                    final = st
+                    break
+                _time.sleep(0.2)
+            assert final is not None, f"never done; saw {sorted(seen)}"
+            assert "running" in seen or "queued" in seen
+            assert final.work_order and final.work_order["summary"] == "fix auth"
+
+            # The ONE escalated builder round appears exactly once.
+            wo = WorkOrder.from_dict(final.work_order)
+            res = escalate_pr(cfg, state, jobs, "o/r", 1, head_sha, wo,
+                              installation_id=7)
+            assert res["action"] == "escalated"
+            assert jobs.create_builder.call_count == 1
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+class TestAdvisorClone:
+    """Item 2 — the advisor clone checks out the PR head (detached), so the
+    agent's cwd HEAD equals head_sha even when the remote's default branch
+    differs; a clone failure surfaces git stderr without the token."""
+
+    def test_agent_cwd_head_equals_head_sha(self, tmp_path):
+        from advisor.server import run_advisor
+        bare, sha_default, sha_head = _make_bare_repo(tmp_path)
+        assert sha_default != sha_head  # default branch differs from the head
+        _fake_cli_checks_head(tmp_path, sha_head)
+        wo = run_advisor("o/r", 1, sha_head, [], "", "read-token",
+                         routes=("claude:opus",), timeout=60, origin_url=bare)
+        assert wo["summary"] == "head ok"
+
+    def test_failed_clone_surfaces_stderr_without_token(self, tmp_path):
+        from advisor.server import run_advisor, AgentFailed
+        bare, _, _ = _make_bare_repo(tmp_path)
+        _fake_cli(tmp_path)
+        with pytest.raises(AgentFailed) as ei:
+            run_advisor("o/r", 1, "d" * 40, [], "", "supersecret-token",
+                        routes=("claude:opus",), timeout=60, origin_url=bare)
+        err = str(ei.value)
+        assert "git" in err.lower()
+        assert "supersecret-token" not in err  # never the token in the error
 
 
 class TestRouteFallback:
@@ -817,3 +1120,70 @@ class TestCountBuilderRounds:
         from src.escalation import count_builder_rounds
         assert count_builder_rounds(state, "acme/a", 1) == 3
         state.builder_rounds.assert_called_once_with("acme/a", 1)
+
+
+class TestRecoverEscalations:
+    """Item 1 — the recovery loop's poll-and-advance: timeout parks, advisor
+    failure parks, done creates the ONE escalated round."""
+
+    def test_timeout_parks(self):
+        """Give up after the timeout and park with a one-line reason."""
+        state = MagicMock()
+        state.escalating_prs.return_value = [{
+            "repo": "o/r", "pr": 1, "head_sha": SHA1,
+            "advice_id": "advice-1", "installation_id": None,
+            "created_at": datetime.now(timezone.utc) - timedelta(minutes=31),
+        }]
+        jobs = MagicMock()
+        cfg = SimpleNamespace(advisor_url="http://x", advisor_token="t")
+        from src.escalation import recover_escalations
+        handled = recover_escalations(cfg, state, jobs, timeout_secs=1800)
+        assert len(handled) == 1 and handled[0]["action"] == "parked", handled
+        assert "did not finish" in handled[0]["reason"]
+        state.clear_escalating.assert_called_once_with("o/r", 1)
+
+    def test_advisor_failed_parks(self):
+        """Advisor reports failed → park with the advisor's error."""
+        state = MagicMock()
+        state.escalating_prs.return_value = [{
+            "repo": "o/r", "pr": 1, "head_sha": SHA1,
+            "advice_id": "advice-1", "installation_id": None,
+            "created_at": datetime.now(timezone.utc),
+        }]
+        jobs = MagicMock()
+        cfg = SimpleNamespace(advisor_url="http://x", advisor_token="t")
+        from src.escalation import recover_escalations, AdviceStatus
+        with patch("src.escalation.poll_advice",
+                   return_value=AdviceStatus(status="failed", error="agent timed out")):
+            handled = recover_escalations(cfg, state, jobs, timeout_secs=1800)
+        assert len(handled) == 1 and handled[0]["action"] == "parked", handled
+        assert "timed out" in handled[0]["reason"]
+        state.clear_escalating.assert_called_once_with("o/r", 1)
+
+    def test_done_creates_one_escalated_round(self):
+        """Advisor done → escalate_pr creates the ONE escalated round."""
+        state = MagicMock()
+        state.escalating_prs.return_value = [{
+            "repo": "o/r", "pr": 1, "head_sha": SHA1,
+            "advice_id": "advice-1", "installation_id": 7,
+            "created_at": datetime.now(timezone.utc),
+        }]
+        state.builder_rounds.return_value = 5
+        jobs = MagicMock()
+        cfg = SimpleNamespace(advisor_url="http://x", advisor_token="t")
+        work_order = {"route": "claude:opus", "summary": "Fix auth",
+                      "root_cause": "rc",
+                      "steps": [{"file": "src/a.py", "change": "c", "why": "w"}],
+                      "tests": [], "risks": ""}
+        from src.escalation import recover_escalations, AdviceStatus
+        with patch("src.escalation.poll_advice",
+                   return_value=AdviceStatus(status="done", work_order=work_order)):
+            handled = recover_escalations(cfg, state, jobs, timeout_secs=1800)
+        assert len(handled) == 1 and handled[0]["action"] == "escalated", handled
+        # ONE escalated builder round.
+        jobs.create_builder.assert_called_once()
+        payload = jobs.create_builder.call_args.kwargs["payload"]
+        assert payload["escalated"] is True
+        assert payload["work_order"]["summary"] == "Fix auth"
+        assert payload["installation_id"] == 7
+        state.clear_escalating.assert_called_once_with("o/r", 1)
