@@ -274,7 +274,20 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict) -> None:
             log.info("deduped wake %s@%s — an active job already owns it", repo, sha[:8])
             return
 
-    pr = resolve_pr(cfg, repo, sha, wake.get("pr_number"))
+    try:
+        pr = resolve_pr(cfg, repo, sha, wake.get("pr_number"))
+    except Exception as exc:
+        # gh hung (TimeoutExpired) or is missing: before the claim, nothing else would
+        # release this job — its submitted_at stamp hides it from the sweep. Release it
+        # retryably, exactly like the no-PR branch below.
+        log.warning("resolve_pr crashed (%s) for %s@%s — job released retryably",
+                    type(exc).__name__, repo, sha[:8])
+        wtoken = secrets.token_hex(16)
+        if jobs.claim(job_id, pr_number=None, lease_secs=_wake_lease(cfg),
+                      worker_token=wtoken):
+            jobs.retry(job_id, worker_token=wtoken,
+                       reason=f"pre-claim crash ({type(exc).__name__})")
+        return
     if not pr:
         # Transient gh failure, or a commit status that fired before any PR
         # exists.  Release the job retryably (claim-then-retry: claim() marks
@@ -321,6 +334,18 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict) -> None:
         log.info("%s#%s@%s already acted (triage green=%s or merged) — "
                  "duplicate delivery skipped", repo, pr, sha[:8], green)
         return
+    # A previous run of this verdict did its work (phase row, builder job) and then died
+    # before writing the triage marker. Re-running the agent would mint a second builder
+    # round; finish the bookkeeping instead.
+    for done_phase in ("builder", "ready", "fix_forward", "escalated"):
+        if state.already_acted(repo, pr, sha, done_phase, green=green):
+            state.record(repo, pr, sha, "triage",
+                         detail={"green": wake.get("green"), "recovered": done_phase})
+            jobs.resolve(job_id, "done", worker_token=wtoken,
+                         payload={"reason": f"{done_phase} already recorded; triage marker restored"})
+            log.info("%s#%s@%s %s already recorded — triage marker restored, no re-run",
+                     repo, pr, sha[:8], done_phase)
+            return
 
     rounds = state.builder_rounds(repo, pr)
 
@@ -404,20 +429,6 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict) -> None:
         jobs.retry(job_id, worker_token=wtoken, reason="agent produced no verdict")
         return
 
-    # The triage completed: record the audit row (loop/thrash guard input) and
-    # the phase row together.  Recorded only on success so a crashed run leaves
-    # no marker and is re-run by the retry (see the gate comment above).
-    state.record(repo, pr, sha, "triage", detail={"context": wake.get("context"),
-                                                   "green": wake.get("green"),
-                                                   "jev": jev.brief(),
-                                                   "jev_attention": jev.requires_full_review,
-                                                   "head_sha": evidence.get("head_sha"),
-                                                   "review_sha": evidence.get("review_sha"),
-                                                   "rollup_green": evidence.get("rollup_green"),
-                                                   "jev_blockers": [f.rule for f in jev.blockers],
-                                                   "auto_merge": auto_merge,
-                                                   "reason": authority_reason})
-
     is_builder = verdict.startswith("BOUNCE-BUILDER")
     credits = credits_for(usage, builder=is_builder)
     phase = {
@@ -434,8 +445,24 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict) -> None:
             "head_sha": sha, "phase": phase, "round": new_round,
             "context": wake.get("context"),
         })
+    # The phase row carries the verdict colour so a retry after a crash can tell this
+    # verdict's work is already done (see the gate above).
     state.record(repo, pr, sha, phase, verdict=verdict,
-                 builder_round=new_round, credits=credits)
+                 builder_round=new_round, credits=credits,
+                 detail={"green": wake.get("green"), "wake_job": job_id})
+    # The triage marker goes LAST: it vouches that the phase row and any builder job above
+    # exist. A crash before this line leaves the phase row, which the gate above detects.
+    state.record(repo, pr, sha, "triage", detail={"context": wake.get("context"),
+                                                   "green": wake.get("green"),
+                                                   "jev": jev.brief(),
+                                                   "jev_attention": jev.requires_full_review,
+                                                   "head_sha": evidence.get("head_sha"),
+                                                   "review_sha": evidence.get("review_sha"),
+                                                   "rollup_green": evidence.get("rollup_green"),
+                                                   "jev_blockers": [f.rule for f in jev.blockers],
+                                                   "auto_merge": auto_merge,
+                                                   "reason": authority_reason})
+
     # Resolve the wake job with a terminal outcome.  The triage completed; a
     # builder round is a SEPARATE job the builder lane claims (the wake job is
     # not left running or 'failed' — 'done' + the phase in the payload).

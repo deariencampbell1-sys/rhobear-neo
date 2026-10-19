@@ -802,3 +802,61 @@ class TestWorkerToken:
         token = db.get(job_id)["worker_token"]
         assert db.resolve(job_id, "no_change", worker_token=token) is True
         assert db.get(job_id)["worker_token"] is None
+
+
+# ---------------------------------------------------------------------------
+# Integrator, round-3 review: the two crash windows around the claim
+# ---------------------------------------------------------------------------
+class TestCrashWindows:
+    def _patches(self, verdict="BOUNCE-BUILDER fix it", resolve=5):
+        return [patch("src.neo_worker.resolve_pr", side_effect=resolve) if callable(resolve) or isinstance(resolve, BaseException)
+                else patch("src.neo_worker.resolve_pr", return_value=resolve),
+                patch("src.neo_worker._review_evidence", return_value=_evidence(SHA1)),
+                patch("src.neo_worker._jev_for_pr", return_value=JevAssessment(False, reason="no key")),
+                patch("src.neo_worker._run_agent", return_value=({"input_tokens": 10, "output_tokens": 1}, verdict))]
+
+    def test_resolve_pr_crash_releases_the_job_for_retry(self, db):
+        import subprocess
+        from src.neo_worker import run_neo
+        jobs, state, cfg = db, NeoState(DSN), _cfg()
+        wake = {"repo": "o/r", "sha": SHA1, "green": True, "context": "rhobear-reviews"}
+        boom = subprocess.TimeoutExpired(["gh"], 30)
+        with patch("src.neo_worker.resolve_pr", side_effect=boom):
+            run_neo(cfg, state, jobs, wake)
+        with psycopg.connect(DSN, autocommit=True) as c:
+            st, outcome, submitted = c.execute(
+                "SELECT state, outcome, submitted_at FROM neo_jobs WHERE kind='wake'").fetchone()
+        assert (st, outcome) == ("queued", "failed")
+        assert submitted is None, "retry() clears the stamp so the sweep re-submits it"
+
+    def test_crash_after_bounce_recorded_does_not_mint_a_second_round(self, db):
+        from src.neo_worker import run_neo
+        jobs, state, cfg = db, NeoState(DSN), _cfg()
+        wake = {"repo": "o/r", "sha": SHA1, "green": True, "context": "rhobear-reviews", "pr_number": 5}
+        real_record = NeoState.record
+
+        def die_on_triage(self, repo, pr, sha, phase, **kw):
+            if phase == "triage":
+                raise RuntimeError("process killed before the triage marker")
+            return real_record(self, repo, pr, sha, phase, **kw)
+
+        ps = self._patches()
+        for p in ps: p.start()
+        try:
+            with patch.object(NeoState, "record", die_on_triage):
+                with pytest.raises(RuntimeError):
+                    run_neo(cfg, state, jobs, wake)
+            # Lease expiry re-queues the wake; the retry must not re-run the agent or mint round 2.
+            with psycopg.connect(DSN, autocommit=True) as c:
+                c.execute("UPDATE neo_jobs SET state='queued', lease_expires=NULL, worker_token=NULL WHERE kind='wake'")
+                wake_id = c.execute("SELECT id FROM neo_jobs WHERE kind='wake'").fetchone()[0]
+            agent = MagicMock(return_value=({"input_tokens": 10, "output_tokens": 1}, "BOUNCE-BUILDER again"))
+            with patch("src.neo_worker._run_agent", agent):
+                run_neo(cfg, state, jobs, dict(wake, job_id=wake_id))  # as the recovery sweep re-submits it
+        finally:
+            for p in ps: p.stop()
+        assert agent.call_count == 0, "the earlier run's work was recorded; no second agent run"
+        with psycopg.connect(DSN, autocommit=True) as c:
+            rounds = c.execute("SELECT builder_round FROM neo_jobs WHERE kind='builder' ORDER BY id").fetchall()
+        assert rounds == [(1,)], rounds
+        assert state.already_acted("o/r", 5, SHA1, "triage", green=True)
