@@ -41,7 +41,7 @@ import sys
 import time
 from pathlib import Path
 
-from .agent_hermes import AgentError, HermesAgent
+from .agent_hermes import AgentError, HermesAgent, MissingResult, NonZeroExit
 from .config import Config
 from .jobs import Jobs
 
@@ -77,12 +77,29 @@ JQ_INLINE_COMMENTS = (
 )
 
 
+# The builder lane's OWN output contract.  The Neo protocol set
+# (ACCEPT-MERGED / ACCEPT-READY / FIX-FORWARD / BOUNCE-BUILDER / ESCALATE) is
+# for the triage lane; the fixer brief demands exactly FIXED / NO-CHANGE /
+# BLOCKED (audit §9 mismatch — fixed here in B1, not deferred to B3).
+BUILDER_CANONICAL_VERDICTS = frozenset({"FIXED", "NO-CHANGE", "BLOCKED"})
+
+
 class BuilderAgent(HermesAgent):
     """Hermes agent pinned to a real worktree cwd (no per-run temp dir).
 
-    Verdict parsing is advisory for the builder lane: the pushed=True/False
-    head-diff after the run is the real signal. A missing/malformed VERDICT
-    line is logged with the stdout tail, never raised."""
+    The fixer brief's output contract is its OWN verdict set {FIXED,
+    NO-CHANGE, BLOCKED}.  _parse_output is overridden so:
+
+      * a completed run (exit 0, output produced) whose VERDICT: line is
+        FIXED / NO-CHANGE / BLOCKED parses normally;
+      * a completed run with a MISSING or unparseable verdict is NOT an agent
+        failure — it resolves to no_change with the raw stdout tail recorded,
+        never a retry (a completed run must not be burned three times);
+      * a FAILED run (nonzero exit, timeout, empty output) raises AgentError
+        and is retried by dispatch_one — that IS an agent failure.
+    """
+
+    CANONICAL_VERDICTS = BUILDER_CANONICAL_VERDICTS
 
     def __init__(self, *, work_dir: str, **kw):
         super().__init__(**kw)
@@ -107,12 +124,38 @@ class BuilderAgent(HermesAgent):
             # characters anywhere). Unattended overnight runs need the reason.
             log.error("builder hermes stderr tail %s: %s",
                       self.work_dir.rsplit("/", 1)[-1], proc.stderr.strip()[-1200:])
-        try:
-            return self._parse_output(proc)
-        except Exception as e:
-            tail = (proc.stdout or "")[-2000:]
-            log.warning("builder verdict parse failed (non-fatal): %s\nstdout tail: %s", e, tail)
-            return {"input_tokens": 0, "output_tokens": 0}, ""
+        # Agent failures (nonzero exit / empty output / timeout) raise here and
+        # are retried by dispatch_one; an unparseable-but-completed run returns
+        # (usage with raw_tail, "") and resolves no_change.
+        return self._parse_output(proc)
+
+    def _parse_output(self, proc: subprocess.CompletedProcess[str]) -> tuple[dict, str]:
+        """Builder verdict parsing on real Hermes -z text output.
+
+        Mirrors HermesAgent._parse_output except for the unparseable case: a
+        clean exit with a missing/non-canonical verdict is a COMPLETED run and
+        returns ("") with the raw tail instead of raising UnknownVerdict."""
+        stdout = (proc.stdout or "").strip()
+        stderr = (proc.stderr or "").strip()
+        if not stdout:
+            if stderr:
+                log.warning("builder hermes produced no stdout (exit=%d, stderr_len=%d)",
+                            proc.returncode, len(stderr))
+            raise MissingResult("no stdout from builder hermes")
+        if proc.returncode != 0:
+            log.warning("builder hermes exit=%d but produced output: %.200s",
+                        proc.returncode, stdout[:200])
+            raise NonZeroExit(f"builder hermes exited {proc.returncode}")
+        verdict = self._extract_verdict(stdout)
+        if verdict is not None and verdict in self.CANONICAL_VERDICTS:
+            return {"input_tokens": 0, "output_tokens": 0}, verdict
+        # Completed cleanly but no parseable builder verdict — the fixer ran
+        # and finished; that is NOT a retryable failure.  Resolve no_change
+        # with the raw tail recorded so the owner can see what it said.
+        tail = stdout[-2000:]
+        log.warning("builder verdict unparseable after completed run — "
+                    "resolves no_change (stdout tail: %.300s)", tail[-300:])
+        return {"input_tokens": 0, "output_tokens": 0, "raw_tail": tail}, ""
 
 
 def _db():
@@ -273,6 +316,9 @@ def dispatch_one(cfg: Config, jobs: Jobs, row: dict) -> None:
     """
     repo, pr, sha = row["repo"], row["pr_number"], row["head_sha"]
     round_ = int(row.get("builder_round") or row.get("attempt") or 0)
+    # Claimant identity from claim_queued — every resolve/retry/note/lease below
+    # presents it so a stale claimant can never mutate a replacement run.
+    wtoken = row.get("worker_token")
 
     # --- round cap (defect 1 fix) ---
     if round_ > cfg.max_builder_rounds:
@@ -285,7 +331,8 @@ def dispatch_one(cfg: Config, jobs: Jobs, row: dict) -> None:
     state = pr_state(cfg, repo, pr).split("\t")[0]
     if state.upper() == "CLOSED" or state.upper() == "MERGED":
         log.info("skip (closed/merged): %s#%s", repo, pr)
-        jobs.resolve(row["id"], "no_change", payload={"reason": f"PR state: {state}"})
+        jobs.resolve(row["id"], "no_change", worker_token=wtoken,
+                     payload={"reason": f"PR state: {state}"})
         return
     elif not state:
         # Transient gh failure — leave the job running for lease recovery.
@@ -309,7 +356,7 @@ def dispatch_one(cfg: Config, jobs: Jobs, row: dict) -> None:
     # crash at this point is recovered by lease expiry, not consumed forever).
     jobs.note(row["id"], {"dispatched_at": time.strftime("%FT%TZ", time.gmtime()),
                            "round": round_, "worktree": worktree,
-                           "branch": head_branch})
+                           "branch": head_branch}, worker_token=wtoken)
     log.info("dispatched: %s#%s round=%s worktree=%s branch=%s",
              repo, pr, round_, worktree, head_branch)
 
@@ -324,16 +371,18 @@ def dispatch_one(cfg: Config, jobs: Jobs, row: dict) -> None:
         # Lease renewal: the agent run can outlive a static lease — without it
         # a second builder would claim the same round and two agents would work
         # one worktree (GLM 6).  BUILDER_LEASE_SECS covers the whole run.
-        with jobs.lease_renewal(row["id"], lease_secs=BUILDER_LEASE_SECS):
+        with jobs.lease_renewal(row["id"], lease_secs=BUILDER_LEASE_SECS,
+                                worker_token=wtoken):
             usage, verdict = agent.run(brief)
         log.info("fixer done %s#%s verdict=%s usage=%s", repo, pr, verdict or "?", usage)
     except AgentError:
         log.exception("fixer agent failed %s#%s", repo, pr)
-        jobs.retry(row["id"], reason="builder agent failed")
+        jobs.retry(row["id"], worker_token=wtoken, reason="builder agent failed")
         return
     except Exception as exc:
         log.exception("fixer agent crashed (%s) %s#%s", type(exc).__name__, repo, pr)
-        jobs.retry(row["id"], reason=f"builder agent crashed ({type(exc).__name__})")
+        jobs.retry(row["id"], worker_token=wtoken,
+                   reason=f"builder agent crashed ({type(exc).__name__})")
         return
 
     head_after = gh(cfg, "api", f"repos/{repo}/pulls/{pr}", "--jq", ".head.sha")[1].strip()
@@ -348,24 +397,33 @@ def dispatch_one(cfg: Config, jobs: Jobs, row: dict) -> None:
     log.info("fixer round outcome %s#%s pushed=%s head=%s->%s (loop auto-armed: reviewer+neo re-fire on push)",
              repo, pr, pushed, head_before[:8], head_after[:8])
     if pushed:
-        jobs.resolve(row["id"], "done", payload={"outcome": "pushed",
-                                                   "verdict": verdict or "",
-                                                   "head_before": head_before,
-                                                   "head_after": head_after})
+        jobs.resolve(row["id"], "done", worker_token=wtoken,
+                     payload={"outcome": "pushed",
+                              "verdict": verdict or "",
+                              "head_before": head_before,
+                              "head_after": head_after})
     elif verdict == "NO-CHANGE":
-        jobs.resolve(row["id"], "no_change", payload={"outcome": "no-change",
-                                                       "verdict": verdict})
+        jobs.resolve(row["id"], "no_change", worker_token=wtoken,
+                     payload={"outcome": "no-change",
+                              "verdict": verdict})
     elif verdict == "FIXED":
         # Claimed a fix but the head didn't move — record it; the loop re-arms
         # via the new head when it lands.
-        jobs.resolve(row["id"], "done", payload={"outcome": "fixed-no-push",
-                                                   "verdict": verdict})
+        jobs.resolve(row["id"], "done", worker_token=wtoken,
+                     payload={"outcome": "fixed-no-push",
+                              "verdict": verdict})
     else:
-        # BLOCKED / missing verdict / unverifiable head — retryable; bounded by
-        # the attempt cap, then parked (owner-actionable).
-        log.warning("%s#%s round=%s no push and no actionable verdict (%r) — retrying",
-                    repo, pr, round_, verdict)
-        jobs.retry(row["id"], reason=f"no push, verdict={verdict or 'missing'}")
+        # BLOCKED, or a completed run with no parseable verdict.  The agent
+        # COMPLETED (exit 0) — a completed run that did not push is NOT a
+        # retryable failure (round 3 blocker 3: completed-but-no-push runs were
+        # retried 3x then mis-parked).  Resolve no_change and record the raw
+        # verdict tail; the loop re-arms via a push when the head moves.
+        log.info("%s#%s round=%s completed with no push and no actionable "
+                 "verdict (%r) — resolved no_change", repo, pr, round_, verdict or "")
+        jobs.resolve(row["id"], "no_change", worker_token=wtoken,
+                     payload={"outcome": "no-push",
+                              "verdict": verdict or "",
+                              "raw_tail": (usage or {}).get("raw_tail", "")})
 
 
 def main() -> int:
@@ -386,6 +444,13 @@ def main() -> int:
              CONCURRENCY, POLL_SECS, BUILDER_LEASE_SECS,
              ",".join(cfg.repo_allowlist) or "(none)")
     inflight: dict[concurrent.futures.Future, dict] = {}
+    # repo+PR keys of running dispatches.  prepare_worktree() keys its dest on
+    # repo+pr, so two concurrent rounds of the SAME PR must never both run —
+    # the second would rm -rf the live worktree under the first agent
+    # (integrator finding 1: the old code's inflight_keys exclusion was
+    # dropped; supersede_older only touches queued rounds so a running round is
+    # untouched by design).
+    inflight_keys: set[tuple[str, int]] = set()
     while True:
         # --- dry-run: read-only peek (defect 6 fix + GLM 9: never mutate) ---
         if dry:
@@ -415,13 +480,30 @@ def main() -> int:
 
         # --- keep the pool full ---------------------------------------------
         while len(inflight) < CONCURRENCY:
+            # exclude_keys = PRs already running in this process: two rounds of
+            # one repo+PR share a worktree (prepare_worktree keys its dest on
+            # repo+pr), so the second would rm -rf the live worktree.  The SQL
+            # exclusion prevents the same PR from even being claimed (and
+            # avoids claiming-releasing the same row every pass).
             row = jobs.claim_queued("builder", lease_secs=BUILDER_LEASE_SECS,
                                     repo_filter=repo_filter,
-                                    allowlist=cfg.repo_allowlist)
+                                    allowlist=cfg.repo_allowlist,
+                                    exclude_keys=inflight_keys)
             if not row:
                 break
             repo, pr, sha = row["repo"], row["pr_number"], row["head_sha"]
             round_ = int(row["builder_round"] or 0)
+
+            # Defense in depth: a claim that slipped through (e.g. a row that
+            # was already running in another process and this process re-armed
+            # it) whose PR is inflight here is released WITHOUT burning an
+            # attempt — never dispatched into the shared worktree.
+            key = (repo, pr)
+            if key in inflight_keys:
+                jobs.release(row["id"], worker_token=row.get("worker_token"))
+                log.info("skip %s#%s round=%s — same PR already inflight (shared worktree); "
+                         "claim released without burning an attempt", repo, pr, round_)
+                continue
 
             # Newest round wins: supersede OLDER queued builder jobs for the
             # same PR (GLM 7 — the old queued() claimed newest-first; older
@@ -444,6 +526,7 @@ def main() -> int:
             state = pr_state(cfg, repo, pr).split("\t")[0]
             if state.upper() in ("CLOSED", "MERGED"):
                 jobs.resolve(row["id"], "no_change",
+                             worker_token=row.get("worker_token"),
                              payload={"reason": f"PR state: {state}"})
                 log.info("skip closed/merged %s#%s state=%s", repo, pr, state)
                 continue
@@ -454,6 +537,7 @@ def main() -> int:
                             repo, pr)
                 continue
 
+            inflight_keys.add(key)
             inflight[pool.submit(dispatch_one, cfg, jobs, row)] = row
 
         if not inflight:
@@ -466,6 +550,7 @@ def main() -> int:
             list(inflight), return_when=concurrent.futures.FIRST_COMPLETED)
         for fut in done:
             row = inflight.pop(fut)
+            inflight_keys.discard((row["repo"], row["pr_number"]))
             try:
                 fut.result()
             except Exception:

@@ -58,6 +58,15 @@ def main() -> None:
     )
 
     def _submit(wake: dict) -> None:
+        # Stamp the hand-off so the recovery loop's stale_queued sweep
+        # (submitted_at IS NULL) never re-submits a wake that is already
+        # waiting in the executor (recovery-amplification defect).
+        job_id = wake.get("job_id")
+        if job_id is not None:
+            try:
+                jobs.mark_submitted(job_id)
+            except Exception:  # noqa: BLE001
+                log.exception("mark_submitted failed for job %s", job_id)
         try:
             executor.submit(_run_wake, wake)
         except RuntimeError:
@@ -96,7 +105,17 @@ def main() -> None:
     def _recovery_loop() -> None:
         """Re-queue expired wake leases and orphaned queued wakes, re-submitting
         them to the executor.  This is lease recovery for the durable job store
-        (a wake the old code handled is never dropped), not an external poller."""
+        (a wake the old code handled is never dropped), not an external poller.
+
+        Startup: after a restart every executor task died, so any queued wake
+        is an orphan — clear the submitted stamps once so the first
+        stale_queued sweep re-submits them all.  Every submission is stamped
+        again (mark_submitted), so in steady state a wake waiting in the
+        executor is never re-submitted each pass."""
+        try:
+            jobs.reset_queued_submissions("wake")
+        except Exception:  # noqa: BLE001
+            log.exception("startup wake submission reset failed")
         while True:
             time.sleep(RECOVERY_SECS)
             try:
@@ -115,7 +134,9 @@ def main() -> None:
                         if wake.get("repo") and wake.get("sha"):
                             _submit(wake)
                 # After a restart, executor tasks for queued wakes are lost;
-                # re-submit any wake left queued long enough to be an orphan.
+                # re-submit any wake that was NEVER submitted (submitted_at IS
+                # NULL — a wake that IS submitted and merely waiting is never
+                # re-submitted while it waits).
                 for r in jobs.stale_queued("wake", older_than_secs=RECOVERY_SECS):
                     log.info("re-submitting orphaned queued wake %s@%s",
                              r["repo"], r["head_sha"][:8])

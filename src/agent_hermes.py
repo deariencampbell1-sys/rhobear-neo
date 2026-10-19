@@ -79,7 +79,13 @@ class HermesAgent:
     clone/copy graveyard.
 
     Thread-safe for sequential calls (each call creates its own subprocess).
+
+    Subclasses may override CANONICAL_VERDICTS with their own output
+    contract (BuilderAgent uses {FIXED, NO-CHANGE, BLOCKED}) and/or override
+    _parse_output for a different fail-open policy on completed runs.
     """
+
+    CANONICAL_VERDICTS = CANONICAL_VERDICTS
 
     def __init__(
         self,
@@ -227,7 +233,7 @@ class HermesAgent:
         verdict = self._extract_verdict(stdout)
         if verdict is None:
             raise UnknownVerdict("no VERDICT: line found in hermes output")
-        if verdict not in CANONICAL_VERDICTS:
+        if verdict not in self.CANONICAL_VERDICTS:
             raise UnknownVerdict(f"non-canonical verdict: {verdict!r}")
 
         # Usage is not observable from -z on this Hermes version. Reported

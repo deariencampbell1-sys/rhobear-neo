@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import secrets
 import subprocess
 
 from .config import Config
@@ -282,8 +283,10 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict) -> None:
         # job parks and a future wake re-arms it — the SHA is never permanently
         # poisoned (defect 5 / GLM 5).
         log.info("no open PR for %s@%s — job released retryably", repo, sha[:8])
-        if jobs.claim(job_id, pr_number=None, lease_secs=_wake_lease(cfg)):
-            jobs.retry(job_id, reason="no open PR for head sha")
+        wtoken = secrets.token_hex(16)
+        if jobs.claim(job_id, pr_number=None, lease_secs=_wake_lease(cfg),
+                      worker_token=wtoken):
+            jobs.retry(job_id, worker_token=wtoken, reason="no open PR for head sha")
         else:
             log.info("job %s already claimed for %s@%s — another worker resolves PR",
                      job_id, repo, sha[:8])
@@ -291,9 +294,32 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict) -> None:
 
     # --- claim the durable job (dedupe + triage in one transaction) -------
     # Atomic UPDATE ... WHERE state='queued' — if another worker already
-    # claimed it (concurrent re-submit), we skip.
-    if not jobs.claim(job_id, pr_number=pr, lease_secs=_wake_lease(cfg)):
+    # claimed it (concurrent re-submit), we skip.  The worker_token is our
+    # claimant identity: every resolve/retry/lease below must present it, so a
+    # stale claimant (lease lost under a DB outage) can never mutate a
+    # replacement run.
+    wtoken = secrets.token_hex(16)
+    if not jobs.claim(job_id, pr_number=pr, lease_secs=_wake_lease(cfg),
+                      worker_token=wtoken):
         log.info("job already claimed %s job=%s — skip (deduped)", repo, job_id)
+        return
+
+    # --- per-SHA idempotency gate (integrator finding 2 / defect 2) -------
+    # A duplicate delivery of the same verdict (GitHub redelivery, or a
+    # reviewer re-publishing success on the same SHA — both normal) is re-armed
+    # by create_wake (dedupe on OUTCOME, so the verdict is never dropped).  But
+    # re-running the whole triage would re-debit credits, re-merge an
+    # already-merged PR, and mint an extra builder round.  The color-aware
+    # already_acted gate makes the re-arm idempotent.  The triage row is
+    # recorded only AFTER a completed agent run (see below), so a retried job
+    # whose agent crashed mid-run is NOT gated — it re-runs — while a verdict
+    # that actually completed is treated as already-acted.
+    if state.already_acted(repo, pr, sha, "triage", green=green) or \
+            state.already_acted(repo, pr, sha, "merged"):
+        jobs.resolve(job_id, "no_change", worker_token=wtoken,
+                     payload={"reason": "already acted on this SHA/verdict"})
+        log.info("%s#%s@%s already acted (triage green=%s or merged) — "
+                 "duplicate delivery skipped", repo, pr, sha[:8], green)
         return
 
     rounds = state.builder_rounds(repo, pr)
@@ -322,7 +348,8 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict) -> None:
         state.record(repo, pr, sha, "stale_head", verdict="STALE",
                      detail={"context": wake.get("context"),
                              "head_sha": evidence["head_sha"], "decided_sha": sha})
-        jobs.resolve(job_id, "no_change", payload={"reason": "stale head"})
+        jobs.resolve(job_id, "no_change", worker_token=wtoken,
+                     payload={"reason": "stale head"})
         log.info("%s#%s@%s head moved to %s — stale evidence, not mergeable",
                  repo, pr, sha[:8], evidence["head_sha"][:8])
         return
@@ -340,18 +367,14 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict) -> None:
              (evidence.get("head_sha") or "?")[:8], (evidence.get("review_sha") or "?")[:8],
              evidence.get("rollup_green"))
 
-    state.record(repo, pr, sha, "triage", detail={"context": wake.get("context"),
-                                                   "green": wake.get("green"),
-                                                   "jev": jev.brief(),
-                                                   "jev_attention": jev.requires_full_review,
-                                                   "head_sha": evidence.get("head_sha"),
-                                                   "review_sha": evidence.get("review_sha"),
-                                                   "rollup_green": evidence.get("rollup_green"),
-                                                   "jev_blockers": [f.rule for f in jev.blockers],
-                                                   "auto_merge": auto_merge,
-                                                   "reason": authority_reason})
-
     # --- run the Neo protocol headless via Claude Code CLI --------------------
+    # The triage row is recorded AFTER a completed run (below, with the phase
+    # row), NOT here: a triage that crashes mid-agent must not leave a marker
+    # that the per-SHA idempotency gate would then treat as already-acted on
+    # the retry.  Recording it here is what stranded heads in the B0 baseline
+    # (the old code had to clear() the marker on agent failure).  With the
+    # durable job store the retry is the job's own lease cycle, so the marker
+    # is only meaningful once a run actually completes.
     brief = neo_protocol.build_brief(
         repo=repo, pr=pr, head_sha=sha,
         reviewer_context=wake.get("context", "?"), reviewer_green=bool(wake.get("green")),
@@ -363,7 +386,8 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict) -> None:
     try:
         # Lease renewal: a static lease shorter than the agent run would let a
         # second worker claim the same SHA mid-run (GLM 6 applies to wakes too).
-        with jobs.lease_renewal(job_id, lease_secs=_wake_lease(cfg)):
+        with jobs.lease_renewal(job_id, lease_secs=_wake_lease(cfg),
+                                worker_token=wtoken):
             usage, verdict = _run_agent(agent, brief)
     except Exception as exc:
         # Any exception from the agent spawn (FileNotFoundError/OSError/
@@ -371,13 +395,28 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict) -> None:
         # stranding the SHA (defect 3 / GLM 4).
         log.exception("%s#%s@%s agent crashed (%s) — job retried",
                       repo, pr, sha[:8], type(exc).__name__)
-        jobs.retry(job_id, reason=f"agent crashed ({type(exc).__name__})")
+        jobs.retry(job_id, worker_token=wtoken,
+                   reason=f"agent crashed ({type(exc).__name__})")
         return
 
     if not verdict:
         log.warning("%s#%s@%s agent produced no verdict — job retried", repo, pr, sha[:8])
-        jobs.retry(job_id, reason="agent produced no verdict")
+        jobs.retry(job_id, worker_token=wtoken, reason="agent produced no verdict")
         return
+
+    # The triage completed: record the audit row (loop/thrash guard input) and
+    # the phase row together.  Recorded only on success so a crashed run leaves
+    # no marker and is re-run by the retry (see the gate comment above).
+    state.record(repo, pr, sha, "triage", detail={"context": wake.get("context"),
+                                                   "green": wake.get("green"),
+                                                   "jev": jev.brief(),
+                                                   "jev_attention": jev.requires_full_review,
+                                                   "head_sha": evidence.get("head_sha"),
+                                                   "review_sha": evidence.get("review_sha"),
+                                                   "rollup_green": evidence.get("rollup_green"),
+                                                   "jev_blockers": [f.rule for f in jev.blockers],
+                                                   "auto_merge": auto_merge,
+                                                   "reason": authority_reason})
 
     is_builder = verdict.startswith("BOUNCE-BUILDER")
     credits = credits_for(usage, builder=is_builder)
@@ -400,8 +439,9 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict) -> None:
     # Resolve the wake job with a terminal outcome.  The triage completed; a
     # builder round is a SEPARATE job the builder lane claims (the wake job is
     # not left running or 'failed' — 'done' + the phase in the payload).
-    jobs.resolve(job_id, "done", payload={"verdict": verdict, "phase": phase,
-                                            "credits": credits})
+    jobs.resolve(job_id, "done", worker_token=wtoken,
+                 payload={"verdict": verdict, "phase": phase,
+                          "credits": credits})
     if inst.get("plan"):
         state.debit(org, credits)
     log.info("%s#%s@%s verdict=%s credits=%d (auto_merge=%s round=%d)",
