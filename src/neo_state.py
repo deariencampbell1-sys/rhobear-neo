@@ -157,6 +157,7 @@ class NeoState:
                 # after a failed terminal action) keeps the original start, so
                 # the give-up timeout is never pushed out by retries.
                 "started_at": _started_at(detail, r[4]),
+                "detail": detail,
             })
         return out
 

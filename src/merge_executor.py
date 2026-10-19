@@ -177,7 +177,7 @@ def _delete_head_branch(token: str, repo: str, pr: int, head_ref: str, cross_rep
         if head_ref == default.strip():
             return
         rc, others = _gh(token, "pr", "list", "-R", repo, "--head", head_ref, "--state", "open",
-                         "--json", "number", "--jq", ".[].number", timeout=30)
+                         "--limit", "1000", "--json", "number", "--jq", ".[].number", timeout=30)
         if rc != 0:
             log.warning("head branch %s for %s#%s kept: open-PR check failed", head_ref, repo, pr)
             return

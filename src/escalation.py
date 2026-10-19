@@ -409,7 +409,8 @@ def escalate_pr(
 
 def _consume_and_act(state, repo: str, pr: int, head_sha: str,
                      advice_id: str, installation_id, act,
-                     started_at: float | None = None) -> dict | None:
+                     started_at: float | None = None,
+                     detail: dict | None = None) -> dict | None:
     """Consume this advice's escalating marker (only if it is still the NEWEST
     escalation for the PR), then run `act()`.  Returns:
 
@@ -430,10 +431,15 @@ def _consume_and_act(state, repo: str, pr: int, head_sha: str,
     except Exception as exc:  # noqa: BLE001 — fail closed, never strand
         log.warning("escalation act failed for %s#%s advice %s: %s — marker "
                     "re-recorded, retry next poll", repo, pr, advice_id, exc)
+        # Keep the marker's own detail (green / wake_job feed the worker's
+        # color-aware crash gate) and the escalation's original start.
+        extra = {k: v for k, v in (detail or {}).items()
+                 if k not in ("advice_id", "installation_id")}
+        if started_at:
+            extra["escalation_started"] = started_at
         state.record_escalating(
             repo, pr, head_sha, advice_id=advice_id,
-            installation_id=installation_id,
-            extra={"escalation_started": started_at} if started_at else None)
+            installation_id=installation_id, extra=extra or None)
         return {"action": "retry", "reason": f"transient failure: {exc}"}
 
 
@@ -484,7 +490,7 @@ def recover_escalations(
                 out = _consume_and_act(
                     state, repo, pr, head_sha, "", installation_id,
                     lambda: _park_pr(state, jobs, repo, pr, head_sha, reason),
-                    started_at=started_at,
+                    started_at=started_at, detail=row.get("detail"),
                 )
                 if out is None:
                     handled.append({"repo": repo, "pr": pr, "action": "dropped",
@@ -498,7 +504,7 @@ def recover_escalations(
                     state, jobs, repo, pr, head_sha,
                     f"advisor did not finish within {timeout_secs}s",
                 ),
-                started_at=started_at,
+                started_at=started_at, detail=row.get("detail"),
             )
             if out is None:
                 handled.append({"repo": repo, "pr": pr, "action": "dropped",
@@ -519,7 +525,7 @@ def recover_escalations(
             out = _consume_and_act(
                 state, repo, pr, head_sha, advice_id, installation_id,
                 lambda: _park_pr(state, jobs, repo, pr, head_sha, lost_reason),
-                started_at=started_at,
+                started_at=started_at, detail=row.get("detail"),
             )
             if out is None:
                 handled.append({"repo": repo, "pr": pr, "action": "dropped",
@@ -543,7 +549,7 @@ def recover_escalations(
                     installation_id=installation_id,
                     advice_id=advice_id,
                 ),
-                started_at=started_at,
+                started_at=started_at, detail=row.get("detail"),
             )
             if out is None:
                 log.info("escalation %s#%s advice %s superseded by a newer "
@@ -559,7 +565,7 @@ def recover_escalations(
                     state, jobs, repo, pr, head_sha,
                     f"advisor failed: {status.error or 'unknown'}",
                 ),
-                started_at=started_at,
+                started_at=started_at, detail=row.get("detail"),
             )
             if out is None:
                 handled.append({"repo": repo, "pr": pr, "action": "dropped",
