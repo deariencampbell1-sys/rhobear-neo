@@ -625,6 +625,22 @@ class TestMergeBranchDeletion:
         assert result["merged"] is True
         assert deletes == []
 
+    def test_open_pr_check_is_not_capped_at_30(self):
+        """gh pr list returns 30 rows by default; a shared branch's older PR
+        beyond that cap must still be seen, so the check asks for more."""
+        seen: list = []
+        orig = _branch_lookups
+
+        def spy(args, *a, **k):
+            if args[:2] == ("pr", "list"):
+                seen.append(args)
+            return orig(args, *a, **k)
+
+        with patch(f"{__name__}._branch_lookups", side_effect=spy):
+            self._run()
+        assert seen and "--limit" in seen[0], seen
+        assert int(seen[0][seen[0].index("--limit") + 1]) >= 1000, seen
+
     def test_own_branch_is_deleted_when_only_this_pr_uses_it(self):
         result, deletes = self._run(other_prs="1")
         assert deletes == ["repos/acme/a/git/refs/heads/topic-branch"]

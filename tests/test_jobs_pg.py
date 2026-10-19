@@ -1562,6 +1562,35 @@ class TestTimeoutNoAdviceIdPG:
         assert legacy == 0, "the stale legacy marker is removed"
 
 
+    def test_retry_rerecord_keeps_green_and_wake_job(self, db):
+        """The re-recorded marker keeps the worker's green/wake_job detail, so
+        the color-aware crash gate still sees this green SHA as handled."""
+        jobs = db
+        state = NeoState(DSN)
+        state.record_escalating("o/r", 98, SHA1, advice_id="advice-1",
+                                installation_id=1,
+                                extra={"green": True, "wake_job": 4242})
+        assert state.already_acted("o/r", 98, SHA1, "escalating", green=True)
+        cfg = _cfg()
+        cfg.advisor_url = "http://127.0.0.1:9"
+        cfg.advisor_token = "test-token"
+        from src.escalation import recover_escalations, AdviceStatus
+        work_order = {"route": "claude:opus", "summary": "s", "root_cause": "rc",
+                      "steps": [], "tests": [], "risks": ""}
+
+        def boom(*a, **k):
+            raise RuntimeError("transient")
+
+        with patch("src.escalation.poll_advice",
+                   return_value=AdviceStatus(status="done", work_order=work_order)), \
+             patch("src.escalation.escalate_pr", side_effect=boom):
+            handled = recover_escalations(cfg, state, jobs, timeout_secs=1800)
+        assert [h["action"] for h in handled] == ["retry"], handled
+        row = [r for r in state.escalating_prs() if r["pr"] == 98][0]
+        assert row["detail"].get("green") is True, row
+        assert row["detail"].get("wake_job") == 4242, row
+        assert state.already_acted("o/r", 98, SHA1, "escalating", green=True)
+
 class TestRetryKeepsTimeoutPG:
     """A failing terminal action re-records the marker; the re-recorded marker
     keeps the escalation's ORIGINAL start, so retries never push out the
