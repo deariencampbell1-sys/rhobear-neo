@@ -282,7 +282,7 @@ class TestDefect2PrState:
         with patch("src.neo_builder.pr_state", return_value="MERGED\tmain"):
             dispatch_one(cfg, jobs, row)
         jobs.resolve.assert_called_once_with(
-            1, "no_change", payload={"reason": "PR state: MERGED"})
+            1, "no_change", worker_token=None, payload={"reason": "PR state: MERGED"})
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +302,7 @@ class TestDefect3AgentErrors:
         state = MagicMock()
         state.builder_rounds.return_value = 0
         state.install.return_value = {"auto_merge": False, "plan": None, "credits_balance": 100}
+        state.already_acted.return_value = False   # per-SHA idempotency gate must not short-circuit
         wake = {"repo": "o/r", "sha": "a" * 40, "green": True,
                 "context": "test", "pr_number": 1, "job_id": 42}
         with patch("src.neo_worker.resolve_pr", return_value=1), \
@@ -431,6 +432,7 @@ class TestGLM2BuilderCreated:
         state = MagicMock()
         state.builder_rounds.return_value = 1   # one round already spent
         state.install.return_value = {"auto_merge": False, "plan": None, "credits_balance": 100}
+        state.already_acted.return_value = False   # per-SHA idempotency gate must not short-circuit
         jobs = MagicMock(spec=Jobs)
         jobs.create_wake.return_value = 42
         jobs.claim.return_value = 42
@@ -449,7 +451,7 @@ class TestGLM2BuilderCreated:
         jobs.create_builder.assert_called_once()
         call = jobs.create_builder.call_args
         assert call.args[0:4] == ("o/r", 3, "a" * 40, 2)   # rounds+1 = 2
-        jobs.resolve.assert_called_once_with(42, "done", payload=ANY)
+        jobs.resolve.assert_called_once_with(42, "done", worker_token=ANY, payload=ANY)
 
 
 # ---------------------------------------------------------------------------
@@ -475,7 +477,7 @@ class TestGLM5UnresolvablePR:
         with patch("src.neo_worker.resolve_pr", return_value=None):
             run_neo(cfg, state, jobs, wake)
         jobs.claim.assert_called_once()
-        jobs.retry.assert_called_once_with(42, reason="no open PR for head sha")
+        jobs.retry.assert_called_once_with(42, worker_token=ANY, reason="no open PR for head sha")
         state.record.assert_not_called()
 
 
@@ -496,6 +498,7 @@ class TestGLM6LeaseRenewal:
         state = MagicMock()
         state.builder_rounds.return_value = 0
         state.install.return_value = {"auto_merge": False, "plan": None, "credits_balance": 100}
+        state.already_acted.return_value = False   # per-SHA idempotency gate must not short-circuit
         jobs = MagicMock(spec=Jobs)
         jobs.create_wake.return_value = 42
         jobs.claim.return_value = 42
@@ -582,6 +585,49 @@ class TestRoundCapAtClaim:
         assert jobs.claim_queued.call_count == 2  # over-cap row + empty
         assert not jobs.resolve.called
 
+    def test_main_never_dispatches_second_round_of_inflight_pr(self, monkeypatch, caplog):
+        """Integrator finding 1: two rounds of the SAME PR share one worktree
+        (prepare_worktree keys its dest on repo+pr).  If a round is already
+        running in another worker, a newly claimed round for the same PR must
+        be RELEASED (not dispatched, not attempt-burning) so a second agent can
+        never rm -rf the live worktree."""
+        import logging
+        import sys
+        import src.neo_builder as builder
+        cfg = MagicMock()
+        cfg.max_builder_rounds = 3
+        cfg.repo_allowlist = ()
+        cfg.gh_token = "t"
+        cfg.hermes_bin = "/fake/hermes"
+        cfg.hermes_provider = "zai"
+        cfg.hermes_model = "glm-5.3-flash"
+        cfg.deepseek_timeout = 30
+        jobs = MagicMock(spec=Jobs)
+        row1 = {"id": 1, "repo": "o/r", "pr_number": 5, "head_sha": "a" * 40,
+                "builder_round": 1, "attempt": 1}
+        row2 = {"id": 2, "repo": "o/r", "pr_number": 5, "head_sha": "b" * 40,
+                "builder_round": 2, "attempt": 1}
+        jobs.claim_queued.side_effect = [row1, row2, None]
+        jobs.recover_expired.return_value = []
+        jobs.supersede_older.return_value = []
+        dispatched: list[int] = []
+
+        def fake_dispatch(cfg_, jobs_, row_):
+            dispatched.append(row_["id"])
+
+        monkeypatch.setattr(builder, "Config", lambda: cfg)
+        monkeypatch.setattr(builder, "Jobs", lambda dsn: jobs)
+        monkeypatch.setattr(builder, "pr_state", lambda *a: "OPEN\tmain")
+        monkeypatch.setattr(builder, "dispatch_one", fake_dispatch)
+        monkeypatch.setattr(sys, "argv", ["neo_builder", "--once"])
+        with caplog.at_level(logging.INFO):
+            builder.main()
+        # round 2 of the same PR was claimed but released — never dispatched
+        jobs.release.assert_called_once()
+        assert jobs.release.call_args[0][0] == 2
+        assert dispatched == [1]
+        assert "already inflight" in caplog.text
+
 
 # ---------------------------------------------------------------------------
 # Hermes Builder invocation unchanged
@@ -605,16 +651,50 @@ class TestHermesBuilderUnchanged:
         assert "--yolo" in cmd and "--accept-hooks" in cmd
 
     def test_builder_verdict_parsing(self):
+        """Block 3: the builder lane parses its OWN contract verdicts
+        {FIXED, NO-CHANGE, BLOCKED} — the Neo protocol set (ACCEPT-READY etc.)
+        is not the fixer's contract, and a completed run with an unparseable
+        verdict returns "" (no_change, never a retry) instead of raising."""
         from src.agent_hermes import CANONICAL_VERDICTS
+        from src.agent_hermes import NonZeroExit, MissingResult
+        from src.neo_builder import BUILDER_CANONICAL_VERDICTS
         agent = BuilderAgent(work_dir="/tmp/wt", hermes_bin="/fake/hermes",
                              provider="zai", model="glm-5.3-flash")
+        # the builder's canonical set is the fixer contract, not the triage one
+        assert BUILDER_CANONICAL_VERDICTS == frozenset({"FIXED", "NO-CHANGE", "BLOCKED"})
+        assert "ACCEPT-READY" not in BUILDER_CANONICAL_VERDICTS
+        for verdict in ("FIXED", "NO-CHANGE", "BLOCKED"):
+            proc = MagicMock()
+            proc.stdout = f"Work done\nVERDICT: {verdict}\n"
+            proc.stderr = ""
+            proc.returncode = 0
+            usage, got = agent._parse_output(proc)
+            assert got == verdict, (verdict, got)
+            assert usage == {"input_tokens": 0, "output_tokens": 0}
+        # a clean exit with the triage-lane verdict (or garbage) is a COMPLETED
+        # run: "" verdict + raw_tail recorded, never an exception / retry
         proc = MagicMock()
         proc.stdout = "Work done\nVERDICT: ACCEPT-READY\n"
         proc.stderr = ""
         proc.returncode = 0
-        usage, verdict = agent._parse_output(proc)
-        assert verdict == "ACCEPT-READY"
-        assert "ACCEPT-READY" in CANONICAL_VERDICTS
+        usage, got = agent._parse_output(proc)
+        assert got == ""
+        assert usage["raw_tail"].endswith("VERDICT: ACCEPT-READY")
+        assert "ACCEPT-READY" in CANONICAL_VERDICTS  # triage set unchanged
+        # a FAILED run still raises (agent failure -> retry)
+        proc = MagicMock()
+        proc.stdout = "VERDICT: FIXED\n"
+        proc.stderr = "error"
+        proc.returncode = 1
+        import pytest as _pt
+        with _pt.raises(NonZeroExit):
+            agent._parse_output(proc)
+        proc = MagicMock()
+        proc.stdout = ""
+        proc.stderr = ""
+        proc.returncode = 0
+        with _pt.raises(MissingResult):
+            agent._parse_output(proc)
 
 
 # ---------------------------------------------------------------------------

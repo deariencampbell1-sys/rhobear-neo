@@ -31,6 +31,7 @@ Run:  NEO_TEST_DSN='<dsn>' .venv/bin/python -m pytest tests/test_jobs_pg.py -q
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import threading
 from unittest.mock import MagicMock, patch
 
@@ -477,3 +478,327 @@ class TestDedupeOnOutcome:
         r1b = db.create_builder("o/r", 5, SHA1, 1)
         assert r1b == r1
         assert db.get(r1)["state"] == "queued"
+
+
+# ---------------------------------------------------------------------------
+# FIX ROUND 3 — blocker 2: per-SHA idempotency gate (integrator finding 2)
+# ---------------------------------------------------------------------------
+
+class TestIdempotencyGate:
+    def test_duplicate_delivery_does_not_repeat_work(self, db):
+        """Defect 2: a duplicate delivery of the same verdict re-arms the
+        terminal wake (dedupe on outcome, so the verdict is not dropped), but
+        the per-SHA gate must resolve it no_change — the agent never re-runs,
+        no second debit, no extra builder round."""
+        jobs = db
+        state = NeoState(DSN)
+        cfg = _cfg()
+        wake = {"repo": "o/r", "sha": SHA1, "green": False,
+                "context": "rhobear-reviews", "pr_number": 5}
+        agent_calls: list[int] = []
+
+        def fake_agent(agent, brief):
+            agent_calls.append(1)
+            return {"input_tokens": 1000, "output_tokens": 100}, "BOUNCE-BUILDER fix it"
+
+        from src.neo_worker import run_neo
+        with patch("src.neo_worker.resolve_pr", return_value=5), \
+             patch("src.neo_worker._review_evidence", return_value=_evidence(SHA1)), \
+             patch("src.neo_worker._jev_for_pr",
+                   return_value=JevAssessment(False, reason="no key")), \
+             patch("src.neo_worker._run_agent", side_effect=fake_agent):
+            run_neo(cfg, state, jobs, wake)   # first delivery: real triage
+            run_neo(cfg, state, jobs, wake)   # duplicate delivery: gate -> no_change
+        assert len(agent_calls) == 1, agent_calls
+        with psycopg.connect(DSN, autocommit=True) as c:
+            builds = c.execute("SELECT COUNT(*) FROM neo_jobs WHERE kind='builder'").fetchone()[0]
+            acts = c.execute("SELECT COUNT(*) FROM neo_actions WHERE phase='builder'").fetchone()[0]
+            triages = c.execute("SELECT COUNT(*) FROM neo_actions WHERE phase='triage'").fetchone()[0]
+        assert builds == 1, builds      # no extra builder round minted
+        assert acts == 1, acts
+        assert triages == 1, triages    # one triage record (recorded after success)
+
+    def test_merged_duplicate_is_skipped(self, db):
+        """A duplicate delivery after Neo already merged this head resolves
+        no_change — the already_acted 'merged' arm catches it (no re-merge)."""
+        jobs = db
+        state = NeoState(DSN)
+        cfg = _cfg()
+        cfg.auto_merge_default = True
+        wake = {"repo": "o/r", "sha": SHA1, "green": True,
+                "context": "rhobear-reviews", "pr_number": 5}
+        agent_calls: list[int] = []
+
+        def fake_agent(agent, brief):
+            agent_calls.append(1)
+            return {"input_tokens": 1, "output_tokens": 1}, "ACCEPT-MERGED"
+
+        from src.neo_worker import run_neo
+        with patch("src.neo_worker.resolve_pr", return_value=5), \
+             patch("src.neo_worker._review_evidence", return_value=_evidence(SHA1)), \
+             patch("src.neo_worker._jev_for_pr",
+                   return_value=JevAssessment(False, reason="no key")), \
+             patch("src.neo_worker._run_agent", side_effect=fake_agent):
+            run_neo(cfg, state, jobs, wake)   # first delivery: merge
+            run_neo(cfg, state, jobs, wake)   # duplicate: gate -> no_change
+        assert len(agent_calls) == 1, agent_calls
+        with psycopg.connect(DSN, autocommit=True) as c:
+            wakes = c.execute(
+                "SELECT outcome FROM neo_jobs WHERE kind='wake'").fetchall()
+        # the duplicate re-arms the SAME terminal row (ON CONFLICT re-arm), then
+        # the gate resolves it no_change — the merged disposition is overwritten
+        # by the duplicate's no_change, the history lives in neo_actions
+        assert [w[0] for w in wakes] == ["no_change"], wakes
+        with psycopg.connect(DSN, autocommit=True) as c:
+            merged = c.execute(
+                "SELECT COUNT(*) FROM neo_actions WHERE phase='merged'").fetchone()[0]
+        assert merged == 1, merged  # merged exactly once
+
+    def test_green_after_red_same_head_still_triages(self, db):
+        """The color-aware gate must NOT swallow a green verdict that arrives
+        after a red triage of the SAME head (the reviewer re-ran and passed
+        it) — that is new decision input, not a duplicate."""
+        jobs = db
+        state = NeoState(DSN)
+        cfg = _cfg()
+        agent_calls: list[int] = []
+
+        def fake_agent(agent, brief):
+            agent_calls.append(1)
+            return {"input_tokens": 1, "output_tokens": 1}, "ACCEPT-READY"
+
+        from src.neo_worker import run_neo
+        red = {"repo": "o/r", "sha": SHA1, "green": False,
+               "context": "rhobear-reviews", "pr_number": 6}
+        green = {"repo": "o/r", "sha": SHA1, "green": True,
+                 "context": "rhobear-reviews", "pr_number": 6}
+        with patch("src.neo_worker.resolve_pr", return_value=6), \
+             patch("src.neo_worker._review_evidence", return_value=_evidence(SHA1)), \
+             patch("src.neo_worker._jev_for_pr",
+                   return_value=JevAssessment(False, reason="no key")), \
+             patch("src.neo_worker._run_agent", side_effect=fake_agent):
+            run_neo(cfg, state, jobs, red)
+            run_neo(cfg, state, jobs, green)
+        assert len(agent_calls) == 2, agent_calls
+
+    def test_crashed_run_retry_is_not_gated(self, db):
+        """A job whose agent crashed mid-run is retried and re-runs — the gate
+        must not treat the retry as already-acted (the triage row is recorded
+        only after a completed run)."""
+        jobs = db
+        state = NeoState(DSN)
+        cfg = _cfg()
+        agent_calls: list[int] = []
+
+        def flaky_agent(agent, brief):
+            agent_calls.append(1)
+            if len(agent_calls) == 1:
+                raise FileNotFoundError("agent binary gone")
+            return {"input_tokens": 1, "output_tokens": 1}, "ACCEPT-READY"
+
+        wake = {"repo": "o/r", "sha": SHA1, "green": True,
+                "context": "rhobear-reviews", "pr_number": 7}
+        from src.neo_worker import run_neo
+        with patch("src.neo_worker.resolve_pr", return_value=7), \
+             patch("src.neo_worker._review_evidence", return_value=_evidence(SHA1)), \
+             patch("src.neo_worker._jev_for_pr",
+                   return_value=JevAssessment(False, reason="no key")), \
+             patch("src.neo_worker._run_agent", side_effect=flaky_agent):
+            # first delivery: agent crashes -> job retried (back to queued)
+            run_neo(cfg, state, jobs, wake)
+        with psycopg.connect(DSN, autocommit=True) as c:
+            job_id, st, outcome = c.execute(
+                "SELECT id, state, outcome FROM neo_jobs WHERE kind='wake'").fetchone()
+        assert st == "queued" and outcome == "failed", (st, outcome)
+        # retry path: same job id re-submitted -> claim -> NOT gated -> re-runs
+        with patch("src.neo_worker.resolve_pr", return_value=7), \
+             patch("src.neo_worker._review_evidence", return_value=_evidence(SHA1)), \
+             patch("src.neo_worker._jev_for_pr",
+                   return_value=JevAssessment(False, reason="no key")), \
+             patch("src.neo_worker._run_agent", side_effect=flaky_agent):
+            run_neo(cfg, state, jobs, {"repo": "o/r", "sha": SHA1,
+                                       "green": True, "job_id": job_id})
+        assert len(agent_calls) == 2, agent_calls
+        assert jobs.get(job_id)["outcome"] == "done"
+
+
+# ---------------------------------------------------------------------------
+# FIX ROUND 3 — blocker 1: never two rounds of one PR in one worktree
+# ---------------------------------------------------------------------------
+
+class TestInflightRelease:
+    def test_release_returns_queued_without_failure_marker(self, db):
+        """Jobs.release() voids a claim (same repo+PR already running in
+        another worker sharing the worktree) WITHOUT recording a retryable
+        failure: state back to queued, outcome stays NULL, no reason burned."""
+        job_id = db.create_builder("o/r", 5, SHA1, 1)
+        row = db.claim_queued("builder")
+        assert row["id"] == job_id and row["attempt"] == 1
+        assert db.release(job_id, worker_token=row["worker_token"]) is True
+        r = db.get(job_id)
+        assert r["state"] == "queued"
+        assert r["outcome"] is None          # NOT a retryable failure
+        assert r["attempt"] == 1             # release itself does not add
+        # the released round is claimable again once the running one frees up
+        row2 = db.claim_queued("builder")
+        assert row2["id"] == job_id
+
+    def test_release_rejects_stale_claimant(self, db):
+        """A release by a non-claimant (token mismatch) does nothing."""
+        job_id = db.create_builder("o/r", 5, SHA1, 1)
+        row = db.claim_queued("builder")
+        assert db.release(job_id, worker_token="not-the-claimant") is False
+        assert db.get(job_id)["state"] == "running"
+        assert db.release(job_id, worker_token=row["worker_token"]) is True
+
+    def test_claim_queued_excludes_inflight_keys(self, db):
+        """The SQL-side guard: claim_queued with exclude_keys never returns a
+        row for a PR that is already running in this process (they share one
+        worktree).  This is what prevents the claiming-releasing busy loop."""
+        a = db.create_builder("o/r", 5, SHA1, 1)
+        b = db.create_builder("o/r", 6, SHA2, 1)
+        row = db.claim_queued("builder", exclude_keys={("o/r", 6)})
+        assert row is not None and row["id"] == a, row   # PR 6 excluded -> PR 5
+        # both PRs claimable when nothing is excluded
+        c = db.create_builder("o/r", 7, SHA2, 1)
+        row2 = db.claim_queued("builder", exclude_keys=set())
+        assert row2["id"] == c
+
+
+# ---------------------------------------------------------------------------
+# FIX ROUND 3 — blocker 3: builder verdict branches (real DB dispatch_one)
+# ---------------------------------------------------------------------------
+
+class TestBuilderVerdictBranches:
+    def _dispatch(self, db, run_result):
+        """Claim a real builder round and dispatch it with a faked agent run."""
+        from src.neo_builder import dispatch_one
+        cfg = _cfg()
+        cfg.max_builder_rounds = 3
+        row_id = db.create_builder("o/r", 5, SHA1, 1)
+        row = db.claim_queued("builder")
+        assert row is not None and row["id"] == row_id
+        with patch("src.neo_builder.pr_state", return_value="OPEN\tmain"), \
+             patch("src.neo_builder.prepare_worktree", return_value=("/tmp/wt", "main")), \
+             patch("src.neo_builder.fetch_findings", return_value=""), \
+             patch("src.neo_builder.gh", return_value=(0, SHA2)), \
+             patch("src.neo_builder.BRIEFS", Path("/tmp/briefs")), \
+             patch("src.neo_builder.BuilderAgent.run", return_value=run_result):
+            dispatch_one(cfg, db, row)
+        return row_id
+
+    def test_no_change_resolves_no_change(self, db):
+        row_id = self._dispatch(db, ({"input_tokens": 0}, "NO-CHANGE"))
+        r = db.get(row_id)
+        assert r["state"] == "done" and r["outcome"] == "no_change", r
+
+    def test_fixed_no_push_records_done(self, db):
+        row_id = self._dispatch(db, ({"input_tokens": 0}, "FIXED"))
+        r = db.get(row_id)
+        assert r["state"] == "done" and r["outcome"] == "done", r
+        assert r["payload"]["outcome"] == "fixed-no-push", r
+
+    def test_completed_unparseable_verdict_is_no_change_not_retry(self, db):
+        """Block 3: a COMPLETED run (exit 0) whose verdict line is unparseable
+        resolves no_change with the raw tail recorded — it is NOT retried 3x
+        then mis-parked (the old dead-code behavior)."""
+        row_id = self._dispatch(
+            db, ({"input_tokens": 0, "output_tokens": 0,
+                  "raw_tail": "VERDICT: ACCEPT-READY"}, ""))
+        r = db.get(row_id)
+        assert r["state"] == "done" and r["outcome"] == "no_change", r
+        assert r["payload"].get("verdict") == "", r
+        assert "ACCEPT-READY" in r["payload"].get("raw_tail", ""), r
+
+    def test_blocked_is_no_change_with_verdict_recorded(self, db):
+        row_id = self._dispatch(db, ({"input_tokens": 0}, "BLOCKED"))
+        r = db.get(row_id)
+        assert r["state"] == "done" and r["outcome"] == "no_change", r
+        assert r["payload"].get("verdict") == "BLOCKED", r
+
+
+# ---------------------------------------------------------------------------
+# FIX ROUND 3 — lower severity 1: recovery must not amplify waiting wakes
+# ---------------------------------------------------------------------------
+
+class TestRecoveryAmplification:
+    def test_submitted_wake_is_not_resubmitted_while_waiting(self, db):
+        """A wake that was submitted and is merely waiting in a saturated
+        executor (submitted_at set, created long ago) must NOT be returned by
+        stale_queued — it was re-submitted every recovery pass before the fix."""
+        job_id = db.create_wake("o/r", SHA1, True,
+                                payload={"repo": "o/r", "sha": SHA1, "green": True})
+        assert db.get(job_id)["submitted_at"] is not None
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute("UPDATE neo_jobs SET created_at = now() - interval '3 minutes' "
+                      "WHERE id = %s", (job_id,))
+        assert db.stale_queued("wake", older_than_secs=30) == []
+
+    def test_retried_wake_becomes_eligible_exactly_once(self, db):
+        """A crash-retried wake clears submitted_at so it IS re-submitted, but
+        after re-submission it is stamped again and not amplified."""
+        job_id = db.create_wake("o/r", SHA1, True,
+                                payload={"repo": "o/r", "sha": SHA1, "green": True})
+        db.claim(job_id, lease_secs=600)
+        db.retry(job_id, reason="agent crashed")
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute("UPDATE neo_jobs SET created_at = now() - interval '3 minutes' "
+                      "WHERE id = %s", (job_id,))
+        # retry cleared submitted_at -> stale_queued returns it once
+        assert [r["id"] for r in db.stale_queued("wake", older_than_secs=30)] == [job_id]
+        # after the recovery loop re-submits (mark_submitted), it is no longer
+        # an orphan even if it waits in the executor again
+        db.mark_submitted(job_id)
+        assert db.stale_queued("wake", older_than_secs=30) == []
+
+    def test_startup_reset_makes_orphans_eligible(self, db):
+        """After a restart every executor task died: reset_queued_submissions
+        clears the stamps once so the first sweep re-submits them all."""
+        job_id = db.create_wake("o/r", SHA1, True,
+                                payload={"repo": "o/r", "sha": SHA1, "green": True})
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute("UPDATE neo_jobs SET created_at = now() - interval '3 minutes' "
+                      "WHERE id = %s", (job_id,))
+        assert db.stale_queued("wake", older_than_secs=30) == []  # submitted
+        assert db.reset_queued_submissions("wake") == 1
+        assert [r["id"] for r in db.stale_queued("wake", older_than_secs=30)] == [job_id]
+
+
+# ---------------------------------------------------------------------------
+# FIX ROUND 3 — lower severity 2: worker_token (stale claimant never mutates)
+# ---------------------------------------------------------------------------
+
+class TestWorkerToken:
+    def test_stale_claimant_cannot_resolve_replacement(self, db):
+        """If a DB outage lets the lease lapse and another worker claims the
+        re-queued job, the ORIGINAL claimant's resolve/retry/lease must fail —
+        only the current claimant can mutate the row."""
+        job_id = db.create_wake("o/r", SHA1, True)
+        _id = db.claim(job_id, lease_secs=600)
+        assert _id == job_id
+        token1 = db.get(job_id)["worker_token"]
+        assert token1
+        # simulate the outage: lease expires, recovery re-queues, new worker claims
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute("UPDATE neo_jobs SET lease_expires = now() - interval '5 seconds' "
+                      "WHERE id = %s", (job_id,))
+        db.recover_expired("wake")
+        _id2 = db.claim(job_id, lease_secs=600)
+        assert _id2 == job_id
+        token2 = db.get(job_id)["worker_token"]
+        assert token2 != token1
+        # the stale claimant's mutations are rejected
+        assert db.resolve(job_id, "no_change", worker_token=token1) is False
+        assert db.retry(job_id, worker_token=token1, reason="stale") == "?"
+        assert db.lease(job_id, 600, worker_token=token1) is False
+        assert db.get(job_id)["state"] == "running"
+        # the current claimant can resolve
+        assert db.resolve(job_id, "no_change", worker_token=token2) is True
+        assert db.get(job_id)["outcome"] == "no_change"
+
+    def test_resolve_clears_token(self, db):
+        job_id = db.create_wake("o/r", SHA1, True)
+        db.claim(job_id, lease_secs=600)
+        token = db.get(job_id)["worker_token"]
+        assert db.resolve(job_id, "no_change", worker_token=token) is True
+        assert db.get(job_id)["worker_token"] is None
