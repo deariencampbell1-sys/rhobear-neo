@@ -9,6 +9,25 @@ Runs: `.venv/bin/python -m src`, reads `.env` via `EnvironmentFile`.
 `.env`, `app-key.pem` (GitHub App private key), `.local/` — all on the box only.
 `config.py` reads everything from the environment; there is no secret in source.
 
+## GitHub App identity (N15-B1g, 2026-10-19)
+Neo acts as the customer's GitHub App (`rhobear-neo`, App ID 4347986), not as a
+personal `gho_` token. A customer grants Neo access to a private repo by
+installing the App on it; every GitHub action for a repo uses that repo's
+installation token. `.env` must set:
+
+```bash
+NEO_GITHUB_APP_ID=4347986
+NEO_GITHUB_APP_KEY_PATH=/opt/rhobear/rhobear-neo/app-key.pem   # or NEO_GITHUB_APP_KEY=<PEM text>
+```
+
+- A repo with no App installation is refused: job outcome `no_installation`
+  (terminal, never retried). There is **no fallback to a personal token**.
+- A stale `GH_TOKEN` in the env is logged once at startup and ignored.
+- The service refuses to start without the App identity (fail closed).
+
+The integrator verifies against the real App at deploy, after the owner rotates
+this App's keys.
+
 ## Claude Code CLI migration (wave0-neo bounce 1, 2026-08-09) — history only
 
 The old Pi/direct-DeepSeek path and direct-HTTP OpenRouterClient are both gone.

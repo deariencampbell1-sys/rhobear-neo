@@ -107,13 +107,16 @@ class HermesAgent:
     # ------------------------------------------------------------------
 
     @classmethod
-    def from_config(cls, cfg: Config) -> HermesAgent:
+    def from_config(cls, cfg: Config, *, gh_token: str | None = None) -> HermesAgent:
+        """`gh_token` overrides the configured token: production passes the
+        repo's GitHub App installation token so the agent env never carries a
+        personal token (test/pre-App callers use cfg.gh_token)."""
         return cls(
             hermes_bin=cfg.hermes_bin,
             provider=cfg.hermes_provider,
             model=cfg.hermes_model,
             timeout=cfg.deepseek_timeout,
-            gh_token=cfg.gh_token,
+            gh_token=cfg.gh_token if gh_token is None else gh_token,
         )
 
     # ------------------------------------------------------------------

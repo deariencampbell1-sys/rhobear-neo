@@ -18,9 +18,10 @@ def test_clone_keeps_token_out_of_argv_and_config(tmp_path, monkeypatch):
     monkeypatch.setattr(neo_builder, "WORKTREES", tmp_path / "wt")
     monkeypatch.setattr(neo_builder.subprocess, "run", fake_run)
     monkeypatch.setattr(neo_builder, "pr_state", lambda *a: "OPEN\tfeature")
-    cfg = SimpleNamespace(gh_token=TOKEN)
+    # The token is the repo's installation token (here a placeholder); it must
+    # reach the git subprocess env but never an argv or .git/config value.
     try:
-        neo_builder.prepare_worktree(cfg, "acme/app", 7)
+        neo_builder.prepare_worktree(TOKEN, "acme/app", 7)
     except Exception:
         pass  # later steps may need more fakes; the clone calls are what matter
     clone = [c for c in calls if "clone" in c[0]]

@@ -24,6 +24,7 @@ import time
 import concurrent.futures
 
 from . import config as _config
+from .github_app import github_app_for
 from .jobs import Jobs
 from .neo_state import NeoState
 from .neo_worker import run_neo
@@ -42,6 +43,20 @@ RECOVERY_SECS = int(os.environ.get("NEO_WAKE_RECOVERY_SECS", "30"))
 
 def main() -> None:
     cfg = _config.load().require().validate()
+
+    # Neo acts as the customer's GitHub App — a personal GH_TOKEN is never an
+    # identity. Refuse to serve without the App identity (fail closed) and log
+    # once if a stale GH_TOKEN is still in the env (it is ignored).
+    if cfg.gh_token:
+        log.warning("GH_TOKEN is set in the environment but IGNORED — Neo "
+                    "authenticates as the GitHub App (NEO_GITHUB_APP_ID + key)")
+    if github_app_for(cfg) is None:
+        raise RuntimeError(
+            "rhobear-neo missing GitHub App identity — set NEO_GITHUB_APP_ID "
+            "and NEO_GITHUB_APP_KEY_PATH (or NEO_GITHUB_APP_KEY); a personal "
+            "GH_TOKEN is never used as an identity"
+        )
+
     state = NeoState(cfg.database_url)
     state.ensure_schema()
 
@@ -150,8 +165,8 @@ def main() -> None:
     threading.Thread(target=_recovery_loop, daemon=True,
                      name="neo-wake-recovery").start()
 
-    log.info("rhobear-neo up — app_id=%s orgs=%s auto_merge_default=%s max_workers=%s",
-             cfg.__dict__.get("_app_id", "4347986"), ",".join(cfg.orgs),
+    log.info("rhobear-neo up — github_app_id=%s orgs=%s auto_merge_default=%s max_workers=%s",
+             cfg.github_app_id, ",".join(cfg.orgs),
              cfg.auto_merge_default, max_workers)
     serve(cfg, NeoDispatcher(cfg, on_verdict))
 

@@ -62,6 +62,9 @@ class NeoDispatcher:
 
     def dispatch(self, event: str, payload: dict[str, Any], delivery_id: str = "") -> DispatchOutcome:
         repo_full = (payload.get("repository") or {}).get("full_name", "")
+        # The webhook payload carries the App installation id — Neo uses it to
+        # mint this repo's installation token (falling back to a repo lookup).
+        installation_id = (payload.get("installation") or {}).get("id")
         if not repo_full or not self._in_scope(repo_full):
             return DispatchOutcome(204, f"out of scope repo={repo_full!r}")
 
@@ -78,6 +81,7 @@ class NeoDispatcher:
                 "kind": "status", "repo": repo_full, "sha": sha,
                 "context": context, "green": state == "success",
                 "delivery": delivery_id,
+                "installation_id": installation_id,
             })
             return DispatchOutcome(200, f"verdict via status {context}={state} sha={sha[:8]}")
 
@@ -96,6 +100,7 @@ class NeoDispatcher:
                 "kind": "check_run", "repo": repo_full, "sha": sha,
                 "context": name, "green": concl == "success",
                 "pr_number": pr_number, "delivery": delivery_id,
+                "installation_id": installation_id,
             })
             return DispatchOutcome(200, f"verdict via check_run {name}={concl} sha={sha[:8]}")
 

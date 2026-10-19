@@ -45,7 +45,9 @@ log = logging.getLogger("rhobear_neo.jobs")
 
 # Terminal outcomes for resolve().  'failed' is handled by retry() (retryable,
 # goes back to 'queued'); a retryable failure that exhausts max_attempts parks.
-TERMINAL_OUTCOMES = ("done", "no_change", "superseded", "parked")
+# 'no_installation' is terminal: a repo the customer has not installed the
+# GitHub App on is refused, never retried.
+TERMINAL_OUTCOMES = ("done", "no_change", "no_installation", "superseded", "parked")
 
 
 def _new_token() -> str:
