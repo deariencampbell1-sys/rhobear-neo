@@ -78,7 +78,7 @@ class TestHermesAgent:
         cfg.hermes_model = "glm-5.3-flash"
         cfg.gh_token = "fake-token"
 
-        agent = HermesAgent.from_config(cfg)
+        agent = HermesAgent.from_config(cfg, gh_token="fake-token")
         assert agent.hermes_bin == "/fake/hermes"
         assert agent.provider == "zai"
         assert agent.model == "glm-5.3-flash"

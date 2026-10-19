@@ -193,7 +193,7 @@ class TestCommandAssembly:
         cfg.claude_bin = CLAUDE_BIN
         cfg.gh_token = GH_TOKEN
 
-        agent = ClaudeAgent.from_config(cfg)
+        agent = ClaudeAgent.from_config(cfg, gh_token=GH_TOKEN)
         assert agent.claude_bin == CLAUDE_BIN
         assert agent.api_key == API_KEY
         assert agent.base_url == BASE
@@ -573,7 +573,7 @@ class TestConfigMapping:
         cfg.deepseek_key = "sk-test-key"
         cfg.gh_token = GH_TOKEN
         cfg.claude_bin = CLAUDE_BIN
-        agent = ClaudeAgent.from_config(cfg)
+        agent = ClaudeAgent.from_config(cfg, gh_token=GH_TOKEN)
         assert agent.api_key == "sk-test-key"
 
     def test_deepseek_model_mapped(self) -> None:
@@ -583,7 +583,7 @@ class TestConfigMapping:
         cfg.deepseek_model = "deepseek-v4-flash"
         cfg.gh_token = GH_TOKEN
         cfg.claude_bin = CLAUDE_BIN
-        agent = ClaudeAgent.from_config(cfg)
+        agent = ClaudeAgent.from_config(cfg, gh_token=GH_TOKEN)
         assert agent.model == "deepseek-v4-flash"
         assert agent.model == cfg.deepseek_model
 

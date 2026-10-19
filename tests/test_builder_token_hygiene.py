@@ -4,8 +4,15 @@ import subprocess
 from types import SimpleNamespace
 
 from src import neo_builder
+from src.github_app import NoInstallation
 
 TOKEN = "ghs_SECRETtoken123"
+
+
+class _FakeGHApp:
+    """Fake GitHubApp that returns the test token for any repo."""
+    def token_for_repo(self, repo, installation_id=None):
+        return TOKEN
 
 
 def test_clone_keeps_token_out_of_argv_and_config(tmp_path, monkeypatch):
@@ -42,8 +49,10 @@ def test_failed_clone_log_has_no_token(monkeypatch, caplog):
     monkeypatch.setattr(neo_builder, "_db", lambda: None)
     from unittest.mock import MagicMock as MockMagic
     jobs_mock = MockMagic()
+    cfg = SimpleNamespace(gh_token=TOKEN, max_builder_rounds=3)
+    setattr(cfg, "_rhobear_github_app", _FakeGHApp())
     row = {"id": 1, "repo": "acme/app", "pr_number": 7, "head_sha": "a" * 40, "builder_round": 1, "attempt": 1}
     with caplog.at_level(logging.ERROR):
-        neo_builder.dispatch_one(SimpleNamespace(gh_token=TOKEN, max_builder_rounds=3), jobs_mock, row)
+        neo_builder.dispatch_one(cfg, jobs_mock, row)
     assert "worktree prep failed" in caplog.text
     assert TOKEN not in caplog.text

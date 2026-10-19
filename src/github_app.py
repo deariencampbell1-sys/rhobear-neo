@@ -154,36 +154,40 @@ class GitHubApp:
         """The App installation id for `repo` (GET /repos/{owner}/{repo}/installation).
 
         Raises NoInstallation when the repo has no installation (GitHub returns
-        404 for that). Cached with a short TTL.
+        404 for that). Cached with a short TTL.  The HTTP fetch happens OUTSIDE
+        the lock so a slow call does not stall all workers.
         """
         now = self._time() if now is None else now
         with self._lock:
             cached = self._repo_cache.get(repo)
             if cached and now - cached[1] < self._repo_ttl:
                 return cached[0]
-            status, raw = self._api(
-                "GET", f"/repos/{repo}/installation"
+        # Cache miss — fetch outside the lock (concurrent misses for the same
+        # repo may both call the API; that is a minor inefficiency, not a stall).
+        status, raw = self._api(
+            "GET", f"/repos/{repo}/installation"
+        )
+        if status == 404:
+            raise NoInstallation(
+                f"repo {repo} has no GitHub App installation"
             )
-            if status == 404:
-                raise NoInstallation(
-                    f"repo {repo} has no GitHub App installation"
-                )
-            if status != 200:
-                raise GitHubAppError(
-                    f"installation lookup for {repo} failed: HTTP {status}"
-                )
-            data = json.loads(raw)
-            installation_id = int(data["id"])
+        if status != 200:
+            raise GitHubAppError(
+                f"installation lookup for {repo} failed: HTTP {status}"
+            )
+        data = json.loads(raw)
+        installation_id = int(data["id"])
+        with self._lock:
             self._repo_cache[repo] = (installation_id, now)
-            return installation_id
+        return installation_id
 
     def installation_token(
         self, installation_id: int, *, now: float | None = None
     ) -> str:
         """A 1-hour installation token for `installation_id`.
 
-        Cached and refreshed 5 minutes before expiry. Thread-safe (the fetch
-        happens under the lock so a cold cache mints exactly one token).
+        Cached and refreshed 5 minutes before expiry. The HTTP fetch happens
+        OUTSIDE the lock so a slow token-mint does not stall all workers.
         """
         now = self._time() if now is None else now
         inst = int(installation_id)
@@ -191,20 +195,22 @@ class GitHubApp:
             cached = self._token_cache.get(inst)
             if cached and cached[1] - now > self._token_refresh_lead:
                 return cached[0]
-            status, raw = self._api(
-                "POST",
-                f"/app/installations/{inst}/access_tokens",
-                body={},
+        # Cache miss — fetch outside the lock.
+        status, raw = self._api(
+            "POST",
+            f"/app/installations/{inst}/access_tokens",
+            body={},
+        )
+        if status != 201:
+            raise GitHubAppError(
+                f"installation token for {inst} failed: HTTP {status}"
             )
-            if status != 201:
-                raise GitHubAppError(
-                    f"installation token for {inst} failed: HTTP {status}"
-                )
-            data = json.loads(raw)
-            token = str(data["token"])
-            expires = _parse_iso(str(data["expires_at"]))
+        data = json.loads(raw)
+        token = str(data["token"])
+        expires = _parse_iso(str(data["expires_at"]))
+        with self._lock:
             self._token_cache[inst] = (token, expires)
-            return token
+        return token
 
     def token_for_repo(
         self,
@@ -245,6 +251,7 @@ class GitHubApp:
             hdrs.update(headers)
         if body is not None and not isinstance(body, bytes):
             body = json.dumps(body).encode("utf-8")
+            hdrs["Content-Type"] = "application/json"
         try:
             return self._http(method, path, hdrs, body)
         except GitHubAppError:
@@ -294,22 +301,19 @@ def github_app_for(cfg) -> GitHubApp | None:
 def repo_token(cfg, repo: str, installation_id: int | None = None) -> str:
     """The installation token to use when acting on `repo`.
 
-    Uses the GitHub App when configured; otherwise falls back to
-    `cfg.gh_token`. The fallback exists ONLY for the pre-App unit tests that
-    pass a placeholder token via cfg.gh_token and assert the token-propagation
-    mechanism — production always configures the App (startup refuses to serve
-    without it), so a personal token can never be used as an identity here.
+    Every GitHub action for a repo uses THAT repo's installation token
+    (minted by the GitHub App).  There is NO fallback to a personal token:
+    a repo with no installation raises NoInstallation (terminal).  A cfg
+    with no App identity raises AppNotConfigured.
 
-    Raises NoInstallation (repo not installed) or AppNotConfigured (no
-    identity at all) — both fail closed, never a personal-token fallback in
-    production.
+    Callers that need a token for tests inject a fake GitHubApp (set it on
+    the cfg via the `_rhobear_github_app` attribute or a fixture) instead
+    of relying on cfg.gh_token — that field is ignored as an identity.
     """
     app = github_app_for(cfg)
-    if app is not None:
-        return app.token_for_repo(repo, installation_id=installation_id)
-    token = str(getattr(cfg, "gh_token", "") or "").strip()
-    if not token:
+    if app is None:
         raise AppNotConfigured(
-            f"no GitHub identity for {repo} (GitHub App not configured)"
+            f"no GitHub identity for {repo} (GitHub App not configured; "
+            "personal GH_TOKEN is never used as an identity)"
         )
-    return token
+    return app.token_for_repo(repo, installation_id=installation_id)

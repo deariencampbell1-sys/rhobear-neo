@@ -252,7 +252,7 @@ class TestTokenCache:
 # ---------------------------------------------------------------------------
 
 class TestThreadSafety:
-    def test_concurrent_token_fetch_mints_once(self, rsa_key):
+    def test_concurrent_token_fetch_all_get_same_token(self, rsa_key):
         clock = FakeClock()
         http = FakeGitHubHTTP(installations={"acme/a": 111}, clock=clock)
         app = _make_app(rsa_key, http)
@@ -270,9 +270,11 @@ class TestThreadSafety:
             t.join(timeout=10)
         assert len(results) == 8
         assert set(results) == {"ghs_tok_111"}
-        # One installation GET + exactly ONE token POST despite 8 racers.
+        # The HTTP fetch happens OUTSIDE the lock now (fix 5), so concurrent
+        # misses may each call the API.  The important guarantee is that every
+        # thread gets the same valid token — not that only one POST was made.
         posts = [c for c in http.calls if c[0] == "POST"]
-        assert len(posts) == 1
+        assert len(posts) >= 1
 
 
 # ---------------------------------------------------------------------------
@@ -518,6 +520,67 @@ class TestWorkerWiring:
         pr_state.assert_not_called()
         jobs.resolve.assert_called_once()
         assert jobs.resolve.call_args[0][1] == "no_installation"
+
+    def test_review_evidence_runs_with_fake_gh(self, rsa_key):
+        """_review_evidence runs for real with a fake gh subprocess.
+
+        The review finding says all existing tests patch _review_evidence out;
+        this one exercises the actual function (trusted_contexts lookup,
+        status fetch, rollup_green computation) against fake gh output.
+        """
+        from src.neo_worker import _review_evidence, _gh
+        import subprocess
+
+        cfg = _cfg_with_app(rsa_key, FakeGitHubHTTP(installations={}))
+
+        def fake_gh(token, *args, **kw):
+            if args[:3] == ("pr", "view", str(5)):
+                # Return a PR with no reviews, no statusCheckRollup
+                data = {
+                    "headRefOid": SHA1,
+                    "reviews": [],
+                    "statusCheckRollup": [],
+                }
+                return 0, json.dumps(data)
+            if args[:3] == ("api", f"repos/acme/a/commits/{SHA1}/status",):
+                data = {"state": "success", "statuses": [
+                    {"context": "rhobear-reviews", "state": "success"},
+                ]}
+                return 0, json.dumps(data)
+            raise AssertionError(f"unexpected _gh call: {args}")
+
+        with patch("src.neo_worker._gh", side_effect=fake_gh):
+            ev = _review_evidence("tok", cfg, "acme/a", 5, SHA1)
+        assert ev["ok"] is True
+        assert ev["decided_sha"] == SHA1
+        assert ev["head_sha"] == SHA1
+        assert ev["review_bound_ok"] is True  # no reviews -> bound is vacuously ok
+        assert ev["trusted_green"] is True
+        # Empty statusCheckRollup -> rollup_green is None (no data),
+        # which is correct: there is no rollup to judge.
+        assert ev["rollup_green"] is None
+        assert ev["failing_checks"] == 0
+
+    def test_review_evidence_no_trusted_contexts(self, rsa_key):
+        """_review_evidence returns ok=False when no trusted contexts are configured."""
+        from src.neo_worker import _review_evidence
+
+        cfg = _cfg_with_app(rsa_key, FakeGitHubHTTP(installations={}))
+        cfg.trusted_review_contexts = ()  # empty
+
+        def fake_gh(token, *args, **kw):
+            if args[:3] == ("pr", "view", str(5)):
+                data = {"headRefOid": SHA1, "reviews": [], "statusCheckRollup": []}
+                return 0, json.dumps(data)
+            if args[:3] == ("api", f"repos/acme/a/commits/{SHA1}/status",):
+                data = {"state": "success", "statuses": []}
+                return 0, json.dumps(data)
+            raise AssertionError(f"unexpected _gh call: {args}")
+
+        with patch("src.neo_worker._gh", side_effect=fake_gh):
+            ev = _review_evidence("tok", cfg, "acme/a", 5, SHA1)
+        assert ev["ok"] is False
+        assert ev["reason"] == "no trusted review contexts configured"
 
 
 # ---------------------------------------------------------------------------
