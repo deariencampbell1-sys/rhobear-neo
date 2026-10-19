@@ -573,8 +573,11 @@ class TestIdempotencyGate:
                     ],
                 }
                 return 0, _json.dumps(data)
-            if args[:3] == ("pr", "merge", "5"):
-                return 0, "Merge successful"
+            if args and args[0] == "api" and len(args) > 3 and \
+                    args[3] == "repos/o/r/pulls/5/merge":
+                # REST merge API with sha — GitHub rejects if the head moved.
+                assert f"sha={SHA1}" in args, args
+                return 0, _json.dumps({"merged": True, "sha": "M" * 40})
             raise AssertionError(f"unexpected merge _gh call: {args}")
 
         from src.neo_worker import run_neo
@@ -1058,3 +1061,200 @@ class TestE2EEscalationPG:
         reasons = [r[0]["reason"] for r in parked if isinstance(r[0], dict) and "reason" in r[0]]
         assert reasons, parked
         assert "bounced again" in reasons[-1]
+
+
+# ---------------------------------------------------------------------------
+# FIX ROUND 3 — the five review defects (real Postgres where the fix touches
+# neo_actions / neo_jobs)
+# ---------------------------------------------------------------------------
+
+class TestAlreadyEscalatedPG:
+    """Defect 1 — already_escalated counts only GENUINE advisor escalations
+    (detail->'advisor_round' present).  Overloaded phase='escalated' rows (the
+    agent's canonical ESCALATE verdict, the old out-of-credits marker) must
+    NOT lock the PR out of builder/escalation automation."""
+
+    def test_escalate_verdict_without_advisor_round_is_not_escalation(self, db):
+        state = NeoState(DSN)
+        state.record("o/r", 71, SHA1, "escalated", verdict="ESCALATE",
+                     detail={"reason": "owner-proxy handoff"})
+        assert state.already_escalated("o/r", 71) is False
+
+    def test_genuine_advisor_escalation_is_escalation(self, db):
+        state = NeoState(DSN)
+        state.record("o/r", 72, SHA1, "escalated", verdict="ESCALATE",
+                     builder_round=6,
+                     detail={"reason": "escalated to frontier advisor",
+                             "advisor_round": 6})
+        assert state.already_escalated("o/r", 72) is True
+
+    def test_out_of_credits_records_parked_not_escalated(self, db):
+        """The out-of-credits gate records phase='parked' (with the reason),
+        never phase='escalated' — so a later top-up + new head can still
+        bounce through builder/escalation automation."""
+        jobs = db
+        state = NeoState(DSN)
+        cfg = _cfg()
+        cfg.max_builder_rounds = 5
+        state.install("o", "o")
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute(
+                "UPDATE neo_installs SET plan='starter', credits_balance=0 "
+                "WHERE install_id='o'")
+        wake = {"repo": "o/r", "sha": SHA1, "green": False,
+                "context": "rhobear-reviews", "pr_number": 73}
+        from src.neo_worker import run_neo
+        with patch("src.neo_worker.resolve_pr", return_value=73), \
+             patch("src.neo_worker._review_evidence", return_value=_evidence(SHA1)), \
+             patch("src.neo_worker._jev_for_pr",
+                   return_value=JevAssessment(False, reason="no key")), \
+             patch("src.neo_worker._run_agent") as agent, \
+             patch("src.neo_worker._gh", return_value=(0, "ok")):
+            run_neo(cfg, state, jobs, wake)
+        agent.assert_not_called()
+        with psycopg.connect(DSN, autocommit=True) as c:
+            parked = c.execute(
+                "SELECT COUNT(*) FROM neo_actions WHERE phase='parked' "
+                "AND repo='o/r' AND pr_number=73").fetchone()[0]
+            esc = c.execute(
+                "SELECT COUNT(*) FROM neo_actions WHERE phase='escalated' "
+                "AND repo='o/r' AND pr_number=73").fetchone()[0]
+        assert parked == 1, "out-of-credits marker must be phase='parked'"
+        assert esc == 0, "out-of-credits must NOT be phase='escalated'"
+        assert state.already_escalated("o/r", 73) is False
+
+
+class TestEscalatingPhaseInRecoveryGatePG:
+    """Defect 2 — the crash-recovery per-SHA gate recognizes phase='escalating'
+    too.  If run_neo crashes after submit_escalation but before the triage
+    marker, a re-delivered wake must restore the marker WITHOUT re-running the
+    agent or re-submitting to the advisor (which would mint a second advice
+    and burn a frontier slot)."""
+
+    def test_escalating_phase_restores_triage_without_rerun(self, db):
+        jobs = db
+        state = NeoState(DSN)
+        cfg = _cfg()
+        cfg.bounces_before_escalation = 5
+        cfg.advisor_url = "http://127.0.0.1:9"
+        cfg.advisor_token = "test-token"
+        pr = 74
+        sha = "c" * 40
+        # Simulate the crash: submit_escalation recorded the escalating row
+        # but run_neo died before writing the triage marker.
+        state.record("o/r", pr, sha, "escalating", verdict="ESCALATE",
+                     detail={"advice_id": "advice-crash", "installation_id": 3})
+        wake = {"repo": "o/r", "sha": sha, "green": False,
+                "context": "rhobear-reviews", "pr_number": pr}
+        from src.neo_worker import run_neo
+        agent_calls: list = []
+
+        def fake_agent(agent, brief):
+            agent_calls.append(1)
+            return {"input_tokens": 1, "output_tokens": 1}, "BOUNCE-BUILDER"
+
+        with patch("src.neo_worker.resolve_pr", return_value=pr), \
+             patch("src.neo_worker._review_evidence", return_value=_evidence(sha)), \
+             patch("src.neo_worker._jev_for_pr",
+                   return_value=JevAssessment(False, reason="no key")), \
+             patch("src.neo_worker._run_agent", side_effect=fake_agent), \
+             patch("src.escalation._post_advise",
+                   side_effect=AssertionError("must not re-submit to advisor")):
+            run_neo(cfg, state, jobs, wake)
+        assert agent_calls == [], "agent must not re-run for an escalating SHA"
+        with psycopg.connect(DSN, autocommit=True) as c:
+            esc = c.execute(
+                "SELECT COUNT(*) FROM neo_actions WHERE phase='escalating' "
+                "AND repo='o/r' AND pr_number=%s", (pr,)).fetchone()[0]
+            tri = c.execute(
+                "SELECT COUNT(*) FROM neo_actions WHERE phase='triage' "
+                "AND repo='o/r' AND pr_number=%s", (pr,)).fetchone()[0]
+        assert esc == 1, "the existing escalating row must survive the gate"
+        assert tri == 1, "triage marker restored (recovery loop can finish)"
+
+
+class TestTakeEscalationPG:
+    """Defect 3 — take_escalation deletes ONLY the advice it handled, and only
+    when that advice is still the NEWEST escalation for the PR.  A newer
+    escalation (new head bounced while the old advice was still queued) is
+    never deleted and the stale advice is dropped without creating a round."""
+
+    def test_older_advice_superseded_is_dropped(self, db):
+        state = NeoState(DSN)
+        state.record("o/r", 75, SHA1, "escalating", verdict="ESCALATE",
+                     detail={"advice_id": "advice-A", "installation_id": 1})
+        state.record("o/r", 75, SHA2, "escalating", verdict="ESCALATE",
+                     detail={"advice_id": "advice-B", "installation_id": 1})
+        # A is no longer the newest -> dropped (return False), never a round.
+        assert state.take_escalation("o/r", 75, "advice-A") is False
+        with psycopg.connect(DSN, autocommit=True) as c:
+            remaining = [r[0] for r in c.execute(
+                "SELECT detail->>'advice_id' FROM neo_actions "
+                "WHERE repo='o/r' AND pr_number=75 AND phase='escalating' "
+                "ORDER BY id").fetchall()]
+        assert remaining == ["advice-B"], remaining
+
+    def test_newest_advice_is_consumed(self, db):
+        state = NeoState(DSN)
+        state.record("o/r", 76, SHA1, "escalating", verdict="ESCALATE",
+                     detail={"advice_id": "advice-A", "installation_id": 1})
+        state.record("o/r", 76, SHA2, "escalating", verdict="ESCALATE",
+                     detail={"advice_id": "advice-B", "installation_id": 1})
+        # B is the newest -> consumed (True), both its rows removed.
+        assert state.take_escalation("o/r", 76, "advice-B") is True
+        with psycopg.connect(DSN, autocommit=True) as c:
+            remaining = c.execute(
+                "SELECT COUNT(*) FROM neo_actions WHERE repo='o/r' "
+                "AND pr_number=76 AND phase='escalating'").fetchone()[0]
+        assert remaining == 0, remaining
+
+    def test_unknown_advice_leaves_rows_untouched(self, db):
+        state = NeoState(DSN)
+        state.record("o/r", 77, SHA1, "escalating", verdict="ESCALATE",
+                     detail={"advice_id": "advice-A", "installation_id": 1})
+        assert state.take_escalation("o/r", 77, "advice-ghost") is False
+        with psycopg.connect(DSN, autocommit=True) as c:
+            remaining = c.execute(
+                "SELECT COUNT(*) FROM neo_actions WHERE repo='o/r' "
+                "AND pr_number=77 AND phase='escalating'").fetchone()[0]
+        assert remaining == 1, remaining
+
+
+class TestEscalationInstallationIdPG:
+    """Defect 4 — the NEWEST escalating row (the one escalating_prs() hands to
+    the recovery loop) carries the webhook installation_id, so the escalated
+    round uses the id Neo already had instead of a repo->installation lookup."""
+
+    def _bounce(self, jobs, state, cfg, sha, pr, installation_id=None):
+        from src.neo_worker import run_neo
+        wake = {"repo": "o/r", "sha": sha, "green": False,
+                "context": "rhobear-reviews", "pr_number": pr}
+        if installation_id is not None:
+            wake["installation_id"] = installation_id
+        with patch("src.neo_worker.resolve_pr", return_value=pr), \
+             patch("src.neo_worker._review_evidence", return_value=_evidence(sha)), \
+             patch("src.neo_worker._jev_for_pr",
+                   return_value=JevAssessment(False, reason="no key")), \
+             patch("src.neo_worker._compute_diff_stat", return_value=""), \
+             patch("src.neo_worker._run_agent",
+                   return_value=({"input_tokens": 1, "output_tokens": 1},
+                                 "BOUNCE-BUILDER still broken")):
+            run_neo(cfg, state, jobs, wake)
+
+    def test_escalating_phase_row_carries_installation_id(self, db):
+        jobs = db
+        state = NeoState(DSN)
+        cfg = _cfg()
+        cfg.bounces_before_escalation = 5
+        cfg.advisor_url = "http://127.0.0.1:9"
+        cfg.advisor_token = "test-token"
+        pr = 78
+        for i in range(5):
+            self._bounce(jobs, state, cfg, f"{i:040d}", pr)
+        assert state.builder_rounds("o/r", pr) == 5
+        with patch("src.escalation._post_advise", return_value="advice-inst-1"):
+            self._bounce(jobs, state, cfg, "c" * 40, pr, installation_id=11)
+        pr_rows = [r for r in state.escalating_prs() if r["pr"] == pr]
+        assert pr_rows, "PR must be escalating"
+        assert pr_rows[0]["advice_id"] == "advice-inst-1", pr_rows
+        assert pr_rows[0]["installation_id"] == 11, pr_rows

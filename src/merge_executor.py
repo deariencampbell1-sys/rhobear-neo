@@ -58,18 +58,21 @@ def merge(
     evidence: dict,
     token: str,
 ) -> dict:
-    """Merge `pr` in `repo` at `expected_sha`.
+    """Merge `pr` in `repo` at `expected_sha` via the GitHub REST merge API.
 
     Steps:
       1. Re-read the PR head (headRefOid) from GitHub.
       2. If it does not match `expected_sha`, raise HeadMoved.
-      3. Call `gh pr merge --squash --delete-branch` with `--expected-head
-         <sha>`.
+      3. Call the merge API
+         (PUT /repos/{repo}/pulls/{pr}/merge) with `sha=expected_sha` —
+         GitHub rejects the merge if the head changed between our re-read
+         and the merge call.
       4. Record the merge result and return it.
 
-    Returns `{"merged": True, "sha": <merge_commit_sha>}` on success.
+    Returns `{"merged": True, "sha": <head_sha>}` on success.
 
-    Raises MergeError subclasses on failure.
+    Raises MergeError subclasses on failure.  This is the ONLY code path that
+    merges; no agent prompt runs `gh pr merge`.
     """
     # --- Step 1: Re-read the PR head ---------------------------------------
     rc, raw = _gh(
@@ -107,24 +110,35 @@ def merge(
         raise MergeDenied(f"evidence unavailable ({evidence.get('reason', 'unknown')})")
 
     # --- Step 4: Execute the merge -----------------------------------------
-    # Use gh pr merge --squash --delete-branch.  The --expected-head flag
-    # makes GitHub reject the merge if the head changed between our re-read
-    # and the merge call.
+    # REST merge API with sha=expected_sha: GitHub rejects with 422 if the
+    # head no longer matches, closing the race between re-read and merge.
     merge_args = [
-        "pr", "merge", str(pr), "-R", repo,
-        "--squash",
-        "--delete-branch",
+        "api", "-X", "PUT",
+        f"repos/{repo}/pulls/{pr}/merge",
+        "-f", "merge_method=squash",
+        "-f", f"sha={expected_sha}",
+        "-f", "delete_branch=true",
     ]
-
     rc, out = _gh(token, *merge_args, timeout=60)
 
     if rc != 0:
         error_msg = out[:300] if out else "unknown error"
-        if "required" in error_msg.lower() or "protection" in error_msg.lower():
+        low = error_msg.lower()
+        if "required" in low or "protection" in low:
             raise MergeDenied(f"GitHub refused merge: {error_msg}")
+        if "sha" in low and ("does not match" in low or "not the head" in low
+                             or "provided sha" in low or "head" in low):
+            raise HeadMoved(f"GitHub rejected merge — head moved: {error_msg}")
         raise MergeFailed(f"merge API call failed (exit={rc}): {error_msg}")
 
-    log.info("merged %s#%s at %s: %s", repo, pr, expected_sha[:12], out[:200])
+    try:
+        result = json.loads(out)
+    except (TypeError, ValueError):
+        result = {}
+    if not result.get("merged"):
+        raise MergeFailed(f"GitHub returned no merge confirmation: {out[:200]}")
+
+    log.info("merged %s#%s at %s", repo, pr, expected_sha[:12])
 
     return {
         "merged": True,
