@@ -228,7 +228,15 @@ def run_neo(cfg: Config, state: NeoState, wake: dict) -> None:
             "--body", "Neo: this install is out of credits — top up to resume auto-fix/merge.")
         log.info("%s#%s: install out of credits — gated", repo, pr)
         return
-    install_auto_merge = bool(inst.get("auto_merge") or cfg.auto_merge_default)
+    # P0 hotfix: nullable inheritance for auto-merge.
+    #   None  → inherit from global default (cfg.auto_merge_default)
+    #   False → explicit false wins (does NOT inherit)
+    #   True  → explicit true wins
+    inst_auto_merge = inst.get("auto_merge")
+    if inst_auto_merge is None:
+        install_auto_merge = bool(cfg.auto_merge_default)
+    else:
+        install_auto_merge = bool(inst_auto_merge)
 
     # --- exact-SHA evidence (Phase A) --------------------------------------
     # The wake carries the SHA the reviewer's status belongs to. If the PR head
