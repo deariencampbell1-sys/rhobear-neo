@@ -39,10 +39,19 @@ import psycopg
 import pytest
 
 from src.config import Config
-from src.github_app import NoInstallation
+from src.github_app import NoInstallation, AppNotConfigured
 from src.jobs import Jobs
 from src.neo_state import NeoState
 from src.jev_review import JevAssessment
+
+
+class _FakeGitHubApp:
+    """Fake GitHubApp that returns a fixed token for any repo."""
+    def __init__(self, token="test-ghs-token"):
+        self._token = token
+
+    def token_for_repo(self, repo, installation_id=None):
+        return self._token
 
 DSN = os.environ.get("NEO_TEST_DSN", "")
 
@@ -75,6 +84,8 @@ def _cfg() -> Config:
     cfg.max_builder_rounds = 2
     cfg.auto_merge_default = False
     cfg.deepseek_timeout = 60
+    # Inject a fake GitHubApp so repo_token works (no personal-token fallback).
+    setattr(cfg, "_rhobear_github_app", _FakeGitHubApp("test-ghs-token"))
     return cfg
 
 

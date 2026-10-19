@@ -27,7 +27,7 @@ from .config import Config
 from .jobs import Jobs
 from .neo_state import NeoState
 from .agent_claude import ClaudeAgent, AgentError
-from .github_app import AppNotConfigured, NoInstallation, repo_token
+from .github_app import AppNotConfigured, GitHubAppError, NoInstallation, repo_token
 from . import neo_protocol
 from .jev_review import JevAssessment, assess as jev_assess
 
@@ -90,7 +90,7 @@ def _is_trusted(context: str, trusted: tuple[str, ...]) -> bool:
     return any(context == c or context.startswith(c) for c in trusted)
 
 
-def _review_evidence(token: str, repo: str, pr: int, sha: str) -> dict:
+def _review_evidence(token: str, cfg: Config, repo: str, pr: int, sha: str) -> dict:
     """Machine-readable review evidence bound to ONE commit, not to the PR.
 
     A result produced for commit A may authorize only commit A. What is
@@ -293,6 +293,18 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict) -> None:
             jobs.resolve(job_id, "no_installation", worker_token=wtoken,
                          payload={"reason": f"no GitHub App installation for {repo}"})
         return
+    except GitHubAppError as exc:
+        # Transient GitHub API failure (5xx, timeout, token-mint error).
+        # Before the claim, nothing else would release this job — its
+        # submitted_at stamp hides it from the sweep.  Release it retryably.
+        log.warning("transient GitHub error for %s@%s: %s — job released retryably",
+                    repo, sha[:8], exc)
+        wtoken = secrets.token_hex(16)
+        if jobs.claim(job_id, pr_number=wake.get("pr_number"),
+                      lease_secs=_wake_lease(cfg), worker_token=wtoken):
+            jobs.retry(job_id, worker_token=wtoken,
+                       reason=f"transient GitHub identity error ({type(exc).__name__})")
+        return
 
     try:
         pr = resolve_pr(token, repo, sha, wake.get("pr_number"))
@@ -388,7 +400,7 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict) -> None:
         install_auto_merge = bool(inst_auto_merge)
 
     # --- exact-SHA evidence (Phase A) --------------------------------------
-    evidence = _review_evidence(token, repo, pr, sha)
+    evidence = _review_evidence(token, cfg, repo, pr, sha)
     if evidence.get("ok") and evidence.get("head_sha") and evidence["head_sha"] != sha:
         state.record(repo, pr, sha, "stale_head", verdict="STALE",
                      detail={"context": wake.get("context"),

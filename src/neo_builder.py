@@ -45,6 +45,7 @@ from .agent_hermes import AgentError, HermesAgent, MissingResult, NonZeroExit
 from .config import Config
 from .github_app import (
     AppNotConfigured,
+    GitHubAppError,
     NoInstallation,
     github_app_for,
     repo_token,
@@ -356,6 +357,13 @@ def dispatch_one(cfg: Config, jobs: Jobs, row: dict) -> None:
         jobs.resolve(row["id"], "no_installation", worker_token=wtoken,
                      payload={"reason": f"no GitHub App installation for {repo}"})
         return
+    except GitHubAppError as exc:
+        # Transient GitHub API failure (5xx, timeout, token-mint error).
+        # Leave the job running for lease recovery — never resolve a transient
+        # failure as terminal.
+        log.warning("transient GitHub error for %s#%s: %s — job stays running "
+                    "(lease recovery)", repo, pr, exc)
+        return
 
     state = pr_state(token, repo, pr).split("\t")[0]
     if state.upper() == "CLOSED" or state.upper() == "MERGED":
@@ -532,7 +540,7 @@ def main() -> int:
                                     exclude_keys=inflight_keys)
             if not row:
                 break
-            repo, pr, sha = row["repo"], row["pr_number"], row["head_sha"]
+            repo, pr = row["repo"], row["pr_number"]
             round_ = int(row["builder_round"] or 0)
 
             # Defense in depth: a claim that slipped through (e.g. a row that
@@ -578,6 +586,13 @@ def main() -> int:
                 jobs.resolve(row["id"], "no_installation",
                              worker_token=row.get("worker_token"),
                              payload={"reason": f"no GitHub App installation for {repo}"})
+                continue
+            except GitHubAppError as exc:
+                # Transient GitHub API failure (5xx, timeout, token-mint error).
+                # Leave the job running for lease recovery — never resolve a
+                # transient failure as terminal.
+                log.warning("transient GitHub error for %s#%s: %s — job stays "
+                            "running (lease recovery)", repo, pr, exc)
                 continue
 
             # Check PR is still open (defect 2 fix: empty = transient, retry;

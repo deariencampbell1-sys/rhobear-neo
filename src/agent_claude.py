@@ -116,13 +116,12 @@ class ClaudeAgent:
     # ------------------------------------------------------------------
 
     @classmethod
-    def from_config(cls, cfg: Config, *, gh_token: str | None = None) -> ClaudeAgent:
+    def from_config(cls, cfg: Config, *, gh_token: str) -> ClaudeAgent:
         """Build from a Config object.
 
-        `gh_token` overrides the configured token: production passes the
-        repo's GitHub App installation token so the agent's GH_TOKEN env is
-        never a personal token. Omitted in tests / pre-App callers, where
-        cfg.gh_token (a placeholder) is used.
+        `gh_token` is REQUIRED: production passes the repo's GitHub App
+        installation token so the agent's GH_TOKEN env is never a personal
+        token.  The cfg.gh_token field is ignored as an identity.
         """
         return cls(
             claude_bin=cfg.claude_bin,
@@ -132,7 +131,7 @@ class ClaudeAgent:
             effort=cfg.deepseek_reasoning_effort,
             max_tokens=cfg.deepseek_max_tokens,
             timeout=cfg.deepseek_timeout,
-            gh_token=cfg.gh_token if gh_token is None else gh_token,
+            gh_token=gh_token,
         )
 
     # ------------------------------------------------------------------

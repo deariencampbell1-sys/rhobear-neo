@@ -37,6 +37,19 @@ from unittest.mock import MagicMock, patch, ANY
 import pytest
 
 from src.jobs import Jobs, SCHEMA as JOBS_SCHEMA, INDEXES, MIGRATION, TERMINAL_OUTCOMES
+from src.github_app import repo_token as _real_repo_token
+
+
+@pytest.fixture(autouse=True)
+def _patch_repo_token():
+    """All tests in this file use MagicMock(spec=Jobs) for jobs and don't
+    need a real GitHubApp.  Patch repo_token to return a dummy token so the
+    removal of the personal-token fallback doesn't break them."""
+    def fake_repo_token(cfg, repo, installation_id=None):
+        return "test-ghs-token"
+    with patch("src.neo_worker.repo_token", side_effect=fake_repo_token), \
+         patch("src.neo_builder.repo_token", side_effect=fake_repo_token):
+        yield
 from src.neo_builder import (
     BuilderAgent, build_brief, pr_state, dispatch_one, gh,
     WORKTREES, BRIEFS, CONCURRENCY, POLL_SECS,
