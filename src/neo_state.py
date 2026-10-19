@@ -42,6 +42,9 @@ CREATE TABLE IF NOT EXISTS neo_installs (
 
 @dataclass
 class NeoState:
+    """Thread-safe Postgres state store. Every method opens a fresh
+    psycopg.connect(dsn, autocommit=True) — no shared connection, cursor, or
+    mutable state. Safe to call from concurrent ThreadPoolExecutor threads."""
     dsn: str
 
     def _conn(self):
@@ -62,13 +65,28 @@ class NeoState:
             ).fetchone()
         return int(row[0] or 0)
 
-    def already_acted(self, repo: str, pr: int, head_sha: str, phase: str) -> bool:
+    def already_acted(self, repo: str, pr: int, head_sha: str, phase: str,
+                      green: bool | None = None) -> bool:
+        """Dedup guard. When `green` is given, only a prior action recorded for
+        the SAME verdict color counts as already-acted: a green verdict arriving
+        after a red triage of the same head (the reviewer re-ran and passed it)
+        is new decision input and must be triaged again. Rows with no recorded
+        color predate the field and count as red, so a first green wake still
+        re-triggers. `green=None` keeps the old any-phase behavior."""
         with self._conn() as c:
-            row = c.execute(
-                "SELECT 1 FROM neo_actions WHERE repo=%s AND pr_number=%s "
-                "AND head_sha=%s AND phase=%s LIMIT 1",
-                (repo, pr, head_sha, phase),
-            ).fetchone()
+            if green is None:
+                row = c.execute(
+                    "SELECT 1 FROM neo_actions WHERE repo=%s AND pr_number=%s "
+                    "AND head_sha=%s AND phase=%s LIMIT 1",
+                    (repo, pr, head_sha, phase),
+                ).fetchone()
+            else:
+                row = c.execute(
+                    "SELECT 1 FROM neo_actions WHERE repo=%s AND pr_number=%s "
+                    "AND head_sha=%s AND phase=%s "
+                    "AND COALESCE((detail->>'green')::boolean, false) = %s LIMIT 1",
+                    (repo, pr, head_sha, phase, bool(green)),
+                ).fetchone()
         return row is not None
 
     def record(self, repo: str, pr: int, head_sha: str, phase: str, *,
@@ -81,6 +99,16 @@ class NeoState:
                 (repo, pr, head_sha, phase, builder_round, verdict, credits,
                  json.dumps(detail or {})),
             )
+
+    def clear(self, repo: str, pr: int, head_sha: str, phase: str) -> int:
+        """Remove a phase marker so the next wake for this head re-runs it."""
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM neo_actions WHERE repo=%s AND pr_number=%s "
+                "AND head_sha=%s AND phase=%s",
+                (repo, pr, head_sha, phase),
+            )
+            return cur.rowcount
 
     # --- per-install settings + credits ------------------------------------
     def install(self, install_id: str, org: str) -> dict:

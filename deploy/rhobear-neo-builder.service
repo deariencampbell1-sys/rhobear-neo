@@ -1,0 +1,16 @@
+# /etc/systemd/system/rhobear-neo-builder.service
+[Unit]
+Description=rhobear-neo builder lane - dispatches BOUNCE-BUILDER fixes via Hermes
+After=rhobear-neo.service
+
+[Service]
+User=slang
+WorkingDirectory=/opt/rhobear/rhobear-neo
+EnvironmentFile=/opt/rhobear/rhobear-neo/.env
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/opt/rhobear/rhobear-neo/.venv/bin
+ExecStart=/opt/rhobear/rhobear-neo/.venv/bin/python -m src.neo_builder
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

@@ -26,6 +26,7 @@ from .config import Config
 from .neo_state import NeoState
 from .agent_claude import ClaudeAgent, AgentError
 from . import neo_protocol
+from .jev_review import JevAssessment, assess as jev_assess
 
 log = logging.getLogger("rhobear_neo.worker")
 
@@ -73,6 +74,126 @@ def credits_for(usage: dict, builder: bool) -> int:
     return int(cost * MARGIN * CREDITS_PER_USD)
 
 
+def _trusted_contexts(cfg: Config) -> tuple[str, ...]:
+    """Contexts whose status is the reviewer's own gate (config-driven)."""
+    raw = getattr(cfg, "trusted_review_contexts", ()) or ()
+    if isinstance(raw, str):
+        raw = [c.strip() for c in raw.split(",") if c.strip()]
+    return tuple(str(c) for c in raw)
+
+
+def _is_trusted(context: str, trusted: tuple[str, ...]) -> bool:
+    return any(context == c or context.startswith(c) for c in trusted)
+
+
+def _review_evidence(cfg: Config, repo: str, pr: int, sha: str) -> dict:
+    """Machine-readable review evidence bound to ONE commit, not to the PR.
+
+    A result produced for commit A may authorize only commit A. What is
+    genuinely SHA-bound here is the trusted review commit-status: GitHub stores
+    it against an immutable commit. Formal review objects are context — the
+    reviewer's own objects carry `commit_id: null`, so when a commit_id IS
+    present it must match, and when it is absent the status carries the binding.
+    """
+    try:
+        rc, raw = _gh(cfg, "pr", "view", str(pr), "-R", repo,
+                      "--json", "headRefOid,reviews,statusCheckRollup", timeout=45)
+    except Exception as exc:  # noqa: BLE001 — fail closed, never strand the wake
+        return {"ok": False, "reason": f"evidence read failed ({type(exc).__name__})",
+                "decided_sha": sha}
+    if rc != 0:
+        return {"ok": False, "reason": "pr view unavailable", "decided_sha": sha}
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return {"ok": False, "reason": "pr view malformed", "decided_sha": sha}
+
+    head = str(data.get("headRefOid") or "")
+    reviews = data.get("reviews") or []
+    review_sha = next((str(r.get("commit_id") or "") for r in reversed(reviews)
+                       if r.get("body")), "")
+
+    # The reviewer's gate, read straight off the commit.
+    trusted = _trusted_contexts(cfg)
+    trusted_states: list[str] = []
+    try:
+        rc, raw_status = _gh(cfg, "api", f"repos/{repo}/commits/{sha}/status", timeout=30)
+        if rc == 0:
+            for item in (json.loads(raw_status).get("statuses") or []):
+                if _is_trusted(str(item.get("context") or ""), trusted):
+                    trusted_states.append(str(item.get("state") or "").lower())
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"status read failed ({type(exc).__name__})",
+                "decided_sha": sha}
+    if not trusted:
+        return {"ok": False, "reason": "no trusted review contexts configured",
+                "decided_sha": sha}
+
+    rollup = data.get("statusCheckRollup") or []
+    failing = [c for c in rollup
+               if str(c.get("conclusion") or "").upper() in {"FAILURE", "TIMED_OUT", "CANCELLED"}
+               or str(c.get("state") or "").upper() in {"FAILURE", "ERROR"}]
+    return {
+        "ok": True,
+        "decided_sha": sha,
+        "head_sha": head,
+        "review_sha": review_sha,
+        # A nil commit_id is the reviewer's normal shape; a present-but-different
+        # one is evidence about another commit and must not authorize this one.
+        "review_bound_ok": (not review_sha) or review_sha == sha or review_sha.startswith(sha),
+        "trusted_states": trusted_states,
+        "trusted_green": bool(trusted_states) and all(s == "success" for s in trusted_states),
+        # Informational only: this repo's inherited CI wall is red on every PR.
+        "failing_checks": len(failing),
+    }
+
+
+def merge_authority(install_auto_merge: bool, evidence: dict,
+                    jev: JevAssessment) -> tuple[bool, str]:
+    """Exact-SHA merge authority. Fails closed; never a veto by adjective."""
+    if not install_auto_merge:
+        return False, "auto-merge disabled for this install"
+    if not evidence.get("ok"):
+        return False, f"review evidence unavailable ({evidence.get('reason')})"
+    if evidence.get("head_sha") != evidence.get("decided_sha"):
+        return False, "head moved since the wake — stale evidence cannot authorize this SHA"
+    if not evidence.get("review_bound_ok", True):
+        return False, "the reviewed commit is not this head SHA"
+    if not evidence.get("trusted_green"):
+        return False, "the trusted review status is not success on this exact head SHA"
+    blockers = jev.blockers
+    if blockers:
+        return False, "Jev blocking findings: " + ",".join(f.rule for f in blockers)
+    return True, "exact-head evidence complete"
+
+
+def _jev_for_pr(cfg: Config, repo: str, pr: int, sha: str = "") -> JevAssessment:
+    """Read this PR's patch and review evidence for one cheap Jev decision."""
+    if not isinstance(cfg.jev_api_key, str) or not cfg.jev_api_key:
+        return JevAssessment(False, reason="no OpenRouter key")
+    rc, diff = _gh(cfg, "pr", "diff", str(pr), "-R", repo, timeout=45)
+    if rc != 0:
+        return JevAssessment(False, reason="PR diff unavailable")
+    rc, raw = _gh(cfg, "pr", "view", str(pr), "-R", repo,
+                  "--json", "reviews,comments", timeout=45)
+    if rc != 0:
+        return JevAssessment(False, reason="review evidence unavailable")
+    try:
+        data = json.loads(raw)
+        # GitHub status arrives after the review is published. The most recent
+        # formal review is more relevant than concatenating old bot output.
+        reviews = data.get("reviews") or []
+        comments = data.get("comments") or []
+        review = next((str(item.get("body")) for item in reversed(reviews)
+                       if item.get("body")), "")
+        if not review:
+            review = next((str(item.get("body")) for item in reversed(comments)
+                           if item.get("body")), "")
+    except (TypeError, ValueError, AttributeError):
+        return JevAssessment(False, reason="review evidence malformed")
+    return jev_assess(diff, review, cfg.jev_api_key, head_sha=sha)
+
+
 def run_neo(cfg: Config, state: NeoState, wake: dict) -> None:
     repo, sha = wake["repo"], wake["sha"]
     pr = resolve_pr(cfg, repo, sha, wake.get("pr_number"))
@@ -81,8 +202,19 @@ def run_neo(cfg: Config, state: NeoState, wake: dict) -> None:
         return
 
     # --- loop / thrash guard ------------------------------------------------
-    if state.already_acted(repo, pr, sha, "triage"):
-        log.info("already triaged %s#%s@%s — skip (idempotent)", repo, pr, sha[:8])
+    # Keyed on verdict COLOR, not sha alone. A green verdict arriving after a
+    # red triage of the same head (the reviewer re-ran and passed it) is new
+    # decision input and must not be swallowed by the old idempotency skip --
+    # that skip is what left green-reviewed PRs open (green-stall) while the
+    # red triage sat as their only record. Missing color on old rows counts
+    # as red so a first green wake still re-triggers.
+    green = bool(wake.get("green"))
+    if state.already_acted(repo, pr, sha, "triage", green=green):
+        log.info("already triaged %s#%s@%s (green=%s) — skip (idempotent)",
+                 repo, pr, sha[:8], green)
+        return
+    if state.already_acted(repo, pr, sha, "merged"):
+        log.info("%s#%s@%s already merged by Neo — skip", repo, pr, sha[:8])
         return
     rounds = state.builder_rounds(repo, pr)
 
@@ -96,10 +228,45 @@ def run_neo(cfg: Config, state: NeoState, wake: dict) -> None:
             "--body", "Neo: this install is out of credits — top up to resume auto-fix/merge.")
         log.info("%s#%s: install out of credits — gated", repo, pr)
         return
-    auto_merge = bool(inst.get("auto_merge") or cfg.auto_merge_default)
+    install_auto_merge = bool(inst.get("auto_merge") or cfg.auto_merge_default)
+
+    # --- exact-SHA evidence (Phase A) --------------------------------------
+    # The wake carries the SHA the reviewer's status belongs to. If the PR head
+    # has moved since, the old evidence may be shown as history but must not
+    # open the merge gate: skip, and let the new head produce its own wake.
+    evidence = _review_evidence(cfg, repo, pr, sha)
+    if evidence.get("ok") and evidence.get("head_sha") and evidence["head_sha"] != sha:
+        state.record(repo, pr, sha, "stale_head", verdict="STALE",
+                     detail={"context": wake.get("context"),
+                             "head_sha": evidence["head_sha"], "decided_sha": sha})
+        log.info("%s#%s@%s head moved to %s — stale evidence, not mergeable (re-enter precheck)",
+                 repo, pr, sha[:8], evidence["head_sha"][:8])
+        return
+
+    # Jev never supplies a green verdict. A *concrete* finding may remove
+    # automatic merge authority; a risk adjective may not (Phase B).
+    jev = _jev_for_pr(cfg, repo, pr, sha)
+    auto_merge, authority_reason = merge_authority(install_auto_merge, evidence, jev)
+    log.info("%s#%s@%s Jev available=%s risk=%s quality=%s partial=%s "
+             "requires_full_review=%s blockers=%s",
+             repo, pr, sha[:8], jev.available, jev.risk, jev.review_quality,
+             jev.partial, jev.requires_full_review,
+             ",".join(f.rule for f in jev.blockers) or "-")
+    log.info("%s#%s@%s merge authority=%s (%s) head=%s review_sha=%s checks_green=%s",
+             repo, pr, sha[:8], auto_merge, authority_reason,
+             (evidence.get("head_sha") or "?")[:8], (evidence.get("review_sha") or "?")[:8],
+             evidence.get("rollup_green"))
 
     state.record(repo, pr, sha, "triage", detail={"context": wake.get("context"),
-                                                   "green": wake.get("green")})
+                                                   "green": wake.get("green"),
+                                                   "jev": jev.brief(),
+                                                   "jev_attention": jev.requires_full_review,
+                                                   "head_sha": evidence.get("head_sha"),
+                                                   "review_sha": evidence.get("review_sha"),
+                                                   "rollup_green": evidence.get("rollup_green"),
+                                                   "jev_blockers": [f.rule for f in jev.blockers],
+                                                   "auto_merge": auto_merge,
+                                                   "reason": authority_reason})
 
     # --- run the Neo protocol headless via Claude Code CLI --------------------
     brief = neo_protocol.build_brief(
@@ -107,9 +274,21 @@ def run_neo(cfg: Config, state: NeoState, wake: dict) -> None:
         reviewer_context=wake.get("context", "?"), reviewer_green=bool(wake.get("green")),
         auto_merge=auto_merge, builder_round=rounds,
         max_builder_rounds=cfg.max_builder_rounds, builder_model=cfg.deepseek_model,
+        jev_context=jev.brief() + "\n" + evidence_brief(evidence, auto_merge, authority_reason),
     )
     agent = ClaudeAgent.from_config(cfg)
     usage, verdict = _run_agent(agent, brief)
+    if not verdict:
+        # The triage marker above is written BEFORE the agent runs, and
+        # already_acted() treats it as done. So an agent that dies -- provider
+        # 402, timeout, malformed stream -- used to strand this PR at this head
+        # forever: every later wake for the same sha hit "already triaged --
+        # skip". Clear it so the next wake retries. (2026-09-21: DeepSeek ran
+        # out of credit mid-triage and capturd#40 stranded exactly this way.)
+        state.clear(repo, pr, sha, "triage")
+        log.warning("%s#%s@%s agent produced no verdict — triage marker cleared, "
+                    "next wake retries", repo, pr, sha[:8])
+        return
     is_builder = verdict.startswith("BOUNCE-BUILDER")
     credits = credits_for(usage, builder=is_builder)
     phase = {
@@ -122,6 +301,28 @@ def run_neo(cfg: Config, state: NeoState, wake: dict) -> None:
         state.debit(org, credits)
     log.info("%s#%s@%s verdict=%s credits=%d (auto_merge=%s round=%d)",
              repo, pr, sha[:8], verdict or "?", credits, auto_merge, rounds)
+
+
+def evidence_brief(evidence: dict, auto_merge: bool, reason: str) -> str:
+    """Machine-readable evidence line handed to the Neo agent.
+
+    The agent's prose must never outrank this: if it says merge authority is not
+    granted, the agent may ACCEPT and label but must not merge.
+    """
+    if not evidence.get("ok"):
+        return (f"MERGE_AUTHORITY: NOT_GRANTED — {reason}. Do not merge; continue non-merge work "
+                "and record what blocked it.")
+    head = (evidence.get("head_sha") or "?")[:12]
+    review_sha = (evidence.get("review_sha") or "?")[:12]
+    grant = "GRANTED" if auto_merge else "NOT_GRANTED"
+    return (
+        f"MERGE_AUTHORITY: {grant} ({reason}).\n"
+        f"EVIDENCE head_sha={head} decided_sha={evidence.get('decided_sha', '?')[:12]} "
+        f"review_sha={review_sha} review_bound_ok={evidence.get('review_bound_ok')} "
+        f"trusted_review_status={evidence.get('trusted_states')} "
+        f"(other checks in this repo: {evidence.get('failing_checks')} failing, informational).\n"
+        "Merge only when MERGE_AUTHORITY is GRANTED for this exact head SHA."
+    )
 
 
 def _run_agent(agent: ClaudeAgent, brief: str) -> tuple[dict, str]:

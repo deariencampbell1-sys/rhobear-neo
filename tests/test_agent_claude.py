@@ -654,10 +654,12 @@ class TestStaleOpenRouterEnv:
 # ===================================================================
 
 class TestCanonicalSet:
-    """The CANONICAL_VERDICTS constant contains exactly the 5 expected values."""
+    """The CANONICAL_VERDICTS constant contains exactly the 6 expected values (production adds FIXED)."""
 
     def test_exact_set(self) -> None:
+        # Production adds FIXED as a builder alias for ACCEPT-READY.
         assert CANONICAL_VERDICTS == {
+            "FIXED",
             "ACCEPT-MERGED",
             "ACCEPT-READY",
             "FIX-FORWARD",
