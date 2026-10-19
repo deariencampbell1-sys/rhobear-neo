@@ -29,8 +29,8 @@ def build_brief(*, repo: str, pr: int, head_sha: str, reviewer_context: str,
         + (f"You may dispatch ONE more Claude Code CLI agent (same {builder_model} model/tool loop) for a substantial fix."
            if builder_round < max_builder_rounds else
            "You are OUT of builder rounds — do NOT dispatch another builder. Report what is still "
-           "outstanding as BOUNCE-BUILDER with the findings; the lane keeps the PR actionable "
-           "and the owner-proxy re-arms it. Running out of rounds is NOT an escalation.")
+           "outstanding as BOUNCE-BUILDER with the findings; the lane parks the PR (visible, "
+           "owner-actionable) and never auto-dispatches. Running out of rounds is NOT an escalation.")
     )
 
     return f"""You are Neo, RHOBEAR's review-and-MERGE gate. Follow your canon EXACTLY — the

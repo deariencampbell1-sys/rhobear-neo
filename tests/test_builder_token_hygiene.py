@@ -39,8 +39,10 @@ def test_failed_clone_log_has_no_token(monkeypatch, caplog):
     monkeypatch.setattr(neo_builder, "pr_state", lambda *a: "OPEN\tfeature")
     monkeypatch.setattr(neo_builder, "_mark", lambda *a, **k: None)
     monkeypatch.setattr(neo_builder, "_db", lambda: None)
-    row = {"id": 1, "repo": "acme/app", "pr_number": 7, "head_sha": "a" * 40, "builder_round": 1}
+    from unittest.mock import MagicMock as MockMagic
+    jobs_mock = MockMagic()
+    row = {"id": 1, "repo": "acme/app", "pr_number": 7, "head_sha": "a" * 40, "builder_round": 1, "attempt": 1}
     with caplog.at_level(logging.ERROR):
-        neo_builder.dispatch_one(SimpleNamespace(gh_token=TOKEN), row)
+        neo_builder.dispatch_one(SimpleNamespace(gh_token=TOKEN, max_builder_rounds=3), jobs_mock, row)
     assert "worktree prep failed" in caplog.text
     assert TOKEN not in caplog.text

@@ -23,6 +23,7 @@ import os
 import subprocess
 
 from .config import Config
+from .jobs import Jobs
 from .neo_state import NeoState
 from .agent_claude import ClaudeAgent, AgentError
 from . import neo_protocol
@@ -94,6 +95,9 @@ def _review_evidence(cfg: Config, repo: str, pr: int, sha: str) -> dict:
     it against an immutable commit. Formal review objects are context — the
     reviewer's own objects carry `commit_id: null`, so when a commit_id IS
     present it must match, and when it is absent the status carries the binding.
+
+    Computes rollup_green from the statusCheckRollup (fixes defect 5: was
+    never populated).
     """
     try:
         rc, raw = _gh(cfg, "pr", "view", str(pr), "-R", repo,
@@ -133,6 +137,12 @@ def _review_evidence(cfg: Config, repo: str, pr: int, sha: str) -> dict:
     failing = [c for c in rollup
                if str(c.get("conclusion") or "").upper() in {"FAILURE", "TIMED_OUT", "CANCELLED"}
                or str(c.get("state") or "").upper() in {"FAILURE", "ERROR"}]
+    # Compute rollup_green from the rollup data (defect 5 fix).
+    all_success = all(
+        str(c.get("conclusion") or "").upper() == "SUCCESS"
+        or str(c.get("state") or "").upper() == "SUCCESS"
+        for c in rollup
+    ) if rollup else None
     return {
         "ok": True,
         "decided_sha": sha,
@@ -145,6 +155,7 @@ def _review_evidence(cfg: Config, repo: str, pr: int, sha: str) -> dict:
         "trusted_green": bool(trusted_states) and all(s == "success" for s in trusted_states),
         # Informational only: this repo's inherited CI wall is red on every PR.
         "failing_checks": len(failing),
+        "rollup_green": all_success,
     }
 
 
@@ -194,123 +205,6 @@ def _jev_for_pr(cfg: Config, repo: str, pr: int, sha: str = "") -> JevAssessment
     return jev_assess(diff, review, cfg.jev_api_key, head_sha=sha)
 
 
-def run_neo(cfg: Config, state: NeoState, wake: dict) -> None:
-    repo, sha = wake["repo"], wake["sha"]
-    pr = resolve_pr(cfg, repo, sha, wake.get("pr_number"))
-    if not pr:
-        log.info("no open PR for %s@%s — skip", repo, sha[:8])
-        return
-
-    # --- loop / thrash guard ------------------------------------------------
-    # Keyed on verdict COLOR, not sha alone. A green verdict arriving after a
-    # red triage of the same head (the reviewer re-ran and passed it) is new
-    # decision input and must not be swallowed by the old idempotency skip --
-    # that skip is what left green-reviewed PRs open (green-stall) while the
-    # red triage sat as their only record. Missing color on old rows counts
-    # as red so a first green wake still re-triggers.
-    green = bool(wake.get("green"))
-    if state.already_acted(repo, pr, sha, "triage", green=green):
-        log.info("already triaged %s#%s@%s (green=%s) — skip (idempotent)",
-                 repo, pr, sha[:8], green)
-        return
-    if state.already_acted(repo, pr, sha, "merged"):
-        log.info("%s#%s@%s already merged by Neo — skip", repo, pr, sha[:8])
-        return
-    rounds = state.builder_rounds(repo, pr)
-
-    # --- entitlement (per-install credit balance) ---------------------------
-    org = repo.split("/", 1)[0]
-    inst = state.install(org, org)          # dogfood: install keyed by org
-    if inst.get("plan") and inst.get("credits_balance", 0) <= 0:
-        state.record(repo, pr, sha, "escalated", verdict="ESCALATE",
-                     detail={"reason": "out of credits"})
-        _gh(cfg, "pr", "comment", str(pr), "-R", repo,
-            "--body", "Neo: this install is out of credits — top up to resume auto-fix/merge.")
-        log.info("%s#%s: install out of credits — gated", repo, pr)
-        return
-    # P0 hotfix: nullable inheritance for auto-merge.
-    #   None  → inherit from global default (cfg.auto_merge_default)
-    #   False → explicit false wins (does NOT inherit)
-    #   True  → explicit true wins
-    inst_auto_merge = inst.get("auto_merge")
-    if inst_auto_merge is None:
-        install_auto_merge = bool(cfg.auto_merge_default)
-    else:
-        install_auto_merge = bool(inst_auto_merge)
-
-    # --- exact-SHA evidence (Phase A) --------------------------------------
-    # The wake carries the SHA the reviewer's status belongs to. If the PR head
-    # has moved since, the old evidence may be shown as history but must not
-    # open the merge gate: skip, and let the new head produce its own wake.
-    evidence = _review_evidence(cfg, repo, pr, sha)
-    if evidence.get("ok") and evidence.get("head_sha") and evidence["head_sha"] != sha:
-        state.record(repo, pr, sha, "stale_head", verdict="STALE",
-                     detail={"context": wake.get("context"),
-                             "head_sha": evidence["head_sha"], "decided_sha": sha})
-        log.info("%s#%s@%s head moved to %s — stale evidence, not mergeable (re-enter precheck)",
-                 repo, pr, sha[:8], evidence["head_sha"][:8])
-        return
-
-    # Jev never supplies a green verdict. A *concrete* finding may remove
-    # automatic merge authority; a risk adjective may not (Phase B).
-    jev = _jev_for_pr(cfg, repo, pr, sha)
-    auto_merge, authority_reason = merge_authority(install_auto_merge, evidence, jev)
-    log.info("%s#%s@%s Jev available=%s risk=%s quality=%s partial=%s "
-             "requires_full_review=%s blockers=%s",
-             repo, pr, sha[:8], jev.available, jev.risk, jev.review_quality,
-             jev.partial, jev.requires_full_review,
-             ",".join(f.rule for f in jev.blockers) or "-")
-    log.info("%s#%s@%s merge authority=%s (%s) head=%s review_sha=%s checks_green=%s",
-             repo, pr, sha[:8], auto_merge, authority_reason,
-             (evidence.get("head_sha") or "?")[:8], (evidence.get("review_sha") or "?")[:8],
-             evidence.get("rollup_green"))
-
-    state.record(repo, pr, sha, "triage", detail={"context": wake.get("context"),
-                                                   "green": wake.get("green"),
-                                                   "jev": jev.brief(),
-                                                   "jev_attention": jev.requires_full_review,
-                                                   "head_sha": evidence.get("head_sha"),
-                                                   "review_sha": evidence.get("review_sha"),
-                                                   "rollup_green": evidence.get("rollup_green"),
-                                                   "jev_blockers": [f.rule for f in jev.blockers],
-                                                   "auto_merge": auto_merge,
-                                                   "reason": authority_reason})
-
-    # --- run the Neo protocol headless via Claude Code CLI --------------------
-    brief = neo_protocol.build_brief(
-        repo=repo, pr=pr, head_sha=sha,
-        reviewer_context=wake.get("context", "?"), reviewer_green=bool(wake.get("green")),
-        auto_merge=auto_merge, builder_round=rounds,
-        max_builder_rounds=cfg.max_builder_rounds, builder_model=cfg.deepseek_model,
-        jev_context=jev.brief() + "\n" + evidence_brief(evidence, auto_merge, authority_reason),
-    )
-    agent = ClaudeAgent.from_config(cfg)
-    usage, verdict = _run_agent(agent, brief)
-    if not verdict:
-        # The triage marker above is written BEFORE the agent runs, and
-        # already_acted() treats it as done. So an agent that dies -- provider
-        # 402, timeout, malformed stream -- used to strand this PR at this head
-        # forever: every later wake for the same sha hit "already triaged --
-        # skip". Clear it so the next wake retries. (2026-09-21: DeepSeek ran
-        # out of credit mid-triage and capturd#40 stranded exactly this way.)
-        state.clear(repo, pr, sha, "triage")
-        log.warning("%s#%s@%s agent produced no verdict — triage marker cleared, "
-                    "next wake retries", repo, pr, sha[:8])
-        return
-    is_builder = verdict.startswith("BOUNCE-BUILDER")
-    credits = credits_for(usage, builder=is_builder)
-    phase = {
-        "ACCEPT-MERGED": "merged", "ACCEPT-READY": "ready", "FIX-FORWARD": "fix_forward",
-        "BOUNCE-BUILDER": "builder", "ESCALATE": "escalated",
-    }.get(verdict.split()[0] if verdict else "", "triage")
-    state.record(repo, pr, sha, phase, verdict=verdict,
-                 builder_round=(rounds + 1) if is_builder else rounds, credits=credits)
-    if inst.get("plan"):
-        state.debit(org, credits)
-    log.info("%s#%s@%s verdict=%s credits=%d (auto_merge=%s round=%d)",
-             repo, pr, sha[:8], verdict or "?", credits, auto_merge, rounds)
-
-
 def evidence_brief(evidence: dict, auto_merge: bool, reason: str) -> str:
     """Machine-readable evidence line handed to the Neo agent.
 
@@ -348,3 +242,128 @@ def _run_agent(agent: ClaudeAgent, brief: str) -> tuple[dict, str]:
     except AgentError:
         log.exception("neo claude agent run failed")
         return {}, ""
+
+
+def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict) -> None:
+    repo, sha = wake["repo"], wake["sha"]
+    pr = resolve_pr(cfg, repo, sha, wake.get("pr_number"))
+    if not pr:
+        log.info("no open PR for %s@%s — skip", repo, sha[:8])
+        return
+
+    # --- claim the durable job (dedupe + triage record in one transaction) --
+    # The job was already created by on_verdict() in __main__.  Here we claim
+    # it atomically.  If another worker already claimed it (concurrent wake),
+    # we skip — the job keyed by (repo, pr, sha) UNIQUE constraint prevents
+    # duplicates.
+    job = jobs.claim(repo, pr, sha)
+    if job is None:
+        log.info("job already claimed %s#%s@%s — skip (deduped)", repo, pr, sha[:8])
+        return
+
+    green = bool(wake.get("green"))
+    rounds = state.builder_rounds(repo, pr)
+
+    # --- entitlement (per-install credit balance) ---------------------------
+    org = repo.split("/", 1)[0]
+    inst = state.install(org, org)          # dogfood: install keyed by org
+    if inst.get("plan") and inst.get("credits_balance", 0) <= 0:
+        state.record(repo, pr, sha, "escalated", verdict="ESCALATE",
+                     detail={"reason": "out of credits"})
+        _gh(cfg, "pr", "comment", str(pr), "-R", repo,
+            "--body", "Neo: this install is out of credits — top up to resume auto-fix/merge.")
+        jobs.resolve(job, "failed", payload={"reason": "out of credits"})
+        log.info("%s#%s: install out of credits — gated", repo, pr)
+        return
+    # P0 hotfix: nullable inheritance for auto-merge.
+    inst_auto_merge = inst.get("auto_merge")
+    if inst_auto_merge is None:
+        install_auto_merge = bool(cfg.auto_merge_default)
+    else:
+        install_auto_merge = bool(inst_auto_merge)
+
+    # --- exact-SHA evidence (Phase A) --------------------------------------
+    evidence = _review_evidence(cfg, repo, pr, sha)
+    if evidence.get("ok") and evidence.get("head_sha") and evidence["head_sha"] != sha:
+        state.record(repo, pr, sha, "stale_head", verdict="STALE",
+                     detail={"context": wake.get("context"),
+                             "head_sha": evidence["head_sha"], "decided_sha": sha})
+        jobs.resolve(job, "no_change", payload={"reason": "stale head"})
+        log.info("%s#%s@%s head moved to %s — stale evidence, not mergeable",
+                 repo, pr, sha[:8], evidence["head_sha"][:8])
+        return
+
+    # Jev never supplies a green verdict.
+    jev = _jev_for_pr(cfg, repo, pr, sha)
+    auto_merge, authority_reason = merge_authority(install_auto_merge, evidence, jev)
+    log.info("%s#%s@%s Jev available=%s risk=%s quality=%s partial=%s "
+             "requires_full_review=%s blockers=%s",
+             repo, pr, sha[:8], jev.available, jev.risk, jev.review_quality,
+             jev.partial, jev.requires_full_review,
+             ",".join(f.rule for f in jev.blockers) or "-")
+    log.info("%s#%s@%s merge authority=%s (%s) head=%s review_sha=%s checks_green=%s",
+             repo, pr, sha[:8], auto_merge, authority_reason,
+             (evidence.get("head_sha") or "?")[:8], (evidence.get("review_sha") or "?")[:8],
+             evidence.get("rollup_green"))
+
+    state.record(repo, pr, sha, "triage", detail={"context": wake.get("context"),
+                                                   "green": wake.get("green"),
+                                                   "jev": jev.brief(),
+                                                   "jev_attention": jev.requires_full_review,
+                                                   "head_sha": evidence.get("head_sha"),
+                                                   "review_sha": evidence.get("review_sha"),
+                                                   "rollup_green": evidence.get("rollup_green"),
+                                                   "jev_blockers": [f.rule for f in jev.blockers],
+                                                   "auto_merge": auto_merge,
+                                                   "reason": authority_reason})
+
+    # --- run the Neo protocol headless via Claude Code CLI --------------------
+    brief = neo_protocol.build_brief(
+        repo=repo, pr=pr, head_sha=sha,
+        reviewer_context=wake.get("context", "?"), reviewer_green=bool(wake.get("green")),
+        auto_merge=auto_merge, builder_round=rounds,
+        max_builder_rounds=cfg.max_builder_rounds, builder_model=cfg.deepseek_model,
+        jev_context=jev.brief() + "\n" + evidence_brief(evidence, auto_merge, authority_reason),
+    )
+    agent = ClaudeAgent.from_config(cfg)
+    try:
+        usage, verdict = _run_agent(agent, brief)
+    except Exception as exc:
+        # Defect 3 fix: catch any exception from agent spawn so the job
+        # is released via lease expiry instead of stranding the SHA.
+        log.exception("%s#%s@%s agent crashed (%s) — job released for retry",
+                      repo, pr, sha[:8], type(exc).__name__)
+        return
+
+    if not verdict:
+        log.warning("%s#%s@%s agent produced no verdict — job released for retry",
+                    repo, pr, sha[:8])
+        return
+
+    is_builder = verdict.startswith("BOUNCE-BUILDER")
+    credits = credits_for(usage, builder=is_builder)
+    phase = {
+        "ACCEPT-MERGED": "merged", "ACCEPT-READY": "ready", "FIX-FORWARD": "fix_forward",
+        "BOUNCE-BUILDER": "builder", "ESCALATE": "escalated",
+    }.get(verdict.split()[0] if verdict else "", "triage")
+    state.record(repo, pr, sha, phase, verdict=verdict,
+                 builder_round=(rounds + 1) if is_builder else rounds, credits=credits)
+    # Resolve the job with a terminal outcome.
+    outcome = "done"
+    if phase == "escalated":
+        outcome = "failed"
+    elif phase in ("merged", "ready"):
+        outcome = "done"
+    elif phase == "fix_forward":
+        outcome = "done"
+    elif phase == "builder":
+        outcome = "done"  # builder round dispatched; the builder job handles it
+    jobs.resolve(job, outcome, payload={"verdict": verdict, "phase": phase,
+                                         "credits": credits})
+    if inst.get("plan"):
+        state.debit(org, credits)
+    log.info("%s#%s@%s verdict=%s credits=%d (auto_merge=%s round=%d)",
+             repo, pr, sha[:8], verdict or "?", credits, auto_merge, rounds)
+
+
+
