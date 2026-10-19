@@ -18,8 +18,6 @@ from __future__ import annotations
 import json
 import logging
 
-from .config import Config
-
 log = logging.getLogger("rhobear_neo.merge")
 
 
@@ -90,7 +88,6 @@ def merge(
 
     head = str(data.get("headRefOid") or "")
     state = str(data.get("state") or "").lower()
-    mergeable = str(data.get("mergeable") or "").lower()
 
     # --- Step 2: Verify head has not moved ---------------------------------
     if not head:

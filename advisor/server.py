@@ -30,11 +30,7 @@ import os
 import subprocess
 import tempfile
 import threading
-import time
-import urllib.error
-import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Any
 
 log = logging.getLogger("rhobear_neo.advisor.server")
 

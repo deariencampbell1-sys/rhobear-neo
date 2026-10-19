@@ -16,7 +16,6 @@ must never outrank it.
 """
 from __future__ import annotations
 
-import json
 import logging
 
 from .config import Config
@@ -69,7 +68,6 @@ def build_evidence(
     reviews = pr_data.get("reviews") or []
     trusted_reviews = []
     for r in reviews:
-        author = r.get("author") or {}
         # The review's body and commit_id are our evidence.
         body = str(r.get("body") or "")
         commit_id = str(r.get("commit_id") or "")

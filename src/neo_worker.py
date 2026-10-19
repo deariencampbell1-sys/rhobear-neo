@@ -78,6 +78,22 @@ def credits_for(usage: dict, builder: bool) -> int:
     return int(cost * MARGIN * CREDITS_PER_USD)
 
 
+def _compute_diff_stat(token: str, repo: str, pr: int) -> str:
+    """Compute a diff stat for the PR.
+
+    Returns a string like '10 files changed, 200 insertions(+), 50 deletions(-)'
+    or empty on failure.
+    """
+    try:
+        rc, out = _gh(token, "pr", "diff", str(pr), "-R", repo,
+                      "--stat", timeout=30)
+        if rc == 0 and out:
+            return out.strip()[:2000]
+    except Exception:
+        log.warning("diff_stat failed for %s#%s", repo, pr)
+    return ""
+
+
 def _trusted_contexts(cfg: Config) -> tuple[str, ...]:
     """Contexts whose status is the reviewer's own gate (config-driven)."""
     raw = getattr(cfg, "trusted_review_contexts", ()) or ()
@@ -544,21 +560,13 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict) -> None:
                 outcome = escalation.escalate_pr(
                     cfg, state, jobs, repo, pr, sha,
                     rounds=round_records,
-                    diff_stat="",
+                    diff_stat=_compute_diff_stat(token, repo, pr),
                     installation_id=wake.get("installation_id"),
                 )
                 if outcome["action"] == "escalated":
                     phase = "escalated"
-                    # Create the escalated builder job.
-                    jobs.create_builder(repo, pr, sha, rounds + 1, payload={
-                        "verdict": verdict, "wake_job": job_id,
-                        "head_sha": sha, "phase": "escalated",
-                        "round": rounds + 1,
-                        "context": "neo:escalated",
-                        "escalated": True,
-                        "work_order": outcome.get("work_order", {}),
-                        "installation_id": wake.get("installation_id"),
-                    })
+                    # escalate_pr already created the builder job with the work order.
+                    # Do NOT create a second one here — it would clobber the payload.
                 else:
                     phase = "parked"
             except Exception as exc:

@@ -330,8 +330,18 @@ def dispatch_one(cfg: Config, jobs: Jobs, row: dict) -> None:
     # presents it so a stale claimant can never mutate a replacement run.
     wtoken = row.get("worker_token")
 
+    # Parse payload before the round cap check (needed to detect escalated rounds).
+    payload = row.get("payload") or {}
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except (TypeError, ValueError):
+            payload = {}
+
     # --- round cap (defect 1 fix) ---
-    if round_ > cfg.max_builder_rounds:
+    # Escalated rounds are exempt from the cap.
+    is_escalated = bool((payload or {}).get("escalated"))
+    if not is_escalated and round_ > cfg.max_builder_rounds:
         jobs.park(row["id"],
                   reason=f"max builder rounds ({cfg.max_builder_rounds}) reached (round {round_})")
         log.info("park %s#%s round=%s > max=%s — owner must re-arm",
@@ -343,12 +353,6 @@ def dispatch_one(cfg: Config, jobs: Jobs, row: dict) -> None:
     # personal token. The webhook's installation.id (carried through the wake
     # job into the builder job payload) is used when present. A repo with no
     # App installation is refused: no_installation, terminal, not retried.
-    payload = row.get("payload") or {}
-    if isinstance(payload, str):
-        try:
-            payload = json.loads(payload)
-        except (TypeError, ValueError):
-            payload = {}
     try:
         token = repo_token(cfg, repo, (payload or {}).get("installation_id"))
     except (NoInstallation, AppNotConfigured) as exc:
@@ -384,7 +388,36 @@ def dispatch_one(cfg: Config, jobs: Jobs, row: dict) -> None:
                   type(e).__name__, getattr(e, "returncode", None))
         return  # job stays running — lease expiry handles recovery
     findings = fetch_findings(token, repo, pr)
+    # Build the base brief from findings.
     brief = build_brief(repo, pr, sha, str(round_), head_branch, findings)
+    # If this is an escalated round, incorporate the work order into the brief.
+    if is_escalated and payload.get("work_order"):
+        wo = payload["work_order"]
+        wo_lines = [
+            "=== ESCALATED ADVISOR WORK ORDER ===",
+            f"Route: {wo.get('route', '')}",
+            f"Summary: {wo.get('summary', '')}",
+            f"Root cause: {wo.get('root_cause', '')}",
+            "",
+            "Steps:",
+        ]
+        for i, step in enumerate(wo.get('steps', []), 1):
+            wo_lines.append(f"  {i}. {step.get('file', '')} — {step.get('change', '')}")
+            if step.get('why'):
+                wo_lines.append(f"     Why: {step.get('why')}")
+        if wo.get('tests'):
+            wo_lines.append("")
+            wo_lines.append("Tests to add:")
+            for t in wo['tests']:
+                wo_lines.append(f"  - {t}")
+        if wo.get('risks'):
+            wo_lines.append("")
+            wo_lines.append(f"Risks: {wo.get('risks')}")
+        wo_lines.append("")
+        wo_lines.append("=== END WORK ORDER ===")
+        wo_brief = "\n".join(wo_lines)
+        # Prepend the work order to the existing findings brief.
+        brief = wo_brief + "\n\n" + brief
     brief_dir = BRIEFS / f"{repo.replace('/', '-')}-{pr}"
     brief_dir.mkdir(parents=True, exist_ok=True)
     (brief_dir / "brief.md").write_text(brief, encoding="utf-8")
@@ -562,8 +595,17 @@ def main() -> int:
                 log.info("superseded %d older builder job(s) for %s#%s",
                          len(superseded), repo, pr)
 
-            # Round cap (defect 1 fix): beyond max -> parked, never dispatched.
-            if round_ > cfg.max_builder_rounds:
+            # Parse payload before the round cap check.
+            payload = row.get("payload") or {}
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except (TypeError, ValueError):
+                    payload = {}
+
+            # Round cap (defect 1 fix): escalated rounds are exempt.
+            is_escalated = bool((payload or {}).get("escalated"))
+            if not is_escalated and round_ > cfg.max_builder_rounds:
                 jobs.park(row["id"],
                           reason=f"max builder rounds ({cfg.max_builder_rounds}) reached (round {round_})")
                 log.info("park %s#%s round=%s > max=%s — owner must re-arm",
@@ -572,12 +614,6 @@ def main() -> int:
 
             # Per-repo installation token. A repo with no App installation is
             # refused here (no_installation, terminal — never dispatched).
-            payload = row.get("payload") or {}
-            if isinstance(payload, str):
-                try:
-                    payload = json.loads(payload)
-                except (TypeError, ValueError):
-                    payload = {}
             try:
                 token = repo_token(cfg, repo, (payload or {}).get("installation_id"))
             except (NoInstallation, AppNotConfigured) as exc:

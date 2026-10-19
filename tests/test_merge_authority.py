@@ -486,15 +486,29 @@ class TestReadTokenPermissions:
     """Read-only token has restricted permissions."""
 
     def test_read_token_permissions(self):
-        """Verify the read token permissions dict is correct."""
+        """Verify the read token is minted with contents:read + pull_requests:read.
+
+        Mocks repo_token and asserts the permissions dict passed to it.
+        """
         from src.escalation import _read_token
-        expected = {"contents": "read", "pull_requests": "read"}
-        # We can't actually mint a token without a real GitHub App,
-        # but we can verify the permissions dict that would be used.
-        import inspect
-        source = inspect.getsource(_read_token)
-        assert '"contents": "read"' in source or "'contents': 'read'" in source
-        assert '"pull_requests": "read"' in source or "'pull_requests': 'read'" in source
+        from unittest.mock import patch
+
+        captured_permissions = []
+
+        def fake_repo_token(cfg, repo, installation_id=None, permissions=None):
+            captured_permissions.append(permissions)
+            return "read-token-abc"
+
+        with patch("src.github_app.repo_token", side_effect=fake_repo_token):
+            cfg = SimpleNamespace()
+            token = _read_token(cfg, "acme/a", installation_id=123)
+
+        assert token == "read-token-abc"
+        assert len(captured_permissions) == 1
+        perms = captured_permissions[0]
+        assert perms == {"contents": "read", "pull_requests": "read"}
+        # Never the write token (no elevated permissions).
+        assert "write" not in str(perms.values())
 
 
 class TestEvidenceBrief:
@@ -520,40 +534,165 @@ class TestAdvisorServer:
     """Advisor HTTP server — auth, queue, bind address."""
 
     def test_bind_address_is_tailnet(self):
-        """Advisor binds to tailnet address by default."""
-        from advisor.server import serve
-        import inspect
-        sig = inspect.signature(serve)
-        default_host = sig.parameters["bind_host"].default
-        assert default_host == "100.111.118.24"
+        """Advisor binds to the configured address.
+
+        Starts the real server on 127.0.0.1 with a free port,
+        sends a POST, and asserts the server responds (it binds
+        to the given address correctly).
+        """
+        from advisor.server import AdvisorRequestHandler, HTTPServer
+        import threading
+        import socket
+
+        # Find a free port.
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+
+        server = HTTPServer(("127.0.0.1", port), AdvisorRequestHandler)
+        server.advisor_token = "test-secret"
+        server.advisor_routes = ()
+        server.advisor_queue_max = 3
+        server.advisor_timeout = 10
+        server.timeout = 5
+
+        t = threading.Thread(target=server.handle_request, daemon=True)
+        t.start()
+
+        import urllib.request
+        import urllib.error
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/v1/advise",
+            data=b'{}',
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            urllib.request.urlopen(req, timeout=5)
+        except urllib.error.HTTPError as exc:
+            # We expect 401 (no auth) or 400 (bad json). Both confirm the
+            # server is live on the configured address.
+            assert exc.code in (400, 401), exc.code
+        finally:
+            server.server_close()
+
+        # Verify the default bind host matches the tailnet address
+        # (config-driven, not a hard-coded source check).
+        from src.config import Config
+        c = Config()
+        assert c.advisor_bind_host == "100.111.118.24"
 
     def test_auth_required(self):
-        """Request without bearer token returns 401."""
+        """Request without bearer token returns 401.
+
+        Starts the real advisor server on 127.0.0.1 with a free port,
+        sends a POST without auth, and asserts 401.
+        """
         from advisor.server import AdvisorRequestHandler, HTTPServer
-        import io
+        import threading
+        import socket
+        import json
 
-        # Create a mock handler
-        handler = AdvisorRequestHandler
-        server = MagicMock()
-        server.advisor_token = "test-token"
+        # Find a free port.
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
 
-        # We can test the auth logic directly
-        handler_cls = type("TestHandler", (object,), {})
-        test_server = SimpleNamespace(advisor_token="test-token")
+        server = HTTPServer(("127.0.0.1", port), AdvisorRequestHandler)
+        server.advisor_token = "test-secret"
+        server.advisor_routes = ()
+        server.advisor_queue_max = 3
+        server.advisor_timeout = 10
 
-        # Verify token checking exists in the handler
-        import inspect
-        source = inspect.getsource(handler.do_POST)
-        assert "401" in source
-        assert "unauthorized" in source
+        t = threading.Thread(target=server.handle_request, daemon=True)
+        t.start()
+
+        import urllib.request
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/v1/advise",
+            data=b'{ "repo": "o/r", "pr": 1, "head_sha": "a" * 40, "read_token": "tok" }',
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            urllib.request.urlopen(req, timeout=5)
+            assert False, "expected 401"
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 401, exc.code
+            body = exc.read().decode()
+            assert "unauthorized" in body.lower()
+        finally:
+            server.server_close()
 
     def test_queue_limit(self):
-        """Queue max 3, then 429."""
-        from advisor.server import AdvisorRequestHandler
-        import inspect
-        source = inspect.getsource(AdvisorRequestHandler.do_POST)
-        assert "429" in source
-        assert "queue full" in source
+        """Queue max 3, then 429.
+
+        Tests the queue logic by starting the real advisor server on
+        127.0.0.1 with a free port, sending requests that get queued,
+        and verifying the 4th concurrent request gets 429.
+        """
+        from advisor.server import AdvisorRequestHandler, HTTPServer
+        import threading
+        import socket
+
+        # Find a free port.
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+
+        server = HTTPServer(("127.0.0.1", port), AdvisorRequestHandler)
+        server.advisor_token = "test-secret"
+        server.advisor_routes = ()
+        server.advisor_queue_max = 3
+        server.advisor_timeout = 10
+
+        # Start server in a background thread.
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+
+        import urllib.request
+        import urllib.error
+
+        # Set active=true via the queue_lock so all requests queue.
+        with AdvisorRequestHandler.queue_lock:
+            AdvisorRequestHandler.active = True
+
+        def send():
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/v1/advise",
+                data=b'{ "repo": "o/r", "pr": 1, "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "read_token": "tok" }',
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": "Bearer test-secret",
+                },
+                method="POST",
+            )
+            return urllib.request.urlopen(req, timeout=5)
+
+        # First 3 requests: queued (202).
+        for _ in range(3):
+            resp = send()
+            assert resp.getcode() == 202, resp.getcode()
+            resp.close()
+
+        # 4th: queue full (429).
+        try:
+            resp4 = send()
+            assert False, f"expected 429, got {resp4.getcode()}"
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 429, exc.code
+            body = exc.read().decode()
+            assert "queue full" in body.lower()
+
+        # Cleanup.
+        with AdvisorRequestHandler.queue_lock:
+            AdvisorRequestHandler.active = False
+            AdvisorRequestHandler.queue.clear()
+        server.shutdown()
+        server.server_close()
 
 
 class TestRouteFallback:
