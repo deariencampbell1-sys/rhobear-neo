@@ -43,7 +43,7 @@ class TestImports:
     def test_import_neo_builder(self):
         from src.neo_builder import (
             BuilderAgent, build_brief, fetch_findings,
-            prepare_worktree, dispatch_one, queued, gh, pr_state,
+            prepare_worktree, dispatch_one, gh, pr_state,
             WORKTREES, BRIEFS, POLL_SECS, CONCURRENCY,
         )
         assert BuilderAgent is not None
@@ -381,8 +381,9 @@ class TestNeoProtocol:
             auto_merge=False, builder_round=2, max_builder_rounds=2,
             builder_model="deepseek-v4-flash",
         )
-        # Verify the out-of-rounds clause mentions owner-proxy rearming
-        assert "owner-proxy re-arms it" in brief
+        # Verify the out-of-rounds clause mentions parked (visible, owner-actionable)
+        assert "parks the PR" in brief
+        assert "owner-actionable" in brief
         assert "NOT an escalation" in brief
 
     def test_comment_verdict_green(self):

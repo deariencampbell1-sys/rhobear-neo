@@ -29,6 +29,27 @@ CREATE TABLE IF NOT EXISTS neo_actions (
 );
 CREATE INDEX IF NOT EXISTS neo_actions_pr ON neo_actions(repo, pr_number, head_sha);
 
+CREATE TABLE IF NOT EXISTS neo_jobs (
+    id            BIGSERIAL PRIMARY KEY,
+    repo          TEXT NOT NULL,
+    pr_number     INTEGER NOT NULL,
+    head_sha      TEXT NOT NULL,
+    kind          TEXT NOT NULL DEFAULT 'wake',   -- wake | builder
+    state         TEXT NOT NULL DEFAULT 'queued', -- queued | running | done
+    outcome       TEXT,                           -- done | no_change | failed | superseded | parked
+    attempt       INTEGER NOT NULL DEFAULT 0,
+    max_attempts  INTEGER NOT NULL DEFAULT 3,
+    lease_expires TIMESTAMPTZ,
+    payload       JSONB NOT NULL DEFAULT '{}',
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (repo, pr_number, head_sha)
+);
+CREATE INDEX IF NOT EXISTS neo_jobs_queued ON neo_jobs(state, lease_expires)
+    WHERE state = 'queued';
+CREATE INDEX IF NOT EXISTS neo_jobs_expired ON neo_jobs(lease_expires)
+    WHERE lease_expires IS NOT NULL AND state = 'running';
+
 CREATE TABLE IF NOT EXISTS neo_installs (
     install_id  TEXT PRIMARY KEY,           -- github app installation id (or org)
     org         TEXT NOT NULL,

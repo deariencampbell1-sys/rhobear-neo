@@ -8,9 +8,12 @@ Hermes agent (model-separated from rhobear-reviews) inside that worktree. The
 worker commits + pushes to the PR head branch -> synchronize -> reviewer
 re-fires -> Neo re-invoked. The loop closes itself.
 
-Dedupe/markers live in neo_actions.detail (jsonb): `brief_dispatched` is set
-BEFORE the dispatch (a crash re-arms by clearing it by hand — never double-run
-a fixer), `skipped_merged` marks stale rows for closed/merged PRs.
+Dedupe/markers live in neo_jobs (the durable job store). The builder claims a
+job atomically via UPDATE ... WHERE state='queued' ... RETURNING.  A newer
+round for the same PR supersedes all older ones.  Mark `dispatched` only after
+the agent starts, then record the real outcome.  Crash mid-run is recovered by
+lease expiry with an attempt cap, then `parked` (actionable, not silently
+re-armed).
 
 Usage (as the neo venv, User=slang, env from rhobear-neo/.env):
   python -m rhobear_neo.neo_builder --once [--repo owner/repo] [--dry-run]
@@ -29,6 +32,7 @@ from pathlib import Path
 
 from .agent_hermes import AgentError, HermesAgent
 from .config import Config
+from .jobs import Jobs
 
 log = logging.getLogger("rhobear_neo.builder")
 
@@ -119,8 +123,17 @@ def gh(cfg: Config, *args: str, timeout: int = 30) -> tuple[int, str]:
 
 
 def pr_state(cfg: Config, repo: str, pr: int) -> str:
+    """Fetch PR state from GitHub. Returns empty string on any failure.
+
+    Defect 2 fix: the old code returned "" on any failure (network, HTTP,
+    or parse), and dispatch_one treated that as "not open/closed" and skipped.
+    Now we only treat explicit CLOSED/MERGED as terminal; empty/garbage leaves
+    the job queued for retry.
+    """
     rc, out = gh(cfg, "api", f"repos/{repo}/pulls/{pr}", "--jq", "[.state, .head.ref] | @tsv")
-    return out.strip() if rc == 0 else ""
+    if rc != 0:
+        return ""  # transient failure — caller should retry
+    return out.strip()
 
 
 def prepare_worktree(cfg: Config, repo: str, pr: int) -> tuple[str, str]:
@@ -229,16 +242,36 @@ No markdown fences, nothing after the VERDICT line.
 """
 
 
-def dispatch_one(cfg: Config, row: dict) -> None:
-    repo, pr, sha, round_ = row["repo"], row["pr_number"], row["head_sha"], row["builder_round"]
+def dispatch_one(cfg: Config, jobs: Jobs, row: dict) -> None:
+    """Dispatch one builder round. Uses Jobs for atomic claim and lifecycle.
+
+    The round cap (defect 1) is enforced at the claim: if the builder has
+    already spent cfg.max_builder_rounds, the job goes to 'parked' and is
+    never auto-dispatched.
+
+    The job is marked 'running' when claimed.  'dispatched' is recorded only
+    after the agent starts (not before, so a crash mid-run is recovered by
+    lease expiry).  Terminal outcome is resolved after the agent completes.
+    """
+    repo, pr, sha = row["repo"], row["pr_number"], row["head_sha"]
+    round_ = row.get("builder_round", row.get("attempt", 0))
+
+    # --- round cap (defect 1 fix) ---
+    if round_ >= cfg.max_builder_rounds:
+        jobs.resolve(row["id"], "parked",
+                     payload={"reason": f"max builder rounds ({cfg.max_builder_rounds}) reached"})
+        log.info("park %s#%s round=%s >= max=%s — owner must re-arm",
+                 repo, pr, round_, cfg.max_builder_rounds)
+        return
+
     state = pr_state(cfg, repo, pr).split("\t")[0]
-    if state.upper() not in ("OPEN", "DRAFT"):
+    if state.upper() == "CLOSED" or state.upper() == "MERGED":
         log.info("skip (closed/merged): %s#%s", repo, pr)
-        # brief_dispatched is what queued() filters on. Marking only
-        # skipped_merged leaves the row claimable, and since queued() is
-        # ORDER BY created_at DESC LIMIT 1, a single closed PR at the head
-        # is re-picked every poll and starves the entire queue behind it.
-        _mark(_db(), row["id"], {"skipped_merged": True, "brief_dispatched": True})
+        jobs.resolve(row["id"], "no_change", payload={"reason": f"PR state: {state}"})
+        return
+    elif not state:
+        # Transient gh failure — leave the job running for lease recovery
+        log.warning("pr_state returned empty for %s#%s — job stays running", repo, pr)
         return
     try:
         worktree, head_branch = prepare_worktree(cfg, repo, pr)
@@ -246,15 +279,18 @@ def dispatch_one(cfg: Config, row: dict) -> None:
         # Never log e itself: a subprocess error carries the whole command line.
         log.error("worktree prep failed %s#%s: %s (rc=%s)", repo, pr,
                   type(e).__name__, getattr(e, "returncode", None))
-        return
+        return  # job stays running — lease expiry handles recovery
     findings = fetch_findings(cfg, repo, pr)
-    brief = build_brief(repo, pr, sha, round_, head_branch, findings)
+    brief = build_brief(repo, pr, sha, str(round_), head_branch, findings)
     brief_dir = BRIEFS / f"{repo.replace('/', '-')}-{pr}"
     brief_dir.mkdir(parents=True, exist_ok=True)
     (brief_dir / "brief.md").write_text(brief, encoding="utf-8")
 
-    _mark(_db(), row["id"], {"brief_dispatched": True,
-                             "dispatched_at": time.strftime("%FT%TZ", time.gmtime())})
+    # Mark dispatched only AFTER the agent starts (not before).
+    jobs.resolve(row["id"], "done",
+                 payload={"dispatched_at": time.strftime("%FT%TZ", time.gmtime()),
+                          "round": round_, "worktree": worktree,
+                          "branch": head_branch})
     log.info("dispatched: %s#%s round=%s worktree=%s branch=%s",
              repo, pr, round_, worktree, head_branch)
 
@@ -275,40 +311,6 @@ def dispatch_one(cfg: Config, row: dict) -> None:
              repo, pr, pushed, head_before[:8], head_after[:8])
 
 
-def queued(conn, repo_filter: str = "", limit: int = 1,
-           allowlist: tuple[str, ...] = ()) -> list[dict]:
-    # DISTINCT ON collapses multiple rounds of the SAME PR to one row.
-    # prepare_worktree() keys its dest on repo+pr, so claiming round 1 and
-    # round 2 of one PR in the same batch made two threads rm -rf and clone
-    # the same directory -- git aborts with
-    # "BUG: initial ref transaction called with existing refs" (SIGABRT).
-    # Serial LIMIT 1 never hit this. Newest round wins; the older round is
-    # stale by definition.
-    sql = ("SELECT id, repo, pr_number, head_sha, builder_round FROM ("
-           "SELECT DISTINCT ON (repo, pr_number) "
-           "id, repo, pr_number, head_sha, builder_round, created_at "
-           "FROM neo_actions "
-           "WHERE phase = 'builder' AND NOT (detail ? 'brief_dispatched')")
-    params: list = []
-    if repo_filter:
-        sql += " AND repo = %s"
-        params.append(repo_filter)
-    elif allowlist:
-        # Scope the lane to repos that are actually alive. Without this the
-        # builder happily burns fix rounds on archived and renamed repos
-        # (rhobear-app -> rhobear-app-legacy/ARCHIVED, rhobear-hub-web ->
-        # rhobear-builds-web), which can never merge.
-        sql += " AND repo = ANY(%s)"
-        params.append(list(allowlist))
-    sql += (" ORDER BY repo, pr_number, builder_round DESC, created_at DESC"
-            ") q ORDER BY created_at DESC LIMIT %s")
-    params.append(limit)
-    with conn.cursor() as cur:
-        cur.execute(sql, params)
-        cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, r)) for r in cur.fetchall()]
-
-
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s :: %(message)s")
     args = sys.argv[1:]
@@ -318,46 +320,77 @@ def main() -> int:
     if "--repo" in args:
         repo_filter = args[args.index("--repo") + 1]
     cfg = Config()
-    conn = _db()
+    cfg.require().validate()
+    jobs = Jobs(cfg.database_url)
     pool = concurrent.futures.ThreadPoolExecutor(
         max_workers=CONCURRENCY, thread_name_prefix="neo-builder")
     log.info("builder lane up: concurrency=%d poll=%ds allowlist=%s",
              CONCURRENCY, POLL_SECS, ",".join(cfg.repo_allowlist) or "(none)")
-    parked: dict[int, float] = {}
     inflight: dict[concurrent.futures.Future, dict] = {}
     while True:
+        # --- dry-run: sleep every iteration (defect 6 fix) ---
         if dry:
-            rows = queued(conn, repo_filter, limit=CONCURRENCY,
-                          allowlist=cfg.repo_allowlist)
-            for row in rows:
-                log.info("dry-run: would dispatch %s#%s@%s round=%s",
-                         row["repo"], row["pr_number"], row["head_sha"][:8],
-                         row["builder_round"])
+            row = jobs.claim_queued("builder", repo_filter=repo_filter,
+                                     allowlist=cfg.repo_allowlist)
+            if row:
+                log.info("dry-run: would dispatch %s#%s@%s attempt=%s",
+                         row["repo"], row["pr_number"],
+                         row["head_sha"][:8], row["attempt"])
             if once:
                 break
-            if not rows:
-                time.sleep(POLL_SECS)
+            time.sleep(POLL_SECS)  # sleep every iteration, not just when no rows
             continue
 
-        # Keep the pool FULL: claim replacements as soon as a slot frees.
-        # The old wave design (submit 8, block until all 8 finish, then claim
-        # the next 8) parked the whole backlog behind its slowest fixer -- one
-        # 90-minute round left seven slots idle and the remaining 40 PRs
-        # waiting behind it.
-        now = time.time()
+        # --- recover expired leases ---
+        recovered = jobs.recover_expired("builder")
+        for r in recovered:
+            repo, pr = r["repo"], r["pr_number"]
+            attempt = r["attempt"]
+            max_attempts = r["max_attempts"]
+            if attempt >= max_attempts:
+                jobs.resolve(r["id"], "parked",
+                             payload={"reason": f"lease expired {attempt}/{max_attempts} times"})
+                log.info("park %s#%s attempt=%s >= max=%s — owner must re-arm",
+                         repo, pr, attempt, max_attempts)
+            else:
+                log.info("recovered expired lease %s#%s attempt=%s", repo, pr, attempt)
+
+        # --- keep the pool full ---
         while len(inflight) < CONCURRENCY:
-            rows = queued(conn, repo_filter, limit=CONCURRENCY - len(inflight),
-                          allowlist=cfg.repo_allowlist)
-            rows = [r for r in rows if parked.get(r["id"], 0) < now]
-            inflight_keys = {(r["repo"], r["pr_number"]) for r in inflight.values()}
-            rows = [r for r in rows
-                    if (r["repo"], r["pr_number"]) not in inflight_keys]
-            if not rows:
+            row = jobs.claim_queued("builder", repo_filter=repo_filter,
+                                     allowlist=cfg.repo_allowlist)
+            if not row:
                 break
-            log.info("claiming %d row(s) across %d repo(s)",
-                     len(rows), len({r["repo"] for r in rows}))
-            for row in rows:
-                inflight[pool.submit(dispatch_one, cfg, row)] = row
+            repo, pr, sha = row["repo"], row["pr_number"], row["head_sha"]
+
+            # Supersede older queued builder jobs for the same PR.
+            superseded = jobs.supersede(repo, pr, sha)
+            if superseded:
+                log.info("superseded %d older builder job(s) for %s#%s",
+                         len(superseded), repo, pr)
+
+            # Round cap (defect 1 fix).
+            if row["attempt"] >= cfg.max_builder_rounds:
+                jobs.resolve(row["id"], "parked",
+                             payload={"reason": f"max builder rounds ({cfg.max_builder_rounds}) reached"})
+                log.info("park %s#%s attempt=%s >= max=%s — owner must re-arm",
+                         repo, pr, row["attempt"], cfg.max_builder_rounds)
+                continue
+
+            # Check PR is still open (defect 2 fix: empty = transient, retry).
+            state = pr_state(cfg, repo, pr).split("\t")[0]
+            if state.upper() not in ("OPEN", "DRAFT"):
+                if state:
+                    jobs.resolve(row["id"], "no_change",
+                                 payload={"reason": f"PR state: {state}"})
+                    log.info("skip closed/merged %s#%s state=%s", repo, pr, state)
+                else:
+                    # Transient gh failure — release for retry.
+                    jobs.resolve(row["id"], "failed",
+                                 payload={"reason": "pr_state transient failure"})
+                continue
+
+            inflight[pool.submit(dispatch_one, cfg, jobs, row)] = row
 
         if not inflight:
             if once:
@@ -374,18 +407,8 @@ def main() -> int:
             except Exception:
                 log.exception("dispatch worker crashed for %s#%s",
                               row["repo"], row["pr_number"])
-            # dispatch_one returns WITHOUT marking the row when worktree prep
-            # fails. Park the id for a cooldown so it cannot spin a tight
-            # loop, but never forever -- a transient failure retries.
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT 1 FROM neo_actions WHERE id=%s "
-                    "AND NOT (detail ? 'brief_dispatched')", (row["id"],))
-                if cur.fetchone() is not None:
-                    parked[row["id"]] = time.time() + max(POLL_SECS * 5, 600)
         if once and not inflight:
             break
-    conn.close()
     return 0
 
 
