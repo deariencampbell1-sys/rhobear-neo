@@ -144,25 +144,66 @@ class NeoState:
             })
         return out
 
-    def clear_escalating(self, repo: str, pr: int) -> int:
-        """Remove ALL escalating markers for a PR (handled: escalated or
-        parked).  Clears by (repo, pr) so a later head can never double-
-        escalate the same PR."""
-        with self._conn() as c:
-            cur = c.execute(
-                "DELETE FROM neo_actions WHERE repo=%s AND pr_number=%s "
-                "AND phase='escalating'",
-                (repo, pr),
-            )
-            return cur.rowcount
+    def take_escalation(self, repo: str, pr: int, advice_id: str) -> bool:
+        """Atomically consume the escalating marker for `advice_id` IF it is
+        still the NEWEST escalation for the PR.
+
+        One transaction: re-checks that no newer escalating row appeared since
+        the recovery loop's snapshot, then deletes exactly this advice's rows
+        (never a newer escalation's marker).  Returns True when the advice was
+        current and is consumed (caller acts on it), False when it was
+        superseded (caller drops it, logged, without creating a round).  In
+        both cases this advice's own rows are removed so stale markers never
+        accumulate.
+        """
+        with psycopg.connect(self.dsn, autocommit=False) as c:
+            try:
+                newest = c.execute(
+                    "SELECT detail->>'advice_id' FROM neo_actions "
+                    "WHERE repo=%s AND pr_number=%s AND phase='escalating' "
+                    "ORDER BY id DESC LIMIT 1",
+                    (repo, pr),
+                ).fetchone()
+                newest_id = newest[0] if newest else None
+                if newest_id == advice_id:
+                    # Still the newest escalation — consume it AND any
+                    # superseded older rows (they are stale; nothing newer
+                    # exists to protect).
+                    c.execute(
+                        "DELETE FROM neo_actions WHERE repo=%s AND pr_number=%s "
+                        "AND phase='escalating'",
+                        (repo, pr),
+                    )
+                    c.commit()
+                    return True
+                # Superseded by a newer escalation: remove ONLY this advice's
+                # rows — a newer escalation's marker is never touched.
+                c.execute(
+                    "DELETE FROM neo_actions WHERE repo=%s AND pr_number=%s "
+                    "AND phase='escalating' AND detail->>'advice_id'=%s",
+                    (repo, pr, advice_id),
+                )
+                c.commit()
+                return False
+            except Exception:
+                c.rollback()
+                raise
 
     def already_escalated(self, repo: str, pr: int) -> bool:
-        """True once this PR has had its ONE escalated round.  A further
-        BOUNCE after escalation parks the PR (no second escalation)."""
+        """True once this PR has had its ONE genuine advisor-escalated round.
+
+        Counts only rows written by `escalate_pr` (detail->'advisor_round'
+        present).  The overloaded phase='escalated' rows written for the
+        agent's canonical ESCALATE verdict or the old out-of-credits marker
+        carry no advisor_round and must NOT lock the PR out of builder /
+        escalation automation.  A further BOUNCE after a genuine escalation
+        parks the PR (no second escalation).
+        """
         with self._conn() as c:
             row = c.execute(
                 "SELECT 1 FROM neo_actions WHERE repo=%s AND pr_number=%s "
-                "AND phase='escalated' LIMIT 1",
+                "AND phase='escalated' AND detail->'advisor_round' IS NOT NULL "
+                "LIMIT 1",
                 (repo, pr),
             ).fetchone()
         return row is not None

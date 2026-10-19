@@ -79,14 +79,16 @@ def credits_for(usage: dict, builder: bool) -> int:
 
 
 def _compute_diff_stat(token: str, repo: str, pr: int) -> str:
-    """Compute a diff stat for the PR.
+    """Compute a diff stat for the PR from the pull request API.
 
-    Returns a string like '10 files changed, 200 insertions(+), 50 deletions(-)'
-    or empty on failure.
+    Returns a string like '3 files changed, +120/-40' or empty on failure.
+    (gh has no `pr diff --stat`; the stat comes from GET /repos/{repo}/pulls/{pr}
+    -> changed_files/additions/deletions.)
     """
+    jq = '"\\(.changed_files) files changed, +\\(.additions)/-\\(.deletions)"'
     try:
-        rc, out = _gh(token, "pr", "diff", str(pr), "-R", repo,
-                      "--stat", timeout=30)
+        rc, out = _gh(token, "api", f"repos/{repo}/pulls/{pr}", "--jq", jq,
+                      timeout=30)
         if rc == 0 and out:
             return out.strip()[:2000]
     except Exception:
@@ -399,7 +401,8 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict) -> None:
     # A previous run of this verdict did its work (phase row, builder job) and then died
     # before writing the triage marker. Re-running the agent would mint a second builder
     # round; finish the bookkeeping instead.
-    for done_phase in ("builder", "ready", "fix_forward", "escalated"):
+    for done_phase in ("builder", "ready", "fix_forward", "escalated",
+                       "escalating"):
         if state.already_acted(repo, pr, sha, done_phase, green=green):
             state.record(repo, pr, sha, "triage",
                          detail={"green": wake.get("green"), "recovered": done_phase})
@@ -415,12 +418,12 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict) -> None:
     org = repo.split("/", 1)[0]
     inst = state.install(org, org)          # dogfood: install keyed by org
     if inst.get("plan") and inst.get("credits_balance", 0) <= 0:
-        state.record(repo, pr, sha, "escalated", verdict="ESCALATE",
-                     detail={"reason": "out of credits"})
+        state.record(repo, pr, sha, "parked", verdict="PARKED",
+                     detail={"reason": "out of credits — owner must top up"})
         _gh(token, "pr", "comment", str(pr), "-R", repo,
             "--body", "Neo: this install is out of credits — top up to resume auto-fix/merge.")
         jobs.park(job_id, reason="out of credits — owner must top up")
-        log.info("%s#%s: install out of credits — gated", repo, pr)
+        log.info("%s#%s: install out of credits — gated (parked)", repo, pr)
         return
     # P0 hotfix: nullable inheritance for auto-merge.
     inst_auto_merge = inst.get("auto_merge")
@@ -630,8 +633,12 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict) -> None:
     # the full detail; this row keeps the advice_id too so the recovery loop's
     # newest-first escalating_prs() always finds it).
     _phase_detail = {"green": wake.get("green"), "wake_job": job_id}
-    if phase == "escalating" and advice_id:
+    if phase == "escalating":
         _phase_detail["advice_id"] = advice_id
+        # Defect 4: carry the webhook installation_id on the NEWEST escalating
+        # row (the one escalating_prs() reads) so the escalated round uses the
+        # id Neo already had instead of a repo->installation lookup.
+        _phase_detail["installation_id"] = wake.get("installation_id")
     state.record(repo, pr, sha, phase, verdict=verdict,
                  builder_round=new_round, credits=credits,
                  detail=_phase_detail)

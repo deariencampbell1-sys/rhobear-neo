@@ -39,6 +39,7 @@ from src.review_evidence import build_evidence, merge_authority, evidence_brief
 from src.escalation import (
     RoundRecord, WorkOrder, should_escalate, escalate_pr, submit_escalation,
     poll_advice, AdviceStatus, EscalationError, AdvisorUnavailable, AdvisorRefused,
+    AdvisorNotFound,
 )
 
 SHA1 = "a" * 40
@@ -82,8 +83,12 @@ def _fake_gh_success(*args, **kw):
             ],
         }
         return 0, json.dumps(data)
-    if gh_args[:3] == ("pr", "merge", "1"):
-        return 0, "Merge successful"
+    if gh_args and gh_args[0] == "api" and len(gh_args) > 3 and \
+            gh_args[3] == "repos/acme/a/pulls/1/merge":
+        return 0, json.dumps({
+            "merged": True, "sha": "M" * 40,
+            "message": "Pull Request successfully merged",
+        })
     if gh_args[:5] == ("api", f"repos/acme/a/commits/{SHA1}/status"):
         data = {
             "state": "success",
@@ -443,6 +448,51 @@ class TestMergeExecutor:
         evidence = {"ok": False, "reason": "no evidence"}
         with patch("src.merge_executor._gh", side_effect=_fake_gh_success):
             with pytest.raises(MergeDenied):
+                merge("acme/a", 1, SHA1, evidence, "test-token")
+
+    def test_merge_calls_api_with_expected_sha(self):
+        """The merge API call carries sha=<expected_sha> — GitHub rejects the
+        merge if the head moved (Extra B / B2 spec: REST merge API with sha)."""
+        calls: list = []
+
+        def fake_gh(token, *args, **kw):
+            gh_args = args
+            if gh_args[:3] == ("pr", "view", "1"):
+                data = {"headRefOid": SHA1, "state": "OPEN",
+                        "mergeable": "MERGEABLE"}
+                return 0, json.dumps(data)
+            if gh_args[0] == "api" and gh_args[3] == "repos/acme/a/pulls/1/merge":
+                calls.append(list(gh_args))
+                return 0, json.dumps({"merged": True, "sha": "M" * 40})
+            raise AssertionError(f"unexpected call: {args}")
+
+        evidence = {"ok": True, "head_sha": SHA1, "decided_sha": SHA1}
+        with patch("src.merge_executor._gh", side_effect=fake_gh):
+            result = merge("acme/a", 1, SHA1, evidence, "test-token")
+        assert result["merged"] is True
+        assert calls, "the merge API must be called"
+        call = calls[0]
+        assert call[0] == "api" and call[3] == "repos/acme/a/pulls/1/merge", call
+        assert call[call.index("-X") + 1] == "PUT", call
+        assert f"sha={SHA1}" in call, call
+        assert "merge_method=squash" in call, call
+
+    def test_merge_api_rejects_changed_head(self):
+        """GitHub rejects the merge when the head no longer matches the given
+        sha (the race between our re-read and the merge call) -> HeadMoved."""
+        def fake_gh(token, *args, **kw):
+            gh_args = args
+            if gh_args[:3] == ("pr", "view", "1"):
+                data = {"headRefOid": SHA1, "state": "OPEN",
+                        "mergeable": "MERGEABLE"}
+                return 0, json.dumps(data)
+            if gh_args[0] == "api" and gh_args[3] == "repos/acme/a/pulls/1/merge":
+                return 1, "422: The provided sha is not the head sha of the pull request"
+            raise AssertionError(f"unexpected call: {args}")
+
+        evidence = {"ok": True, "head_sha": SHA1, "decided_sha": SHA1}
+        with patch("src.merge_executor._gh", side_effect=fake_gh):
+            with pytest.raises(HeadMoved):
                 merge("acme/a", 1, SHA1, evidence, "test-token")
 
 
@@ -1140,7 +1190,7 @@ class TestRecoverEscalations:
         handled = recover_escalations(cfg, state, jobs, timeout_secs=1800)
         assert len(handled) == 1 and handled[0]["action"] == "parked", handled
         assert "did not finish" in handled[0]["reason"]
-        state.clear_escalating.assert_called_once_with("o/r", 1)
+        state.take_escalation.assert_called_once_with("o/r", 1, "advice-1")
 
     def test_advisor_failed_parks(self):
         """Advisor reports failed → park with the advisor's error."""
@@ -1158,7 +1208,7 @@ class TestRecoverEscalations:
             handled = recover_escalations(cfg, state, jobs, timeout_secs=1800)
         assert len(handled) == 1 and handled[0]["action"] == "parked", handled
         assert "timed out" in handled[0]["reason"]
-        state.clear_escalating.assert_called_once_with("o/r", 1)
+        state.take_escalation.assert_called_once_with("o/r", 1, "advice-1")
 
     def test_done_creates_one_escalated_round(self):
         """Advisor done → escalate_pr creates the ONE escalated round."""
@@ -1186,4 +1236,85 @@ class TestRecoverEscalations:
         assert payload["escalated"] is True
         assert payload["work_order"]["summary"] == "Fix auth"
         assert payload["installation_id"] == 7
-        state.clear_escalating.assert_called_once_with("o/r", 1)
+        state.take_escalation.assert_called_once_with("o/r", 1, "advice-1")
+
+
+class TestComputeDiffStat:
+    """Defect 5 — the diff stat comes from the pull API (changed_files /
+    additions / deletions), never `gh pr diff --stat` (which gh rejects, so
+    the advisor permanently saw `Diff stat: (not available)`)."""
+
+    def test_computes_stat_from_pull_api(self):
+        from src.neo_worker import _compute_diff_stat
+        calls: list = []
+
+        def fake_gh(token, *args, **kw):
+            gh_args = args
+            calls.append(list(gh_args))
+            if "--jq" in gh_args:
+                return 0, "3 files changed, +120/-40"
+            return 0, json.dumps({"changed_files": 3, "additions": 120,
+                                  "deletions": 40})
+
+        with patch("src.neo_worker._gh", side_effect=fake_gh):
+            stat = _compute_diff_stat("tok", "acme/a", 7)
+        assert stat == "3 files changed, +120/-40", stat
+        # The stat comes from the pull API — never `gh pr diff --stat`.
+        assert calls and calls[0][0] == "api", calls
+        assert "repos/acme/a/pulls/7" in calls[0], calls
+        assert "--stat" not in calls[0], calls
+        assert "pr" not in calls[0][:2], calls
+
+    def test_failure_returns_empty(self):
+        """A failed stat read fails closed to '' (the advisor brief just says
+        'not available'); it must never crash the escalation."""
+        from src.neo_worker import _compute_diff_stat
+
+        def fake_gh(token, *args, **kw):
+            return 1, "gh: not authenticated"
+
+        with patch("src.neo_worker._gh", side_effect=fake_gh):
+            assert _compute_diff_stat("tok", "acme/a", 7) == ""
+
+
+class TestAdvisorNotFoundParks:
+    """Extra A — an advisor 404 for a KNOWN advice_id (advisor restarted and
+    lost its in-memory results) parks immediately with that reason instead of
+    waiting out the full timeout."""
+
+    def test_404_parks_immediately(self):
+        state = MagicMock()
+        state.escalating_prs.return_value = [{
+            "repo": "o/r", "pr": 1, "head_sha": SHA1,
+            "advice_id": "advice-404", "installation_id": None,
+            "created_at": datetime.now(timezone.utc),
+        }]
+        jobs = MagicMock()
+        cfg = SimpleNamespace(advisor_url="http://x", advisor_token="t")
+        from src.escalation import recover_escalations
+        with patch("src.escalation.poll_advice",
+                   side_effect=AdvisorNotFound(
+                       "advisor has no record for advice_id advice-404")):
+            handled = recover_escalations(cfg, state, jobs, timeout_secs=1800)
+        assert len(handled) == 1 and handled[0]["action"] == "parked", handled
+        assert "no record" in handled[0]["reason"] or "404" in handled[0]["reason"]
+        state.take_escalation.assert_called_once_with("o/r", 1, "advice-404")
+
+    def test_404_superseded_is_dropped_not_parked(self):
+        """If a newer escalation superseded the 404'd advice, the PR is NOT
+        parked — the newer advice is still pending."""
+        state = MagicMock()
+        state.escalating_prs.return_value = [{
+            "repo": "o/r", "pr": 1, "head_sha": SHA1,
+            "advice_id": "advice-old", "installation_id": None,
+            "created_at": datetime.now(timezone.utc),
+        }]
+        state.take_escalation.return_value = False  # a newer advice superseded it
+        jobs = MagicMock()
+        cfg = SimpleNamespace(advisor_url="http://x", advisor_token="t")
+        from src.escalation import recover_escalations
+        with patch("src.escalation.poll_advice",
+                   side_effect=AdvisorNotFound("no record")):
+            handled = recover_escalations(cfg, state, jobs, timeout_secs=1800)
+        assert len(handled) == 1 and handled[0]["action"] == "dropped", handled
+        state.take_escalation.assert_called_once_with("o/r", 1, "advice-old")

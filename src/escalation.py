@@ -49,6 +49,12 @@ class AdvisorFailed(EscalationError):
     """The advisor returned an error or malformed response."""
 
 
+class AdvisorNotFound(AdvisorFailed):
+    """The advisor has no record for a known advice_id (e.g. it restarted
+    and lost its in-memory results).  Fail-closed: park immediately instead
+    of waiting out the timeout."""
+
+
 @dataclass
 class RoundRecord:
     """One builder round in the escalation context."""
@@ -244,7 +250,12 @@ def poll_advice(cfg: Config, advice_id: str) -> AdviceStatus:
             raw = resp.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
-            raise AdvisorFailed(f"advisor has no record for advice_id {advice_id}")
+            # The advisor restarted and lost its in-memory results: a known
+            # advice_id is now unknown.  Fail closed — park immediately, do
+            # not wait out the timeout (Extra A).
+            raise AdvisorNotFound(
+                f"advisor has no record for advice_id {advice_id}"
+            ) from exc
         raise AdvisorRefused(f"advisor poll returned HTTP {exc.code}")
     except urllib.error.URLError as exc:
         raise AdvisorUnavailable(f"advisor unreachable: {exc.reason}")
@@ -398,8 +409,17 @@ def recover_escalations(
       - waited too long  -> park with a one-line reason
       - advisor `done`   -> escalate_pr creates the ONE escalated builder round
       - advisor `failed` -> park with the advisor's error
+      - advisor 404 for a known advice_id (restart) -> park immediately
       - queued/running   -> keep waiting (next poll)
       - transient poll error -> keep waiting (next poll; bounded by timeout)
+      - superseded       -> drop the stale advice, never act on it (defect 3)
+
+    Every terminal action first consumes the escalating marker atomically
+    (`state.take_escalation`): it verifies the advice is still the NEWEST
+    escalation for the PR and deletes only that advice's rows.  A newer
+    escalation (a new head bounced while this advice was queued) supersedes
+    it, so no round is created for a stale head and the newer advice's marker
+    is never deleted.
 
     Returns the list of handled rows for the caller/tests.
     """
@@ -412,11 +432,16 @@ def recover_escalations(
         waited = time.time() - row["created_at"].timestamp()
 
         if waited > timeout_secs:
-            reason = f"advisor did not finish within {timeout_secs}s"
-            _park_pr(state, jobs, repo, pr, head_sha, reason)
-            state.clear_escalating(repo, pr)
-            handled.append({"repo": repo, "pr": pr, "action": "parked",
-                            "reason": reason})
+            if advice_id and state.take_escalation(repo, pr, advice_id):
+                reason = f"advisor did not finish within {timeout_secs}s"
+                _park_pr(state, jobs, repo, pr, head_sha, reason)
+                handled.append({"repo": repo, "pr": pr, "action": "parked",
+                                "reason": reason})
+            else:
+                # Superseded by a newer escalation (or a marker without an
+                # advice_id): drop it, never park the PR for a stale advice.
+                handled.append({"repo": repo, "pr": pr, "action": "dropped",
+                                "reason": "superseded by a newer escalation"})
             continue
         if not advice_id:
             # No advice_id recorded yet — transient; next poll (timeout bounds).
@@ -424,24 +449,46 @@ def recover_escalations(
 
         try:
             status = poll_advice(cfg, advice_id)
+        except AdvisorNotFound as exc:
+            # Extra A: the advisor restarted and lost the record.  Park
+            # immediately with the reason — no 30-minute wait.
+            if state.take_escalation(repo, pr, advice_id):
+                reason = f"advisor lost the record for {advice_id}: {exc}"
+                _park_pr(state, jobs, repo, pr, head_sha, reason)
+                handled.append({"repo": repo, "pr": pr, "action": "parked",
+                                "reason": reason})
+            else:
+                handled.append({"repo": repo, "pr": pr, "action": "dropped",
+                                "reason": "superseded by a newer escalation"})
+            continue
         except EscalationError as exc:
             log.warning("poll escalation %s#%s: %s (retry next poll)",
                         repo, pr, exc)
             continue
 
         if status.status == "done":
+            # Re-check inside the handling transaction that this advice is
+            # still the newest for the PR; a newer escalation supersedes it.
+            if not state.take_escalation(repo, pr, advice_id):
+                log.info("escalation %s#%s advice %s superseded by a newer "
+                         "escalation — dropped, no round", repo, pr, advice_id)
+                handled.append({"repo": repo, "pr": pr, "action": "dropped",
+                                "reason": "superseded by a newer escalation"})
+                continue
             work_order = WorkOrder.from_dict(status.work_order)
             outcome = escalate_pr(
                 cfg, state, jobs, repo, pr, head_sha, work_order,
                 installation_id=row.get("installation_id"),
             )
-            state.clear_escalating(repo, pr)
             handled.append({"repo": repo, "pr": pr,
                             "action": outcome["action"]})
         elif status.status == "failed":
+            if not state.take_escalation(repo, pr, advice_id):
+                handled.append({"repo": repo, "pr": pr, "action": "dropped",
+                                "reason": "superseded by a newer escalation"})
+                continue
             reason = f"advisor failed: {status.error or 'unknown'}"
             _park_pr(state, jobs, repo, pr, head_sha, reason)
-            state.clear_escalating(repo, pr)
             handled.append({"repo": repo, "pr": pr, "action": "parked",
                             "reason": reason})
         else:
