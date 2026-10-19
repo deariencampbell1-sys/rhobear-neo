@@ -119,18 +119,24 @@ def main() -> None:
 
     def _recovery_loop() -> None:
         """Re-queue expired wake leases and orphaned queued wakes, re-submitting
-        them to the executor.  This is lease recovery for the durable job store
-        (a wake the old code handled is never dropped), not an external poller.
+        them to the executor, AND poll escalating PRs (async advisor).
+
+        This is lease recovery for the durable job store (a wake the old code
+        handled is never dropped), not an external poller.  The escalation
+        pass touches only PRs Neo itself marked `escalating` (it does not
+        watch the outside world).
 
         Startup: after a restart every executor task died, so any queued wake
         is an orphan — clear the submitted stamps once so the first
         stale_queued sweep re-submits them all.  Every submission is stamped
         again (mark_submitted), so in steady state a wake waiting in the
         executor is never re-submitted each pass."""
+        from . import escalation as _escalation
         try:
             jobs.reset_queued_submissions("wake")
         except Exception:  # noqa: BLE001
             log.exception("startup wake submission reset failed")
+        last_esc_poll = 0.0
         while True:
             time.sleep(RECOVERY_SECS)
             try:
@@ -159,6 +165,20 @@ def main() -> None:
                     wake["job_id"] = r["id"]
                     if wake.get("repo") and wake.get("sha"):
                         _submit(wake)
+                # --- Escalation poll (async advisor) --------------------
+                # Poll each `escalating` PR every escalation_poll_secs; on
+                # done create the ONE escalated builder round, on failure/
+                # timeout park with a one-line reason.
+                now = time.time()
+                if now - last_esc_poll >= cfg.escalation_poll_secs:
+                    last_esc_poll = now
+                    try:
+                        _escalation.recover_escalations(
+                            cfg, state, jobs,
+                            timeout_secs=cfg.escalation_timeout_secs,
+                        )
+                    except Exception:  # noqa: BLE001
+                        log.exception("escalation poll failed")
             except Exception:
                 log.exception("wake lease-recovery loop failed")
 

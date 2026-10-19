@@ -90,9 +90,13 @@ def _cfg() -> Config:
 
 
 def _evidence(sha: str) -> dict:
+    """Evidence from the trusted Reviews App check run on this exact head
+    (items 3 & 4: unresolved/coverage come from the check run's output)."""
     return {"ok": True, "head_sha": sha, "decided_sha": sha, "review_sha": sha,
             "review_bound_ok": True, "trusted_states": ["success"],
-            "trusted_green": True, "failing_checks": 0, "rollup_green": True}
+            "trusted_green": True, "failing_checks": 0, "rollup_green": True,
+            "trusted_producer_ok": True, "review_sha_match": True,
+            "unresolved_critical_high": 0, "coverage_complete": True}
 
 
 # ---------------------------------------------------------------------------
@@ -948,3 +952,109 @@ class TestNoInstallationRefusal:
         pr_state.assert_not_called()  # refused before any GitHub work
         r = db.get(row_id)
         assert r["state"] == "done" and r["outcome"] == "no_installation", r
+
+
+# ---------------------------------------------------------------------------
+# FIX ROUND 2 — item 5: end-to-end escalation on real Postgres
+# ---------------------------------------------------------------------------
+
+class TestE2EEscalationPG:
+    """Five BOUNCE-BUILDER verdicts on successive head SHAs -> five cheap
+    builder rounds -> advisor submitted once -> (fake advisor done) -> round 6
+    created escalated with the work order in its brief -> dispatched, not
+    parked -> a BOUNCE after it parks the PR and the advisor is not called
+    again."""
+
+    def _bounce_run(self, jobs, state, cfg, sha, pr=7):
+        from src.neo_worker import run_neo
+        wake = {"repo": "o/r", "sha": sha, "green": False,
+                "context": "rhobear-reviews", "pr_number": pr}
+        with patch("src.neo_worker.resolve_pr", return_value=pr), \
+             patch("src.neo_worker._review_evidence", return_value=_evidence(sha)), \
+             patch("src.neo_worker._jev_for_pr",
+                   return_value=JevAssessment(False, reason="no key")), \
+             patch("src.neo_worker._run_agent",
+                   return_value=({"input_tokens": 1, "output_tokens": 1},
+                                 "BOUNCE-BUILDER still broken")):
+            run_neo(cfg, state, jobs, wake)
+
+    def test_e2e_escalation_flow(self, db):
+        jobs = db
+        state = NeoState(DSN)
+        cfg = _cfg()
+        cfg.bounces_before_escalation = 5
+        cfg.advisor_url = "http://127.0.0.1:9"  # never reached (patched)
+        cfg.advisor_token = "test-token"
+        SHAS = [f"{i:040d}" for i in range(1, 7)]
+        pr = 7
+
+        # --- 5 BOUNCE verdicts on successive head SHAs -> 5 cheap rounds ----
+        for i in range(5):
+            self._bounce_run(jobs, state, cfg, SHAS[i], pr)
+        assert state.builder_rounds("o/r", pr) == 5
+        with psycopg.connect(DSN, autocommit=True) as c:
+            cheap = c.execute(
+                "SELECT builder_round, state FROM neo_jobs WHERE kind='builder' "
+                "AND builder_round < 6 ORDER BY builder_round").fetchall()
+        assert [r[0] for r in cheap] == [1, 2, 3, 4, 5], cheap
+        assert all(r[1] == "queued" for r in cheap), cheap
+
+        # --- 6th BOUNCE -> advisor submitted once, PR goes escalating --------
+        submits: list = []
+        from src.escalation import AdviceStatus, WorkOrder as _WO
+
+        def fake_post(cfg_, repo_, pr_, head_sha_, rounds_, diff_stat_, read_token_):
+            submits.append((repo_, pr_, head_sha_))
+            return "advice-e2e-1"
+
+        with patch("src.escalation._post_advise", side_effect=fake_post):
+            self._bounce_run(jobs, state, cfg, SHAS[5], pr)
+        assert len(submits) == 1, submits
+        with psycopg.connect(DSN, autocommit=True) as c:
+            rows = c.execute(
+                "SELECT detail FROM neo_actions WHERE repo='o/r' "
+                "AND pr_number=%s AND phase='escalating'", (pr,)).fetchall()
+        assert rows, "PR must have an escalating state row"
+        assert all(r[0]["advice_id"] == "advice-e2e-1" for r in rows), rows
+
+        # --- (fake advisor done) -> recover -> round 6 escalated ------------
+        work_order = {"route": "claude:opus", "summary": "Fix auth bug",
+                      "root_cause": "missing validation",
+                      "steps": [{"file": "src/auth.py", "change": "add check",
+                                 "why": "prevent injection"}],
+                      "tests": ["tests/test_auth.py::test_validation"],
+                      "risks": "low"}
+        from src.escalation import recover_escalations
+        with patch("src.escalation.poll_advice",
+                   return_value=AdviceStatus(status="done", work_order=work_order)):
+            handled = recover_escalations(cfg, state, jobs, timeout_secs=1800)
+        assert len(handled) == 1 and handled[0]["action"] == "escalated", handled
+        with psycopg.connect(DSN, autocommit=True) as c:
+            row6 = c.execute(
+                "SELECT id, state, payload FROM neo_jobs "
+                "WHERE kind='builder' AND builder_round=6").fetchone()
+        assert row6 is not None, "round 6 escalated builder job must exist"
+        r6_id, r6_state, r6_payload = row6
+        assert r6_state == "queued", r6_state
+        assert r6_payload["escalated"] is True
+        assert r6_payload["phase"] == "escalated"
+        assert r6_payload["context"] == "neo:escalated"
+        assert r6_payload["work_order"]["summary"] == "Fix auth bug"
+        assert "ESCALATED ADVISOR WORK ORDER" in r6_payload["brief"]
+        assert "Fix auth bug" in r6_payload["brief"]
+
+        # --- dispatched, not parked: the escalated round is claimable --------
+        claimed = jobs.claim_queued("builder")
+        assert claimed is not None and claimed["builder_round"] == 6, claimed
+
+        # --- a BOUNCE after it parks the PR; advisor not called again --------
+        with patch("src.escalation._post_advise", side_effect=fake_post):
+            self._bounce_run(jobs, state, cfg, "f" * 40, pr)
+        assert len(submits) == 1, "advisor must not be called again after escalation"
+        with psycopg.connect(DSN, autocommit=True) as c:
+            parked = c.execute(
+                "SELECT detail FROM neo_actions WHERE repo='o/r' AND pr_number=%s "
+                "AND phase='parked' ORDER BY id", (pr,)).fetchall()
+        reasons = [r[0]["reason"] for r in parked if isinstance(r[0], dict) and "reason" in r[0]]
+        assert reasons, parked
+        assert "bounced again" in reasons[-1]

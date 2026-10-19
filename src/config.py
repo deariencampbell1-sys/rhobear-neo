@@ -114,6 +114,12 @@ class Config:
     # Number of builder bounces before escalation to a frontier advisor.
     bounces_before_escalation: int = field(default_factory=lambda: _get_int(
         "NEO_BOUNCES_BEFORE_ESCALATION", 5))
+    # How often Neo polls an escalating PR's advisor advice_id (seconds).
+    escalation_poll_secs: int = field(default_factory=lambda: _get_int(
+        "NEO_ESCALATION_POLL_SECS", 60))
+    # Give up polling an escalating PR after this long and park it (seconds).
+    escalation_timeout_secs: int = field(default_factory=lambda: _get_int(
+        "NEO_ESCALATION_TIMEOUT_SECS", 1800))  # 30 minutes
     # Advisor service URL (tailnet, on the build box).  Fail closed if unset.
     advisor_url: str = field(default_factory=lambda: _get("NEO_ADVISOR_URL"))
     # Bearer token for the advisor service.
@@ -135,6 +141,14 @@ class Config:
     # Deprecated legacy field — kept so pre-App unit tests can pass a
     # placeholder token; production never uses it as an identity.
     gh_token: str = field(default_factory=lambda: _get("GH_TOKEN"))
+
+    # --- trusted producer: the Reviews App's check runs -----------------
+    # A merge is authorized only by a check run whose `app.id` equals this
+    # GitHub App id AND whose `head_sha` equals the exact head SHA (full
+    # 40-char equality). A review or status from any other account (including
+    # the PR author) is ignored.  Unset = fail closed: no merge.
+    trusted_reviewer_app_id: str = field(default_factory=lambda: _get(
+        "NEO_TRUSTED_REVIEWER_APP_ID"))
 
     # --- advisor service (on the build box) ---
     advisor_bind_host: str = field(default_factory=lambda: _get(

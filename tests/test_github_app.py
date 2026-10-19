@@ -525,13 +525,15 @@ class TestWorkerWiring:
         """_review_evidence runs for real with a fake gh subprocess.
 
         The review finding says all existing tests patch _review_evidence out;
-        this one exercises the actual function (trusted_contexts lookup,
-        status fetch, rollup_green computation) against fake gh output.
+        this one exercises the actual function (check-runs fetch for the
+        trusted Reviews App, status fetch, build_evidence) against fake gh
+        output.  Item 3: the trusted producer is the App's check run on the
+        exact head SHA.
         """
-        from src.neo_worker import _review_evidence, _gh
-        import subprocess
+        from src.neo_worker import _review_evidence
 
         cfg = _cfg_with_app(rsa_key, FakeGitHubHTTP(installations={}))
+        cfg.trusted_reviewer_app_id = "12345"
 
         def fake_gh(token, *args, **kw):
             if args[:3] == ("pr", "view", str(5)):
@@ -541,6 +543,14 @@ class TestWorkerWiring:
                     "reviews": [],
                     "statusCheckRollup": [],
                 }
+                return 0, json.dumps(data)
+            if args[:3] == ("api", f"repos/acme/a/commits/{SHA1}/check-runs",):
+                data = {"check_runs": [{
+                    "name": "rhobear-reviews", "head_sha": SHA1,
+                    "app": {"id": 12345, "slug": "rhobear-reviews"},
+                    "conclusion": "success",
+                    "output": {"summary": '{"unresolved_critical_high": 0, "coverage": "complete"}'},
+                }]}
                 return 0, json.dumps(data)
             if args[:3] == ("api", f"repos/acme/a/commits/{SHA1}/status",):
                 data = {"state": "success", "statuses": [
@@ -554,7 +564,11 @@ class TestWorkerWiring:
         assert ev["ok"] is True
         assert ev["decided_sha"] == SHA1
         assert ev["head_sha"] == SHA1
-        assert ev["review_bound_ok"] is True  # no reviews -> bound is vacuously ok
+        assert ev["trusted_producer_ok"] is True
+        assert ev["review_sha_match"] is True
+        assert ev["unresolved_critical_high"] == 0
+        assert ev["coverage_complete"] is True
+        assert ev["review_bound_ok"] is True
         assert ev["trusted_green"] is True
         # Empty statusCheckRollup -> rollup_green is None (no data),
         # which is correct: there is no rollup to judge.
@@ -571,6 +585,9 @@ class TestWorkerWiring:
         def fake_gh(token, *args, **kw):
             if args[:3] == ("pr", "view", str(5)):
                 data = {"headRefOid": SHA1, "reviews": [], "statusCheckRollup": []}
+                return 0, json.dumps(data)
+            if args[:3] == ("api", f"repos/acme/a/commits/{SHA1}/check-runs",):
+                data = {"check_runs": []}
                 return 0, json.dumps(data)
             if args[:3] == ("api", f"repos/acme/a/commits/{SHA1}/status",):
                 data = {"state": "success", "statuses": []}

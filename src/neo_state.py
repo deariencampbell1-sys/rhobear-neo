@@ -114,6 +114,59 @@ class NeoState:
             )
             return cur.rowcount
 
+    # --- escalation (async advisor) --------------------------------------
+    def escalating_prs(self) -> list[dict]:
+        """PRs currently awaiting an advisor (phase='escalating'), newest row
+        per PR.  Each carries advice_id/installation_id from the detail and
+        the row's created_at (used for the give-up timeout)."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT DISTINCT ON (repo, pr_number) "
+                "repo, pr_number, head_sha, detail, created_at "
+                "FROM neo_actions WHERE phase='escalating' "
+                "ORDER BY repo, pr_number, id DESC"
+            ).fetchall()
+        out = []
+        for r in rows:
+            detail = r[3]
+            if isinstance(detail, str):
+                try:
+                    detail = json.loads(detail)
+                except (TypeError, ValueError):
+                    detail = {}
+            elif detail is None:
+                detail = {}
+            out.append({
+                "repo": r[0], "pr": r[1], "head_sha": r[2],
+                "advice_id": str(detail.get("advice_id", "") or ""),
+                "installation_id": detail.get("installation_id"),
+                "created_at": r[4],
+            })
+        return out
+
+    def clear_escalating(self, repo: str, pr: int) -> int:
+        """Remove ALL escalating markers for a PR (handled: escalated or
+        parked).  Clears by (repo, pr) so a later head can never double-
+        escalate the same PR."""
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM neo_actions WHERE repo=%s AND pr_number=%s "
+                "AND phase='escalating'",
+                (repo, pr),
+            )
+            return cur.rowcount
+
+    def already_escalated(self, repo: str, pr: int) -> bool:
+        """True once this PR has had its ONE escalated round.  A further
+        BOUNCE after escalation parks the PR (no second escalation)."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT 1 FROM neo_actions WHERE repo=%s AND pr_number=%s "
+                "AND phase='escalated' LIMIT 1",
+                (repo, pr),
+            ).fetchone()
+        return row is not None
+
     # --- per-install settings + credits ------------------------------------
     def install(self, install_id: str, org: str) -> dict:
         with self._conn() as c:

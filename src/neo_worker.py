@@ -109,14 +109,13 @@ def _is_trusted(context: str, trusted: tuple[str, ...]) -> bool:
 def _review_evidence(token: str, cfg: Config, repo: str, pr: int, sha: str) -> dict:
     """Machine-readable review evidence bound to ONE commit, not to the PR.
 
-    A result produced for commit A may authorize only commit A. What is
-    genuinely SHA-bound here is the trusted review commit-status: GitHub stores
-    it against an immutable commit. Formal review objects are context — the
-    reviewer's own objects carry `commit_id: null`, so when a commit_id IS
-    present it must match, and when it is absent the status carries the binding.
-
-    Computes rollup_green from the statusCheckRollup (fixes defect 5: was
-    never populated).
+    A result produced for commit A may authorize only commit A.  The trusted
+    producer is the Reviews App's CHECK RUN on exactly `sha` (GET
+    /repos/{repo}/commits/{sha}/check-runs): only a check run whose `app.id`
+    equals NEO_TRUSTED_REVIEWER_APP_ID and whose `head_sha` equals `sha`
+    (full 40-char equality) counts.  A review or status from any other
+    account (including the PR author) is ignored.  Unresolved CRITICAL/HIGH
+    and coverage come from that run's output.summary JSON — never hard-coded.
     """
     try:
         rc, raw = _gh(token, "pr", "view", str(pr), "-R", repo,
@@ -131,12 +130,24 @@ def _review_evidence(token: str, cfg: Config, repo: str, pr: int, sha: str) -> d
     except (TypeError, ValueError):
         return {"ok": False, "reason": "pr view malformed", "decided_sha": sha}
 
-    head = str(data.get("headRefOid") or "")
+    # Trusted producer: check runs for EXACTLY this sha.  Only the run from
+    # the configured Reviews App on this exact head authorizes a merge.
+    try:
+        rc, raw_checks = _gh(token, "api",
+                             f"repos/{repo}/commits/{sha}/check-runs", timeout=30)
+        if rc == 0:
+            data["check_runs"] = (json.loads(raw_checks).get("check_runs") or [])
+        else:
+            data["check_runs"] = []
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"check-runs read failed ({type(exc).__name__})",
+                "decided_sha": sha}
+
     reviews = data.get("reviews") or []
     review_sha = next((str(r.get("commit_id") or "") for r in reversed(reviews)
                        if r.get("body")), "")
 
-    # The reviewer's gate, read straight off the commit.
+    # The reviewer's gate, read straight off the commit (context-based legacy).
     trusted = _trusted_contexts(cfg)
     trusted_states: list[str] = []
     try:
@@ -162,20 +173,18 @@ def _review_evidence(token: str, cfg: Config, repo: str, pr: int, sha: str) -> d
         or str(c.get("state") or "").upper() == "SUCCESS"
         for c in rollup
     ) if rollup else None
-    return {
-        "ok": True,
-        "decided_sha": sha,
-        "head_sha": head,
-        "review_sha": review_sha,
-        # A nil commit_id is the reviewer's normal shape; a present-but-different
-        # one is evidence about another commit and must not authorize this one.
-        "review_bound_ok": (not review_sha) or review_sha == sha or review_sha.startswith(sha),
-        "trusted_states": trusted_states,
-        "trusted_green": bool(trusted_states) and all(s == "success" for s in trusted_states),
-        # Informational only: this repo's inherited CI wall is red on every PR.
-        "failing_checks": len(failing),
-        "rollup_green": all_success,
-    }
+
+    # Deterministic evidence (trusted App check run + output summary) plus
+    # the legacy keys the rest of the worker still consumes.
+    from . import review_evidence as rev_ev
+    ev = rev_ev.build_evidence(cfg, data, sha)
+    ev["review_sha"] = review_sha
+    ev["review_bound_ok"] = ev.get("review_sha_match", True)
+    ev["trusted_states"] = trusted_states
+    ev["trusted_green"] = bool(trusted_states) and all(s == "success" for s in trusted_states)
+    ev["failing_checks"] = ev.get("required_checks_failing", len(failing))
+    ev["rollup_green"] = all_success
+    return ev
 
 
 def merge_authority(install_auto_merge: bool, evidence: dict,
@@ -191,6 +200,11 @@ def merge_authority(install_auto_merge: bool, evidence: dict,
         return False, "the reviewed commit is not this head SHA"
     if not evidence.get("trusted_green"):
         return False, "the trusted review status is not success on this exact head SHA"
+    # Trusted producer = the Reviews App's check run on this exact head
+    # (item 3).  A dict without the key (older patched evidence) keeps the
+    # legacy behavior; an explicit False means no trusted run -> no merge.
+    if evidence.get("trusted_producer_ok") is False:
+        return False, "no trusted check run from the Reviews App on this exact head"
     blockers = jev.blockers
     if blockers:
         return False, "Jev blocking findings: " + ",".join(f.rule for f in blockers)
@@ -485,24 +499,32 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict) -> None:
     verdict_base = verdict.split()[0] if verdict else ""
     is_accept = verdict_base in ("ACCEPT", "ACCEPT-MERGED", "ACCEPT-READY")
     is_builder = verdict_base == "BOUNCE-BUILDER"
+    advice_id = ""  # set when the escalation path submits to the advisor
 
     if is_accept:
         # Use the evidence already fetched by _review_evidence above.
         # Convert the old evidence dict to the new format for merge_authority.
+        # Item 4: unresolved_critical_high and coverage_complete come from the
+        # trusted check run's output.summary — nothing is hard-coded here;
+        # missing -> merge denied.
         from . import review_evidence as rev_ev
         evidence_b2 = {
             "ok": evidence.get("ok", False),
             "reason": evidence.get("reason", ""),
             "head_sha": evidence.get("head_sha", ""),
             "decided_sha": evidence.get("decided_sha", sha),
-            "trusted_producer_ok": evidence.get("trusted_green", False),
-            "review_sha_match": evidence.get("review_bound_ok", True),
+            "trusted_producer_ok": evidence.get(
+                "trusted_producer_ok", evidence.get("trusted_green", False)),
+            "review_sha_match": evidence.get(
+                "review_sha_match", evidence.get("review_bound_ok", False)),
             "required_checks_pass": (
                 evidence.get("rollup_green") is not False
             ),
             "required_checks_failing": evidence.get("failing_checks", 0),
-            "unresolved_critical_high": 0,
-            "coverage_complete": True,
+            # From the trusted check run's output — not hard-coded.  Missing
+            # (None) is denied by merge_authority.
+            "unresolved_critical_high": evidence.get("unresolved_critical_high"),
+            "coverage_complete": evidence.get("coverage_complete", False),
             "auto_merge": install_auto_merge,
         }
         granted, reason = rev_ev.merge_authority(evidence_b2)
@@ -543,32 +565,40 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict) -> None:
         # --- B2: Escalation check before dispatching builder ---------------
         rounds = state.builder_rounds(repo, pr)
         bounces_before = getattr(cfg, "bounces_before_escalation", 5)
-        if rounds >= bounces_before:
+        if state.already_escalated(repo, pr):
+            # This PR already had its ONE escalated round; a further bounce
+            # parks it for the owner — no second escalation, no more rounds.
+            log.info("%s#%s@%s already escalated — bounce parks the PR",
+                     repo, pr, sha[:8])
+            phase = "parked"
+            state.record(repo, pr, sha, "parked", verdict="PARKED",
+                         detail={"reason": "escalated builder round bounced again"})
+        elif rounds >= bounces_before:
             log.info("%s#%s@%s %d builder rounds — escalating to advisor",
                      repo, pr, sha[:8], rounds)
             from . import escalation
             try:
-                round_records = []
-                # Build round records from state history.
-                for r in range(1, rounds + 1):
-                    round_records.append(
-                        escalation.RoundRecord(
-                            round_no=r, sha=sha,
-                            outcome="bounced",
-                        )
+                round_records = [
+                    escalation.RoundRecord(
+                        round_no=r, sha=sha, outcome="bounced",
                     )
-                outcome = escalation.escalate_pr(
+                    for r in range(1, rounds + 1)
+                ]
+                # Async: submit returns immediately (advisor runs on the build
+                # box); the recovery loop polls and creates the ONE escalated
+                # round when the work order is done.
+                outcome = escalation.submit_escalation(
                     cfg, state, jobs, repo, pr, sha,
                     rounds=round_records,
                     diff_stat=_compute_diff_stat(token, repo, pr),
                     installation_id=wake.get("installation_id"),
                 )
-                if outcome["action"] == "escalated":
-                    phase = "escalated"
-                    # escalate_pr already created the builder job with the work order.
-                    # Do NOT create a second one here — it would clobber the payload.
+                if outcome["action"] == "escalating":
+                    phase = "escalating"
+                    advice_id = outcome.get("advice_id", "")
                 else:
                     phase = "parked"
+                    advice_id = ""
             except Exception as exc:
                 log.warning("%s#%s@%s escalation failed: %s — parking",
                             repo, pr, sha[:8], exc)
@@ -595,10 +625,16 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict) -> None:
     new_round = (rounds + 1) if is_builder else rounds
 
     # The phase row carries the verdict colour so a retry after a crash can tell this
-    # verdict's work is already done (see the gate above).
+    # verdict's work is already done (see the gate above).  An `escalating` row
+    # carries the advisor advice_id (submit_escalation already recorded one with
+    # the full detail; this row keeps the advice_id too so the recovery loop's
+    # newest-first escalating_prs() always finds it).
+    _phase_detail = {"green": wake.get("green"), "wake_job": job_id}
+    if phase == "escalating" and advice_id:
+        _phase_detail["advice_id"] = advice_id
     state.record(repo, pr, sha, phase, verdict=verdict,
                  builder_round=new_round, credits=credits,
-                 detail={"green": wake.get("green"), "wake_job": job_id})
+                 detail=_phase_detail)
     # The triage marker goes LAST: it vouches that the phase row and any builder job above
     # exist. A crash before this line leaves the phase row, which the gate above detects.
     state.record(repo, pr, sha, "triage", detail={"context": wake.get("context"),
