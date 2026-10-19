@@ -21,7 +21,7 @@ Architecture:
   - Fail-closed on nonzero exit, timeout, missing result, or unknown verdict.
 
 Usage:
-    agent = HermesAgent.from_config(cfg)
+    agent = HermesAgent.from_config(cfg, gh_token=installation_token)
     usage, verdict = agent.run(brief)
 """
 from __future__ import annotations
