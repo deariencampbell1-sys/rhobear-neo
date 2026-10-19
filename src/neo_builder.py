@@ -43,6 +43,12 @@ from pathlib import Path
 
 from .agent_hermes import AgentError, HermesAgent, MissingResult, NonZeroExit
 from .config import Config
+from .github_app import (
+    AppNotConfigured,
+    NoInstallation,
+    github_app_for,
+    repo_token,
+)
 from .jobs import Jobs
 
 log = logging.getLogger("rhobear_neo.builder")
@@ -175,13 +181,14 @@ def _mark(conn, row_id: int, payload: dict) -> None:
     conn.commit()
 
 
-def gh(cfg: Config, *args: str, timeout: int = 30) -> tuple[int, str]:
-    env = {**os.environ, "GH_TOKEN": cfg.gh_token}
+def gh(token: str, *args: str, timeout: int = 30) -> tuple[int, str]:
+    """Run `gh` as the repo's installation token (never a personal token)."""
+    env = {**os.environ, "GH_TOKEN": token}
     p = subprocess.run(["gh", *args], capture_output=True, text=True, env=env, timeout=timeout)
     return p.returncode, (p.stdout or p.stderr).strip()
 
 
-def pr_state(cfg: Config, repo: str, pr: int) -> str:
+def pr_state(token: str, repo: str, pr: int) -> str:
     """Fetch PR state from GitHub. Returns empty string on any failure.
 
     Defect 2 fix: the old code returned "" on any failure (network, HTTP,
@@ -189,20 +196,22 @@ def pr_state(cfg: Config, repo: str, pr: int) -> str:
     Now we only treat explicit CLOSED/MERGED as terminal; empty/garbage leaves
     the job queued for retry.
     """
-    rc, out = gh(cfg, "api", f"repos/{repo}/pulls/{pr}", "--jq", "[.state, .head.ref] | @tsv")
+    rc, out = gh(token, "api", f"repos/{repo}/pulls/{pr}", "--jq", "[.state, .head.ref] | @tsv")
     if rc != 0:
         return ""  # transient failure — caller should retry
     return out.strip()
 
 
-def prepare_worktree(cfg: Config, repo: str, pr: int) -> tuple[str, str]:
-    """clone + checkout the PR head; returns (worktree_path, head_branch)."""
+def prepare_worktree(token: str, repo: str, pr: int) -> tuple[str, str]:
+    """clone + checkout the PR head; returns (worktree_path, head_branch).
+
+    `token` is this repo's GitHub App installation token. The token never goes
+    in a URL: a failed clone's error text (logged) and .git/config (on disk)
+    would both carry it. The helper reads GH_TOKEN from the environment at use
+    time; the fixer agent gets GH_TOKEN the same way."""
     dest = WORKTREES / f"{repo.replace('/', '-')}-{pr}"
-    # The token never goes in a URL: a failed clone's error text (logged) and
-    # .git/config (on disk) would both carry it. The helper reads GH_TOKEN from
-    # the environment at use time; the fixer agent gets GH_TOKEN the same way.
     url = f"https://github.com/{repo}.git"
-    env = {**os.environ, "GH_TOKEN": cfg.gh_token}
+    env = {**os.environ, "GH_TOKEN": token}
     lock_dir = Path("/tmp/rhobear-wt-locks")
     lock_dir.mkdir(parents=True, exist_ok=True)
     lock_path = lock_dir / f"{repo.replace('/', '-')}-{pr}.lock"
@@ -221,12 +230,12 @@ def prepare_worktree(cfg: Config, repo: str, pr: int) -> tuple[str, str]:
                        check=True, timeout=300, env=env)
         subprocess.run(["git", "-C", str(dest), "checkout", "-q", "-b", f"fix-pr-{pr}", f"pr-{pr}"],
                        check=True, timeout=120)
-    state = pr_state(cfg, repo, pr)
+    state = pr_state(token, repo, pr)
     head_branch = state.split("\t")[-1] if "\t" in state else state or ""
     return str(dest), head_branch
 
 
-def fetch_findings(cfg: Config, repo: str, pr: int) -> str:
+def fetch_findings(token: str, repo: str, pr: int) -> str:
     """Reviewer findings for this PR. DB first, then the PR's own timeline.
 
     The DB lookup is scoped to 6 hours, so ANY PR last reviewed before today
@@ -252,11 +261,11 @@ def fetch_findings(cfg: Config, repo: str, pr: int) -> str:
         log.warning("findings fetch failed (falling back to timeline): %s", e)
 
     parts = []
-    rc, out = gh(cfg, "api", f"repos/{repo}/issues/{pr}/comments", "--paginate",
+    rc, out = gh(token, "api", f"repos/{repo}/issues/{pr}/comments", "--paginate",
                  "--jq", JQ_ISSUE_COMMENTS, timeout=60)
     if rc == 0 and out.strip():
         parts.append("## Reviewer comments on this PR" + NEWLINE + out.strip()[-14000:])
-    rc, out = gh(cfg, "api", f"repos/{repo}/pulls/{pr}/comments", "--paginate",
+    rc, out = gh(token, "api", f"repos/{repo}/pulls/{pr}/comments", "--paginate",
                  "--jq", JQ_INLINE_COMMENTS, timeout=60)
     if rc == 0 and out.strip():
         parts.append("## Inline review comments" + NEWLINE + out.strip()[-8000:])
@@ -328,7 +337,27 @@ def dispatch_one(cfg: Config, jobs: Jobs, row: dict) -> None:
                  repo, pr, round_, cfg.max_builder_rounds)
         return
 
-    state = pr_state(cfg, repo, pr).split("\t")[0]
+    # --- GitHub identity for THIS repo (the customer's App installation) ---
+    # Every gh/git call below uses the repo's installation token, never a
+    # personal token. The webhook's installation.id (carried through the wake
+    # job into the builder job payload) is used when present. A repo with no
+    # App installation is refused: no_installation, terminal, not retried.
+    payload = row.get("payload") or {}
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except (TypeError, ValueError):
+            payload = {}
+    try:
+        token = repo_token(cfg, repo, (payload or {}).get("installation_id"))
+    except (NoInstallation, AppNotConfigured) as exc:
+        log.warning("refusing builder round %s#%s: %s — no GitHub App "
+                    "installation (no_installation)", repo, pr, exc)
+        jobs.resolve(row["id"], "no_installation", worker_token=wtoken,
+                     payload={"reason": f"no GitHub App installation for {repo}"})
+        return
+
+    state = pr_state(token, repo, pr).split("\t")[0]
     if state.upper() == "CLOSED" or state.upper() == "MERGED":
         log.info("skip (closed/merged): %s#%s", repo, pr)
         jobs.resolve(row["id"], "no_change", worker_token=wtoken,
@@ -340,13 +369,13 @@ def dispatch_one(cfg: Config, jobs: Jobs, row: dict) -> None:
         log.warning("pr_state returned empty for %s#%s — job stays running", repo, pr)
         return
     try:
-        worktree, head_branch = prepare_worktree(cfg, repo, pr)
+        worktree, head_branch = prepare_worktree(token, repo, pr)
     except Exception as e:
         # Never log e itself: a subprocess error carries the whole command line.
         log.error("worktree prep failed %s#%s: %s (rc=%s)", repo, pr,
                   type(e).__name__, getattr(e, "returncode", None))
         return  # job stays running — lease expiry handles recovery
-    findings = fetch_findings(cfg, repo, pr)
+    findings = fetch_findings(token, repo, pr)
     brief = build_brief(repo, pr, sha, str(round_), head_branch, findings)
     brief_dir = BRIEFS / f"{repo.replace('/', '-')}-{pr}"
     brief_dir.mkdir(parents=True, exist_ok=True)
@@ -360,12 +389,12 @@ def dispatch_one(cfg: Config, jobs: Jobs, row: dict) -> None:
     log.info("dispatched: %s#%s round=%s worktree=%s branch=%s",
              repo, pr, round_, worktree, head_branch)
 
-    rc, head_before = gh(cfg, "api", f"repos/{repo}/pulls/{pr}", "--jq", ".head.sha")
+    rc, head_before = gh(token, "api", f"repos/{repo}/pulls/{pr}", "--jq", ".head.sha")
     head_before = (head_before or "").strip()
     agent = BuilderAgent(
         work_dir=worktree,
         hermes_bin=cfg.hermes_bin, provider=cfg.hermes_provider, model=cfg.hermes_model,
-        timeout=int(os.environ.get("NEO_BUILDER_TIMEOUT") or cfg.deepseek_timeout), gh_token=cfg.gh_token,
+        timeout=int(os.environ.get("NEO_BUILDER_TIMEOUT") or cfg.deepseek_timeout), gh_token=token,
     )
     try:
         # Lease renewal: the agent run can outlive a static lease — without it
@@ -385,7 +414,7 @@ def dispatch_one(cfg: Config, jobs: Jobs, row: dict) -> None:
                    reason=f"builder agent crashed ({type(exc).__name__})")
         return
 
-    head_after = gh(cfg, "api", f"repos/{repo}/pulls/{pr}", "--jq", ".head.sha")[1].strip()
+    head_after = gh(token, "api", f"repos/{repo}/pulls/{pr}", "--jq", ".head.sha")[1].strip()
     # A push is the real outcome signal (more reliable than the advisory
     # verdict); it re-arms reviewer + Neo immediately.
     if head_before and head_after:
@@ -436,6 +465,18 @@ def main() -> int:
         repo_filter = args[args.index("--repo") + 1]
     cfg = Config()
     cfg.require().validate()
+    # Neo acts as the customer's GitHub App — a personal GH_TOKEN is never an
+    # identity. Refuse to run without the App identity (fail closed) and log
+    # once if a stale GH_TOKEN is still in the env (it is ignored).
+    if cfg.gh_token:
+        log.warning("GH_TOKEN is set in the environment but IGNORED — Neo "
+                    "authenticates as the GitHub App (NEO_GITHUB_APP_ID + key)")
+    if github_app_for(cfg) is None:
+        raise RuntimeError(
+            "rhobear-neo missing GitHub App identity — set NEO_GITHUB_APP_ID "
+            "and NEO_GITHUB_APP_KEY_PATH (or NEO_GITHUB_APP_KEY); a personal "
+            "GH_TOKEN is never used as an identity"
+        )
     jobs = Jobs(cfg.database_url)
     jobs.ensure_schema()
     pool = concurrent.futures.ThreadPoolExecutor(
@@ -521,9 +562,27 @@ def main() -> int:
                          repo, pr, round_, cfg.max_builder_rounds)
                 continue
 
+            # Per-repo installation token. A repo with no App installation is
+            # refused here (no_installation, terminal — never dispatched).
+            payload = row.get("payload") or {}
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except (TypeError, ValueError):
+                    payload = {}
+            try:
+                token = repo_token(cfg, repo, (payload or {}).get("installation_id"))
+            except (NoInstallation, AppNotConfigured) as exc:
+                log.warning("refusing builder round %s#%s: %s — no GitHub App "
+                            "installation (no_installation)", repo, pr, exc)
+                jobs.resolve(row["id"], "no_installation",
+                             worker_token=row.get("worker_token"),
+                             payload={"reason": f"no GitHub App installation for {repo}"})
+                continue
+
             # Check PR is still open (defect 2 fix: empty = transient, retry;
             # GLM 8: never resolve transient failure as terminal 'failed').
-            state = pr_state(cfg, repo, pr).split("\t")[0]
+            state = pr_state(token, repo, pr).split("\t")[0]
             if state.upper() in ("CLOSED", "MERGED"):
                 jobs.resolve(row["id"], "no_change",
                              worker_token=row.get("worker_token"),

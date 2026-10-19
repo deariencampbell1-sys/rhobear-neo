@@ -113,7 +113,18 @@ class Config:
     # --- state (shared VPS Postgres; Neo uses its own tables) ---
     database_url: str = field(default_factory=lambda: _get("DATABASE_URL"))
 
-    # --- github auth (App token preferred; gh-cli token fallback) ---
+    # --- github auth: Neo acts as the customer's GitHub App --------------
+    # A paying customer's private repo is reached via the App installation on
+    # that repo (installation token), never via a personal gho_ token. GH_TOKEN
+    # is deliberately NOT an identity any more; if it is still set in the env
+    # it is logged once at startup and ignored (see __main__).
+    github_app_id: str = field(default_factory=lambda: _get("NEO_GITHUB_APP_ID"))
+    # The App private key: either the path to the PEM file, or the PEM text
+    # itself. Never logged.
+    github_app_key_path: str = field(default_factory=lambda: _get("NEO_GITHUB_APP_KEY_PATH"))
+    github_app_key: str = field(default_factory=lambda: _get("NEO_GITHUB_APP_KEY"))
+    # Deprecated legacy field — kept so pre-App unit tests can pass a
+    # placeholder token; production never uses it as an identity.
     gh_token: str = field(default_factory=lambda: _get("GH_TOKEN"))
 
     # Optional Jev review-of-the-reviewer call. This is a separate OpenRouter
@@ -122,11 +133,13 @@ class Config:
         _get("NEO_OPENROUTER_API_KEY") or _get("OPENROUTER_API_KEY")))
 
     def require(self) -> "Config":
+        # GH_TOKEN is NOT required (and is not an identity). The GitHub App
+        # identity is checked at startup (__main__ / neo_builder.main) so the
+        # personal token can never become a silent fallback.
         missing = [n for n, v in {
             "RHOBEAR_NEO_WEBHOOK_SECRET": self.webhook_secret,
             "DEEPSEEK_API_KEY/NEO_DEEPSEEK_API_KEY": self.deepseek_key,
             "DATABASE_URL": self.database_url,
-            "GH_TOKEN": self.gh_token,
         }.items() if not v]
         if missing:
             raise RuntimeError(f"rhobear-neo missing required env: {', '.join(missing)}")

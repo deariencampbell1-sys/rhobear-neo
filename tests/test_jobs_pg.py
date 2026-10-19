@@ -39,6 +39,7 @@ import psycopg
 import pytest
 
 from src.config import Config
+from src.github_app import NoInstallation
 from src.jobs import Jobs
 from src.neo_state import NeoState
 from src.jev_review import JevAssessment
@@ -860,3 +861,50 @@ class TestCrashWindows:
             rounds = c.execute("SELECT builder_round FROM neo_jobs WHERE kind='builder' ORDER BY id").fetchall()
         assert rounds == [(1,)], rounds
         assert state.already_acted("o/r", 5, SHA1, "triage", green=True)
+
+
+# ---------------------------------------------------------------------------
+# N15-B1g — a repo with no GitHub App installation is refused: the job resolves
+# `no_installation` (terminal, never retried) against the real job store.
+# ---------------------------------------------------------------------------
+
+class _NoInstallApp:
+    """Fake GitHub App that reports no installation for any repo."""
+
+    def token_for_repo(self, repo, installation_id=None):
+        raise NoInstallation(f"repo {repo} has no GitHub App installation")
+
+
+class TestNoInstallationRefusal:
+    def test_wake_resolves_no_installation_terminal(self, db):
+        from src.neo_worker import run_neo
+        cfg = _cfg()
+        setattr(cfg, "_rhobear_github_app", _NoInstallApp())
+        state = NeoState(DSN)
+        wake = {"repo": "o/r", "sha": SHA1, "green": True,
+                "context": "rhobear-reviews", "pr_number": 5}
+        with patch("src.neo_worker.resolve_pr") as resolve_pr:
+            run_neo(cfg, state, db, wake)
+        resolve_pr.assert_not_called()  # refused before any GitHub work
+        with psycopg.connect(DSN, autocommit=True) as c:
+            rows = c.execute("SELECT state, outcome, attempt, payload "
+                             "FROM neo_jobs WHERE kind='wake'").fetchall()
+        assert len(rows) == 1, rows
+        st, outcome, attempt, payload = rows[0]
+        assert st == "done" and outcome == "no_installation", rows
+        assert attempt == 1, rows  # claimed once, then terminal — never retried
+        assert "no GitHub App installation" in payload["reason"]
+
+    def test_builder_round_resolves_no_installation_terminal(self, db):
+        from src.neo_builder import dispatch_one
+        cfg = _cfg()
+        setattr(cfg, "_rhobear_github_app", _NoInstallApp())
+        cfg.max_builder_rounds = 3
+        row_id = db.create_builder("o/r", 5, SHA1, 1)
+        row = db.claim_queued("builder")
+        assert row is not None and row["id"] == row_id
+        with patch("src.neo_builder.pr_state") as pr_state:
+            dispatch_one(cfg, db, row)
+        pr_state.assert_not_called()  # refused before any GitHub work
+        r = db.get(row_id)
+        assert r["state"] == "done" and r["outcome"] == "no_installation", r

@@ -127,10 +127,14 @@ class TestJobLifecycle:
         with patch("src.jobs.psycopg.connect", return_value=mock_conn):
             j = Jobs("postgresql://fake:5432/db")
             assert j.resolve(42, "done") is True
+            # no_installation is the terminal refusal for a repo the GitHub App
+            # is not installed on (never retried).
+            assert j.resolve(42, "no_installation") is True
             for bad in ("failed", "retry", ""):
                 with pytest.raises(AssertionError):
                     j.resolve(42, bad)
-            assert TERMINAL_OUTCOMES == ("done", "no_change", "superseded", "parked")
+            assert TERMINAL_OUTCOMES == (
+                "done", "no_change", "no_installation", "superseded", "parked")
 
     def test_retry_returns_queued_and_parks_at_cap(self, mock_conn):
         """failed(retryable) goes back to queued; at the cap it parks."""

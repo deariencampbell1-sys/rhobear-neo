@@ -27,6 +27,7 @@ from .config import Config
 from .jobs import Jobs
 from .neo_state import NeoState
 from .agent_claude import ClaudeAgent, AgentError
+from .github_app import AppNotConfigured, NoInstallation, repo_token
 from . import neo_protocol
 from .jev_review import JevAssessment, assess as jev_assess
 
@@ -42,16 +43,17 @@ GEMINI = {  # $/token
 }
 
 
-def _gh(cfg: Config, *args: str, timeout: int = 30) -> tuple[int, str]:
-    env = {**os.environ, "GH_TOKEN": cfg.gh_token}
+def _gh(token: str, *args: str, timeout: int = 30) -> tuple[int, str]:
+    """Run `gh` as the repo's installation token (never a personal token)."""
+    env = {**os.environ, "GH_TOKEN": token}
     p = subprocess.run(["gh", *args], capture_output=True, text=True, env=env, timeout=timeout)
     return p.returncode, (p.stdout or p.stderr).strip()
 
 
-def resolve_pr(cfg: Config, repo: str, sha: str, given: int | None) -> int | None:
+def resolve_pr(token: str, repo: str, sha: str, given: int | None) -> int | None:
     if given:
         return given
-    rc, out = _gh(cfg, "api", f"repos/{repo}/commits/{sha}/pulls",
+    rc, out = _gh(token, "api", f"repos/{repo}/commits/{sha}/pulls",
                   "-H", "Accept: application/vnd.github+json")
     if rc != 0:
         log.warning("resolve_pr gh failed repo=%s sha=%s: %s", repo, sha[:8], out[:120])
@@ -88,7 +90,7 @@ def _is_trusted(context: str, trusted: tuple[str, ...]) -> bool:
     return any(context == c or context.startswith(c) for c in trusted)
 
 
-def _review_evidence(cfg: Config, repo: str, pr: int, sha: str) -> dict:
+def _review_evidence(token: str, repo: str, pr: int, sha: str) -> dict:
     """Machine-readable review evidence bound to ONE commit, not to the PR.
 
     A result produced for commit A may authorize only commit A. What is
@@ -101,7 +103,7 @@ def _review_evidence(cfg: Config, repo: str, pr: int, sha: str) -> dict:
     never populated).
     """
     try:
-        rc, raw = _gh(cfg, "pr", "view", str(pr), "-R", repo,
+        rc, raw = _gh(token, "pr", "view", str(pr), "-R", repo,
                       "--json", "headRefOid,reviews,statusCheckRollup", timeout=45)
     except Exception as exc:  # noqa: BLE001 — fail closed, never strand the wake
         return {"ok": False, "reason": f"evidence read failed ({type(exc).__name__})",
@@ -122,7 +124,7 @@ def _review_evidence(cfg: Config, repo: str, pr: int, sha: str) -> dict:
     trusted = _trusted_contexts(cfg)
     trusted_states: list[str] = []
     try:
-        rc, raw_status = _gh(cfg, "api", f"repos/{repo}/commits/{sha}/status", timeout=30)
+        rc, raw_status = _gh(token, "api", f"repos/{repo}/commits/{sha}/status", timeout=30)
         if rc == 0:
             for item in (json.loads(raw_status).get("statuses") or []):
                 if _is_trusted(str(item.get("context") or ""), trusted):
@@ -179,14 +181,14 @@ def merge_authority(install_auto_merge: bool, evidence: dict,
     return True, "exact-head evidence complete"
 
 
-def _jev_for_pr(cfg: Config, repo: str, pr: int, sha: str = "") -> JevAssessment:
+def _jev_for_pr(token: str, cfg: Config, repo: str, pr: int, sha: str = "") -> JevAssessment:
     """Read this PR's patch and review evidence for one cheap Jev decision."""
     if not isinstance(cfg.jev_api_key, str) or not cfg.jev_api_key:
         return JevAssessment(False, reason="no OpenRouter key")
-    rc, diff = _gh(cfg, "pr", "diff", str(pr), "-R", repo, timeout=45)
+    rc, diff = _gh(token, "pr", "diff", str(pr), "-R", repo, timeout=45)
     if rc != 0:
         return JevAssessment(False, reason="PR diff unavailable")
-    rc, raw = _gh(cfg, "pr", "view", str(pr), "-R", repo,
+    rc, raw = _gh(token, "pr", "view", str(pr), "-R", repo,
                   "--json", "reviews,comments", timeout=45)
     if rc != 0:
         return JevAssessment(False, reason="review evidence unavailable")
@@ -274,8 +276,26 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict) -> None:
             log.info("deduped wake %s@%s — an active job already owns it", repo, sha[:8])
             return
 
+    # --- GitHub identity for THIS repo (the customer's App installation) ---
+    # Neo acts as the GitHub App: every GitHub call below uses this repo's
+    # installation token, never a personal token. A repo with no App
+    # installation is refused with a clear log line and the job resolves
+    # `no_installation` — terminal, not retried (owner re-arms by installing
+    # the App on the repo).
     try:
-        pr = resolve_pr(cfg, repo, sha, wake.get("pr_number"))
+        token = repo_token(cfg, repo, wake.get("installation_id"))
+    except (NoInstallation, AppNotConfigured) as exc:
+        log.warning("refusing wake %s@%s: %s — no GitHub App installation "
+                    "(no_installation)", repo, sha[:8], exc)
+        wtoken = secrets.token_hex(16)
+        if jobs.claim(job_id, pr_number=wake.get("pr_number"),
+                      lease_secs=_wake_lease(cfg), worker_token=wtoken):
+            jobs.resolve(job_id, "no_installation", worker_token=wtoken,
+                         payload={"reason": f"no GitHub App installation for {repo}"})
+        return
+
+    try:
+        pr = resolve_pr(token, repo, sha, wake.get("pr_number"))
     except Exception as exc:
         # gh hung (TimeoutExpired) or is missing: before the claim, nothing else would
         # release this job — its submitted_at stamp hides it from the sweep. Release it
@@ -355,7 +375,7 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict) -> None:
     if inst.get("plan") and inst.get("credits_balance", 0) <= 0:
         state.record(repo, pr, sha, "escalated", verdict="ESCALATE",
                      detail={"reason": "out of credits"})
-        _gh(cfg, "pr", "comment", str(pr), "-R", repo,
+        _gh(token, "pr", "comment", str(pr), "-R", repo,
             "--body", "Neo: this install is out of credits — top up to resume auto-fix/merge.")
         jobs.park(job_id, reason="out of credits — owner must top up")
         log.info("%s#%s: install out of credits — gated", repo, pr)
@@ -368,7 +388,7 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict) -> None:
         install_auto_merge = bool(inst_auto_merge)
 
     # --- exact-SHA evidence (Phase A) --------------------------------------
-    evidence = _review_evidence(cfg, repo, pr, sha)
+    evidence = _review_evidence(token, repo, pr, sha)
     if evidence.get("ok") and evidence.get("head_sha") and evidence["head_sha"] != sha:
         state.record(repo, pr, sha, "stale_head", verdict="STALE",
                      detail={"context": wake.get("context"),
@@ -380,7 +400,7 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict) -> None:
         return
 
     # Jev never supplies a green verdict.
-    jev = _jev_for_pr(cfg, repo, pr, sha)
+    jev = _jev_for_pr(token, cfg, repo, pr, sha)
     auto_merge, authority_reason = merge_authority(install_auto_merge, evidence, jev)
     log.info("%s#%s@%s Jev available=%s risk=%s quality=%s partial=%s "
              "requires_full_review=%s blockers=%s",
@@ -407,7 +427,8 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict) -> None:
         max_builder_rounds=cfg.max_builder_rounds, builder_model=cfg.deepseek_model,
         jev_context=jev.brief() + "\n" + evidence_brief(evidence, auto_merge, authority_reason),
     )
-    agent = ClaudeAgent.from_config(cfg)
+    # The agent gets the repo's installation token, never a personal one.
+    agent = ClaudeAgent.from_config(cfg, gh_token=token)
     try:
         # Lease renewal: a static lease shorter than the agent run would let a
         # second worker claim the same SHA mid-run (GLM 6 applies to wakes too).
@@ -444,6 +465,7 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict) -> None:
             "verdict": verdict, "wake_job": job_id,
             "head_sha": sha, "phase": phase, "round": new_round,
             "context": wake.get("context"),
+            "installation_id": wake.get("installation_id"),
         })
     # The phase row carries the verdict colour so a retry after a crash can tell this
     # verdict's work is already done (see the gate above).
