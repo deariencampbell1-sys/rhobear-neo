@@ -15,9 +15,9 @@ refused (job outcome `no_installation`, terminal).
     with a short TTL so a newly installed repo is picked up promptly.
 
 Uses PyJWT + cryptography (already in requirements) and stdlib `urllib` over
-plain HTTPS — no new dependency. Caches are guarded by a lock (double-checked
-read under the same lock as the write, so a cold-cache fetch happens exactly
-once even under concurrency).
+plain HTTPS — no new dependency. Caches are read and written under a lock; the
+HTTP call itself runs outside it, so one slow GitHub call never stalls the other
+repos (concurrent cold misses may each mint a token — every one is valid).
 """
 from __future__ import annotations
 
@@ -86,9 +86,9 @@ def load_app_key(cfg) -> str:
 class GitHubApp:
     """App identity: JWT signing + per-installation token minting + caching.
 
-    Thread-safe: caches are read and written under `_lock`, and the cold-cache
-    fetch happens inside the lock so exactly one HTTP call mints a token even
-    when several workers hit the same installation at once.
+    Thread-safe: caches are read and written under `_lock`; HTTP runs outside
+    it (a slow call never blocks other repos). Concurrent cold misses on one
+    installation may each mint a token; all are valid and the last one cached.
     """
 
     def __init__(

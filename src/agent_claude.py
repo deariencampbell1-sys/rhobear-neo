@@ -14,7 +14,7 @@ Architecture:
     permission denials, truncation, or malformed JSON
 
 Usage:
-    agent = ClaudeAgent.from_config(cfg)
+    agent = ClaudeAgent.from_config(cfg, gh_token=installation_token)
     usage, verdict = agent.run(brief)
 """
 from __future__ import annotations
