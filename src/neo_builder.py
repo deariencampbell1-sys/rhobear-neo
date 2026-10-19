@@ -1,19 +1,30 @@
 """Neo builder lane — dispatches BOUNCE-BUILDER fixes with the Hermes worker.
 
-Neo records `neo_actions` rows with phase='builder' (the bounces). Nothing
-consumed them after the Windows watchdog was retired — this module closes the
-loop from the VPS directly: it polls for un-dispatched builder rows, prepares
-a PR worktree, writes the fix brief (with the reviewer findings), and runs the
+Neo's worker creates a durable `kind='builder'` job (keyed by repo + PR +
+round) in the same place the bounce is recorded, so a BOUNCE verdict always
+reaches Hermes.  This module polls for queued builder jobs, prepares a PR
+worktree, writes the fix brief (with the reviewer findings), and runs the
 Hermes agent (model-separated from rhobear-reviews) inside that worktree. The
 worker commits + pushes to the PR head branch -> synchronize -> reviewer
 re-fires -> Neo re-invoked. The loop closes itself.
 
-Dedupe/markers live in neo_jobs (the durable job store). The builder claims a
-job atomically via UPDATE ... WHERE state='queued' ... RETURNING.  A newer
-round for the same PR supersedes all older ones.  Mark `dispatched` only after
-the agent starts, then record the real outcome.  Crash mid-run is recovered by
-lease expiry with an attempt cap, then `parked` (actionable, not silently
-re-armed).
+Dedupe/markers live in neo_jobs (the durable job store).
+
+* Claim is atomic (UPDATE ... WHERE state='queued' ... RETURNING), NEWEST
+  round first; older queued rounds for the same PR are superseded, so a stale
+  round never runs after a newer one exists.
+* The round cap (builder_round <= cfg.max_builder_rounds) is enforced at the
+  claim — beyond it the job is `parked` (visible, owner-actionable), never
+  auto-dispatched.
+* `dispatched` is recorded only when the agent is about to start; the real
+  outcome (pushed / no-change / retry) is recorded after the run.  A crash
+  mid-run is recovered by lease expiry (renewed during the run) with an
+  attempt cap, then `parked`.
+* Transient gh failures never consume a round: only a parsed CLOSED/MERGED
+  resolves to no_change; empty pr_state leaves the job running for lease
+  recovery.
+* --dry-run is read-only (peek, no claim) so an operator can inspect the
+  queue without mutating durable job state.
 
 Usage (as the neo venv, User=slang, env from rhobear-neo/.env):
   python -m rhobear_neo.neo_builder --once [--repo owner/repo] [--dry-run]
@@ -41,6 +52,11 @@ WORKTREES = Path("/opt/rhobear/neo-builder-worktrees")
 GIT_CREDENTIAL_HELPER = '!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f'
 BRIEFS = Path("/opt/rhobear/neo-builder-briefs")
 POLL_SECS = int(os.environ.get("NEO_BUILDER_POLL_SECS", "120"))
+# Builder agent runs are long (up to deepseek_timeout, often 30+ minutes).  The
+# lease must cover the whole run and be renewed while the agent works, or a
+# second builder would claim the same round and two agents would share one
+# worktree (fcntl only serializes prep, not the run).
+BUILDER_LEASE_SECS = int(os.environ.get("NEO_BUILDER_LEASE_SECS", "3600"))
 # Fan-out width. The lane used to claim one row per poll and then sleep
 # POLL_SECS *even after a productive batch*, so the ceiling was one PR per
 # (fix + 120s) no matter how much compute was idle. prepare_worktree() does a
@@ -249,18 +265,20 @@ def dispatch_one(cfg: Config, jobs: Jobs, row: dict) -> None:
     already spent cfg.max_builder_rounds, the job goes to 'parked' and is
     never auto-dispatched.
 
-    The job is marked 'running' when claimed.  'dispatched' is recorded only
-    after the agent starts (not before, so a crash mid-run is recovered by
-    lease expiry).  Terminal outcome is resolved after the agent completes.
+    The job is already 'running' (claimed by main).  'dispatched' is recorded
+    only when the agent is about to start (not before, so a crash mid-run is
+    recovered by lease expiry).  The real outcome is resolved after the agent
+    completes: pushed -> done, NO-CHANGE -> no_change, BLOCKED/empty -> retry
+    (bounded by the attempt cap, then parked).
     """
     repo, pr, sha = row["repo"], row["pr_number"], row["head_sha"]
-    round_ = row.get("builder_round", row.get("attempt", 0))
+    round_ = int(row.get("builder_round") or row.get("attempt") or 0)
 
     # --- round cap (defect 1 fix) ---
-    if round_ >= cfg.max_builder_rounds:
-        jobs.resolve(row["id"], "parked",
-                     payload={"reason": f"max builder rounds ({cfg.max_builder_rounds}) reached"})
-        log.info("park %s#%s round=%s >= max=%s — owner must re-arm",
+    if round_ > cfg.max_builder_rounds:
+        jobs.park(row["id"],
+                  reason=f"max builder rounds ({cfg.max_builder_rounds}) reached (round {round_})")
+        log.info("park %s#%s round=%s > max=%s — owner must re-arm",
                  repo, pr, round_, cfg.max_builder_rounds)
         return
 
@@ -270,7 +288,8 @@ def dispatch_one(cfg: Config, jobs: Jobs, row: dict) -> None:
         jobs.resolve(row["id"], "no_change", payload={"reason": f"PR state: {state}"})
         return
     elif not state:
-        # Transient gh failure — leave the job running for lease recovery
+        # Transient gh failure — leave the job running for lease recovery.
+        # Never resolve a transient failure as terminal (GLM 8).
         log.warning("pr_state returned empty for %s#%s — job stays running", repo, pr)
         return
     try:
@@ -286,29 +305,67 @@ def dispatch_one(cfg: Config, jobs: Jobs, row: dict) -> None:
     brief_dir.mkdir(parents=True, exist_ok=True)
     (brief_dir / "brief.md").write_text(brief, encoding="utf-8")
 
-    # Mark dispatched only AFTER the agent starts (not before).
-    jobs.resolve(row["id"], "done",
-                 payload={"dispatched_at": time.strftime("%FT%TZ", time.gmtime()),
-                          "round": round_, "worktree": worktree,
-                          "branch": head_branch})
+    # Mark dispatched only as the agent is about to start (not before — a
+    # crash at this point is recovered by lease expiry, not consumed forever).
+    jobs.note(row["id"], {"dispatched_at": time.strftime("%FT%TZ", time.gmtime()),
+                           "round": round_, "worktree": worktree,
+                           "branch": head_branch})
     log.info("dispatched: %s#%s round=%s worktree=%s branch=%s",
              repo, pr, round_, worktree, head_branch)
 
     rc, head_before = gh(cfg, "api", f"repos/{repo}/pulls/{pr}", "--jq", ".head.sha")
+    head_before = (head_before or "").strip()
     agent = BuilderAgent(
         work_dir=worktree,
         hermes_bin=cfg.hermes_bin, provider=cfg.hermes_provider, model=cfg.hermes_model,
         timeout=int(os.environ.get("NEO_BUILDER_TIMEOUT") or cfg.deepseek_timeout), gh_token=cfg.gh_token,
     )
     try:
-        usage, verdict = agent.run(brief)
+        # Lease renewal: the agent run can outlive a static lease — without it
+        # a second builder would claim the same round and two agents would work
+        # one worktree (GLM 6).  BUILDER_LEASE_SECS covers the whole run.
+        with jobs.lease_renewal(row["id"], lease_secs=BUILDER_LEASE_SECS):
+            usage, verdict = agent.run(brief)
         log.info("fixer done %s#%s verdict=%s usage=%s", repo, pr, verdict or "?", usage)
     except AgentError:
         log.exception("fixer agent failed %s#%s", repo, pr)
+        jobs.retry(row["id"], reason="builder agent failed")
+        return
+    except Exception as exc:
+        log.exception("fixer agent crashed (%s) %s#%s", type(exc).__name__, repo, pr)
+        jobs.retry(row["id"], reason=f"builder agent crashed ({type(exc).__name__})")
+        return
+
     head_after = gh(cfg, "api", f"repos/{repo}/pulls/{pr}", "--jq", ".head.sha")[1].strip()
-    pushed = bool(head_after) and head_after != head_before
+    # A push is the real outcome signal (more reliable than the advisory
+    # verdict); it re-arms reviewer + Neo immediately.
+    if head_before and head_after:
+        pushed = head_after != head_before
+    else:
+        # Couldn't read the PR head (transient gh failure) — can't confirm.
+        log.warning("head read failed for %s#%s before=%r after=%r", repo, pr, head_before, head_after)
+        pushed = False
     log.info("fixer round outcome %s#%s pushed=%s head=%s->%s (loop auto-armed: reviewer+neo re-fire on push)",
              repo, pr, pushed, head_before[:8], head_after[:8])
+    if pushed:
+        jobs.resolve(row["id"], "done", payload={"outcome": "pushed",
+                                                   "verdict": verdict or "",
+                                                   "head_before": head_before,
+                                                   "head_after": head_after})
+    elif verdict == "NO-CHANGE":
+        jobs.resolve(row["id"], "no_change", payload={"outcome": "no-change",
+                                                       "verdict": verdict})
+    elif verdict == "FIXED":
+        # Claimed a fix but the head didn't move — record it; the loop re-arms
+        # via the new head when it lands.
+        jobs.resolve(row["id"], "done", payload={"outcome": "fixed-no-push",
+                                                   "verdict": verdict})
+    else:
+        # BLOCKED / missing verdict / unverifiable head — retryable; bounded by
+        # the attempt cap, then parked (owner-actionable).
+        log.warning("%s#%s round=%s no push and no actionable verdict (%r) — retrying",
+                    repo, pr, round_, verdict)
+        jobs.retry(row["id"], reason=f"no push, verdict={verdict or 'missing'}")
 
 
 def main() -> int:
@@ -322,72 +379,79 @@ def main() -> int:
     cfg = Config()
     cfg.require().validate()
     jobs = Jobs(cfg.database_url)
+    jobs.ensure_schema()
     pool = concurrent.futures.ThreadPoolExecutor(
         max_workers=CONCURRENCY, thread_name_prefix="neo-builder")
-    log.info("builder lane up: concurrency=%d poll=%ds allowlist=%s",
-             CONCURRENCY, POLL_SECS, ",".join(cfg.repo_allowlist) or "(none)")
+    log.info("builder lane up: concurrency=%d poll=%ds lease=%ds allowlist=%s",
+             CONCURRENCY, POLL_SECS, BUILDER_LEASE_SECS,
+             ",".join(cfg.repo_allowlist) or "(none)")
     inflight: dict[concurrent.futures.Future, dict] = {}
     while True:
-        # --- dry-run: sleep every iteration (defect 6 fix) ---
+        # --- dry-run: read-only peek (defect 6 fix + GLM 9: never mutate) ---
         if dry:
-            row = jobs.claim_queued("builder", repo_filter=repo_filter,
-                                     allowlist=cfg.repo_allowlist)
-            if row:
-                log.info("dry-run: would dispatch %s#%s@%s attempt=%s",
-                         row["repo"], row["pr_number"],
-                         row["head_sha"][:8], row["attempt"])
+            rows = jobs.peek_queued("builder", repo_filter=repo_filter,
+                                    allowlist=cfg.repo_allowlist)
+            for row in rows:
+                log.info("dry-run: would dispatch %s#%s round=%s attempt=%s",
+                         row["repo"], row["pr_number"], row["builder_round"], row["attempt"])
             if once:
                 break
-            time.sleep(POLL_SECS)  # sleep every iteration, not just when no rows
+            time.sleep(POLL_SECS)  # sleep every iteration, not just when empty
             continue
 
-        # --- recover expired leases ---
+        # --- recover expired builder leases (park at the attempt cap) -------
         recovered = jobs.recover_expired("builder")
         for r in recovered:
             repo, pr = r["repo"], r["pr_number"]
-            attempt = r["attempt"]
-            max_attempts = r["max_attempts"]
+            attempt, max_attempts = r["attempt"], r["max_attempts"]
             if attempt >= max_attempts:
-                jobs.resolve(r["id"], "parked",
-                             payload={"reason": f"lease expired {attempt}/{max_attempts} times"})
+                jobs.park(r["id"],
+                          reason=f"lease expired {attempt}/{max_attempts} times")
                 log.info("park %s#%s attempt=%s >= max=%s — owner must re-arm",
                          repo, pr, attempt, max_attempts)
             else:
-                log.info("recovered expired lease %s#%s attempt=%s", repo, pr, attempt)
+                log.info("recovered expired lease %s#%s round=%s attempt=%s (re-queued)",
+                         repo, pr, r["builder_round"], attempt)
 
-        # --- keep the pool full ---
+        # --- keep the pool full ---------------------------------------------
         while len(inflight) < CONCURRENCY:
-            row = jobs.claim_queued("builder", repo_filter=repo_filter,
-                                     allowlist=cfg.repo_allowlist)
+            row = jobs.claim_queued("builder", lease_secs=BUILDER_LEASE_SECS,
+                                    repo_filter=repo_filter,
+                                    allowlist=cfg.repo_allowlist)
             if not row:
                 break
             repo, pr, sha = row["repo"], row["pr_number"], row["head_sha"]
+            round_ = int(row["builder_round"] or 0)
 
-            # Supersede older queued builder jobs for the same PR.
-            superseded = jobs.supersede(repo, pr, sha)
+            # Newest round wins: supersede OLDER queued builder jobs for the
+            # same PR (GLM 7 — the old queued() claimed newest-first; older
+            # rounds are stale by definition).
+            superseded = jobs.supersede_older(repo, pr, round_)
             if superseded:
                 log.info("superseded %d older builder job(s) for %s#%s",
                          len(superseded), repo, pr)
 
-            # Round cap (defect 1 fix).
-            if row["attempt"] >= cfg.max_builder_rounds:
-                jobs.resolve(row["id"], "parked",
-                             payload={"reason": f"max builder rounds ({cfg.max_builder_rounds}) reached"})
-                log.info("park %s#%s attempt=%s >= max=%s — owner must re-arm",
-                         repo, pr, row["attempt"], cfg.max_builder_rounds)
+            # Round cap (defect 1 fix): beyond max -> parked, never dispatched.
+            if round_ > cfg.max_builder_rounds:
+                jobs.park(row["id"],
+                          reason=f"max builder rounds ({cfg.max_builder_rounds}) reached (round {round_})")
+                log.info("park %s#%s round=%s > max=%s — owner must re-arm",
+                         repo, pr, round_, cfg.max_builder_rounds)
                 continue
 
-            # Check PR is still open (defect 2 fix: empty = transient, retry).
+            # Check PR is still open (defect 2 fix: empty = transient, retry;
+            # GLM 8: never resolve transient failure as terminal 'failed').
             state = pr_state(cfg, repo, pr).split("\t")[0]
-            if state.upper() not in ("OPEN", "DRAFT"):
-                if state:
-                    jobs.resolve(row["id"], "no_change",
-                                 payload={"reason": f"PR state: {state}"})
-                    log.info("skip closed/merged %s#%s state=%s", repo, pr, state)
-                else:
-                    # Transient gh failure — release for retry.
-                    jobs.resolve(row["id"], "failed",
-                                 payload={"reason": "pr_state transient failure"})
+            if state.upper() in ("CLOSED", "MERGED"):
+                jobs.resolve(row["id"], "no_change",
+                             payload={"reason": f"PR state: {state}"})
+                log.info("skip closed/merged %s#%s state=%s", repo, pr, state)
+                continue
+            if not state:
+                # Transient gh failure — job stays running; lease expiry
+                # re-queues it.
+                log.warning("pr_state empty for %s#%s — job stays running (lease recovery)",
+                            repo, pr)
                 continue
 
             inflight[pool.submit(dispatch_one, cfg, jobs, row)] = row
