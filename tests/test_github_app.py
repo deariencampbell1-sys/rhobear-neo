@@ -83,11 +83,20 @@ def _iso(epoch: float) -> str:
 
 
 class FakeGitHubHTTP:
-    """Fake api.github.com: repo->installation map + per-install tokens."""
+    """Fake api.github.com: repo->installation map + per-install tokens.
 
-    def __init__(self, installations=None, tokens=None, *, clock=None, token_ttl=3600):
+    Supports defect-6 behaviour: `token_404s` are installations whose
+    access-token POST returns 404 (the App was uninstalled), and
+    `listed_installations` serves GET /app/installations with Link-header
+    pagination (per_page=100).
+    """
+
+    def __init__(self, installations=None, tokens=None, *, clock=None,
+                 token_ttl=3600, token_404s=None, listed_installations=None):
         self.installations = dict(installations or {})  # repo -> installation id
         self.tokens = dict(tokens or {})                # installation id -> token text
+        self.token_404s = set(token_404s or ())         # token POST 404s for these ids
+        self.listed_installations = listed_installations  # None | [{"id": n}, ...]
         self.clock = clock or FakeClock()
         self.token_ttl = token_ttl
         self.calls: list[tuple[str, str]] = []          # (method, path)
@@ -99,8 +108,27 @@ class FakeGitHubHTTP:
             if repo in self.installations:
                 return 200, json.dumps({"id": self.installations[repo]}).encode()
             return 404, b"{}"
+        if method == "GET" and path.startswith("/app/installations"):
+            # Paginated listing: per_page=100, follow the Link rel="next".
+            from urllib.parse import parse_qs, urlparse
+            q = parse_qs(urlparse(path).query)
+            per_page = int(q.get("per_page", ["100"])[0])
+            page = int(q.get("page", ["1"])[0])
+            if self.listed_installations is None:
+                return 200, b"[]"
+            start = (page - 1) * per_page
+            chunk = self.listed_installations[start:start + per_page]
+            raw = json.dumps(chunk).encode()
+            if start + per_page < len(self.listed_installations):
+                nxt = (f"<https://api.github.com/app/installations?per_page="
+                       f"{per_page}&page={page + 1}>; rel=\"next\"")
+            else:
+                nxt = ""
+            return 200, raw, {"Link": nxt}
         if method == "POST" and path.endswith("/access_tokens"):
             inst = int(path.split("/")[3])
+            if inst in self.token_404s:
+                return 404, b'{"message":"Bad credentials"}'
             token = self.tokens.get(inst, f"ghs_tok_{inst}")
             expires = _iso(self.clock.t + self.token_ttl)
             return 201, json.dumps({"token": token, "expires_at": expires}).encode()
@@ -280,6 +308,71 @@ class TestThreadSafety:
 # ---------------------------------------------------------------------------
 # repo_token / github_app_for glue
 # ---------------------------------------------------------------------------
+
+class TestUninstalledApp:
+    """Defect 6 — a stored installation_id whose token POST returns 404 (the
+    App was uninstalled) is NOT treated as a transient error forever.  The
+    cached token is dropped, the repo is re-resolved, and if the repo also has
+    no installation the call fails closed with NoInstallation (terminal)."""
+
+    def test_stale_install_404_refalls_back_to_repo(self, rsa_key):
+        """Webhook passes a stale install id 111; the repo now maps to 222.
+        token_for_repo re-resolves and returns the fresh install's token."""
+        clock = FakeClock()
+        http = FakeGitHubHTTP(installations={"acme/a": 222},
+                              tokens={222: "tok-new"},
+                              token_404s={111}, clock=clock)
+        app = _make_app(rsa_key, http)
+        tok = app.token_for_repo("acme/a", installation_id=111)
+        assert tok == "tok-new"
+        # The stale id was dropped from the token cache — it must not be
+        # served again from cache.
+        assert (111, "{}") not in app._token_cache
+        # The repo mapping was re-resolved to the fresh installation.
+        assert app.installation_for_repo("acme/a") == 222
+
+    def test_stale_install_404_and_no_repo_raises_no_installation(self, rsa_key):
+        """Both the stored id and the repo 404 → NoInstallation (terminal),
+        never an infinite transient retry."""
+        clock = FakeClock()
+        http = FakeGitHubHTTP(installations={}, tokens={},
+                              token_404s={111}, clock=clock)
+        app = _make_app(rsa_key, http)
+        with pytest.raises(NoInstallation):
+            app.token_for_repo("acme/private", installation_id=111)
+
+    def test_installation_token_404_drops_cache_and_raises_typed(self, rsa_key):
+        """installation_token itself surfaces a typed error on 404 and drops
+        the cached entry so a later call re-mints."""
+        from src.github_app import InstallationGone, GitHubAppError
+        clock = FakeClock()
+        http = FakeGitHubHTTP(installations={}, tokens={},
+                              token_404s={111}, clock=clock)
+        app = _make_app(rsa_key, http)
+        with pytest.raises(InstallationGone):
+            app.installation_token(111)
+        assert (111, "{}") not in app._token_cache
+        # GitHubAppError remains the base class (fail closed).
+        assert issubclass(InstallationGone, GitHubAppError)
+
+    def test_list_installations_paginates(self, rsa_key):
+        """Any installation listing pages: per_page=100, following the Link
+        header's rel='next' until exhausted."""
+        clock = FakeClock()
+        http = FakeGitHubHTTP(
+            listed_installations=[{"id": i} for i in range(1, 103)],
+            clock=clock,
+        )
+        app = _make_app(rsa_key, http)
+        ids = app.list_installations()
+        assert len(ids) == 102
+        assert ids[0] == 1 and ids[-1] == 102
+        listing_calls = [p for m, p in http.calls
+                         if m == "GET" and p.startswith("/app/installations")]
+        assert len(listing_calls) == 2, listing_calls
+        assert "per_page=100" in listing_calls[0]
+        assert "page=2" in listing_calls[1]
+
 
 class TestRepoTokenGlue:
     def test_repo_token_uses_app_when_configured(self, rsa_key):

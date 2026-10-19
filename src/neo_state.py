@@ -148,16 +148,25 @@ class NeoState:
         """Atomically consume the escalating marker for `advice_id` IF it is
         still the NEWEST escalation for the PR.
 
-        One transaction: re-checks that no newer escalating row appeared since
-        the recovery loop's snapshot, then deletes exactly this advice's rows
-        (never a newer escalation's marker).  Returns True when the advice was
-        current and is consumed (caller acts on it), False when it was
-        superseded (caller drops it, logged, without creating a round).  In
-        both cases this advice's own rows are removed so stale markers never
-        accumulate.
+        One transaction under the per-PR advisory lock
+        (pg_advisory_xact_lock(hashtext(repo||':'||pr))): re-checks that no
+        newer escalating row appeared since the recovery loop's snapshot, then
+        deletes exactly this advice's rows (never a newer escalation's marker).
+        The lock serializes this check-then-delete-all against a concurrent
+        submit_escalation / phase-row INSERT, so a freshly-inserted newer
+        escalation is never clobbered (defect 1).
+
+        Returns True when the advice was current and is consumed (caller acts
+        on it), False when it was superseded (caller drops it, logged, without
+        creating a round).  In both cases this advice's own rows are removed so
+        stale markers never accumulate.
         """
         with psycopg.connect(self.dsn, autocommit=False) as c:
             try:
+                c.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                    (f"{repo}:{pr}",),
+                )
                 newest = c.execute(
                     "SELECT detail->>'advice_id' FROM neo_actions "
                     "WHERE repo=%s AND pr_number=%s AND phase='escalating' "
@@ -188,6 +197,75 @@ class NeoState:
             except Exception:
                 c.rollback()
                 raise
+
+    def record_escalating(self, repo: str, pr: int, head_sha: str, *,
+                          verdict: str = "ESCALATE", builder_round: int = 0,
+                          credits: int = 0, advice_id: str = "",
+                          installation_id=None, extra: dict | None = None) -> None:
+        """Record an escalating marker row under the per-PR advisory lock.
+
+        The lock serializes the INSERT against take_escalation's
+        check-then-delete-all, so a consume can never clobber a
+        concurrently-inserted newer escalation's marker (defect 1).  `extra`
+        merges into the detail (e.g. green/wake_job from the worker's phase
+        row).
+        """
+        detail = {
+            "advice_id": str(advice_id or ""),
+            "installation_id": installation_id,
+        }
+        if extra:
+            detail.update(extra)
+        with psycopg.connect(self.dsn, autocommit=False) as c:
+            c.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (f"{repo}:{pr}",),
+            )
+            c.execute(
+                "INSERT INTO neo_actions(repo,pr_number,head_sha,phase,builder_round,"
+                "verdict,credits,detail) VALUES (%s,%s,%s,'escalating',%s,%s,%s,%s)",
+                (repo, pr, head_sha, builder_round, verdict, credits,
+                 json.dumps(detail)),
+            )
+            c.commit()
+
+    def clear_escalating(self, repo: str, pr: int) -> int:
+        """Delete ALL escalating rows for (repo, pr), under the per-PR advisory
+        lock (old clear_escalating semantics — used when a marker can never be
+        polled, e.g. one without an advice_id past the timeout)."""
+        with psycopg.connect(self.dsn, autocommit=False) as c:
+            c.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (f"{repo}:{pr}",),
+            )
+            cur = c.execute(
+                "DELETE FROM neo_actions WHERE repo=%s AND pr_number=%s "
+                "AND phase='escalating'",
+                (repo, pr),
+            )
+            c.commit()
+            return cur.rowcount
+
+    def advisor_escalation_for(self, repo: str, pr: int, advice_id: str):
+        """The builder_round of the escalated row recorded for `advice_id`, or
+        None.  Used to make escalate_pr idempotent per advice (defect 2): a
+        retry after a transient failure must not mint a second escalated round.
+        """
+        if not advice_id:
+            return None
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT builder_round FROM neo_actions WHERE repo=%s AND "
+                "pr_number=%s AND phase='escalated' AND "
+                "detail->>'advice_id'=%s ORDER BY id DESC LIMIT 1",
+                (repo, pr, str(advice_id)),
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            return int(row[0])
+        except (TypeError, ValueError):
+            return None
 
     def already_escalated(self, repo: str, pr: int) -> bool:
         """True once this PR has had its ONE genuine advisor-escalated round.

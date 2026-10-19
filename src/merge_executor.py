@@ -61,13 +61,17 @@ def merge(
     """Merge `pr` in `repo` at `expected_sha` via the GitHub REST merge API.
 
     Steps:
-      1. Re-read the PR head (headRefOid) from GitHub.
+      1. Re-read the PR head (headRefOid + headRefName) from GitHub.
       2. If it does not match `expected_sha`, raise HeadMoved.
       3. Call the merge API
          (PUT /repos/{repo}/pulls/{pr}/merge) with `sha=expected_sha` —
          GitHub rejects the merge if the head changed between our re-read
-         and the merge call.
-      4. Record the merge result and return it.
+         and the merge call.  (`delete_branch` is NOT a merge-API parameter;
+         the head branch is deleted explicitly in step 5.)
+      4. Record the merge result.
+      5. Delete the PR's head branch explicitly
+         (DELETE /repos/{repo}/git/refs/heads/<headRefName>), tolerating
+         404/422 when GitHub already auto-deleted it.
 
     Returns `{"merged": True, "sha": <head_sha>}` on success.
 
@@ -78,7 +82,7 @@ def merge(
     rc, raw = _gh(
         token,
         "pr", "view", str(pr), "-R", repo,
-        "--json", "headRefOid,state,mergeable",
+        "--json", "headRefOid,state,mergeable,headRefName",
         timeout=45,
     )
     if rc != 0:
@@ -90,6 +94,7 @@ def merge(
         raise MergeFailed(f"malformed PR view response: {exc}") from exc
 
     head = str(data.get("headRefOid") or "")
+    head_ref = str(data.get("headRefName") or "")
     state = str(data.get("state") or "").lower()
 
     # --- Step 2: Verify head has not moved ---------------------------------
@@ -112,12 +117,13 @@ def merge(
     # --- Step 4: Execute the merge -----------------------------------------
     # REST merge API with sha=expected_sha: GitHub rejects with 422 if the
     # head no longer matches, closing the race between re-read and merge.
+    # `delete_branch` is NOT a parameter of this API (unknown fields are
+    # ignored), so the head branch is deleted explicitly in step 5.
     merge_args = [
         "api", "-X", "PUT",
         f"repos/{repo}/pulls/{pr}/merge",
         "-f", "merge_method=squash",
         "-f", f"sha={expected_sha}",
-        "-f", "delete_branch=true",
     ]
     rc, out = _gh(token, *merge_args, timeout=60)
 
@@ -139,6 +145,26 @@ def merge(
         raise MergeFailed(f"GitHub returned no merge confirmation: {out[:200]}")
 
     log.info("merged %s#%s at %s", repo, pr, expected_sha[:12])
+
+    # --- Step 5: delete the head branch (defect 3) -------------------------
+    # The REST merge API never deletes the branch; gh's --delete-branch did it
+    # client-side.  Delete the ref explicitly, tolerating 404/422 (GitHub may
+    # already have auto-deleted it after the merge).
+    if head_ref:
+        rc_del, out_del = _gh(
+            token, "api", "-X", "DELETE",
+            f"repos/{repo}/git/refs/heads/{head_ref}",
+            timeout=60,
+        )
+        low = (out_del or "").lower()
+        if rc_del == 0:
+            log.info("deleted head branch %s for %s#%s", head_ref, repo, pr)
+        elif "404" in low or "422" in low:
+            log.info("head branch %s for %s#%s already gone (HTTP %s)",
+                     head_ref, repo, pr, "404" if "404" in low else "422")
+        else:
+            log.warning("could not delete head branch %s for %s#%s: %s",
+                        head_ref, repo, pr, out_del[:200])
 
     return {
         "merged": True,

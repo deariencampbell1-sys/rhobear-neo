@@ -108,7 +108,11 @@ class Config:
     auto_merge_default: bool = field(default_factory=lambda: _get_bool("NEO_AUTO_MERGE", False))
 
     # --- safety floors ---
-    max_builder_rounds: int = field(default_factory=lambda: _get_int("NEO_MAX_BUILDER_ROUNDS", 2))
+    # Defaults to bounces_before_escalation (5): a smaller default would make
+    # the 5-bounce escalation unreachable (the builder lane parks the round
+    # after max_builder_rounds before the PR ever bounces 5 times).
+    max_builder_rounds: int = field(default_factory=lambda: _get_int(
+        "NEO_MAX_BUILDER_ROUNDS", 5))
 
     # --- bounce / escalation ---
     # Number of builder bounces before escalation to a frontier advisor.
@@ -237,6 +241,14 @@ class Config:
             raise ValueError(
                 f"deepseek_max_tokens must be >= 32000, "
                 f"got {self.deepseek_max_tokens}"
+            )
+        if self.max_builder_rounds < self.bounces_before_escalation:
+            raise ValueError(
+                f"NEO_MAX_BUILDER_ROUNDS ({self.max_builder_rounds}) must be "
+                f">= NEO_BOUNCES_BEFORE_ESCALATION ({self.bounces_before_escalation}) "
+                f"— with a smaller max the builder lane parks before the PR "
+                f"ever bounces {self.bounces_before_escalation} times, so "
+                f"escalation would be unreachable"
             )
         # Check claude binary exists where practical (skip on Windows — it's a
         # remote VPS path like /usr/bin/claude).
