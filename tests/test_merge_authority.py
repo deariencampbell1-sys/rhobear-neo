@@ -72,6 +72,7 @@ def _fake_gh_success(*args, **kw):
             "headRefOid": SHA1,
             "state": "OPEN",
             "mergeable": "MERGEABLE",
+            "headRefName": "topic-branch",
             "reviews": [
                 {"body": "Looks good. COVERAGE: COMPLETE",
                  "commit_id": SHA1,
@@ -89,6 +90,10 @@ def _fake_gh_success(*args, **kw):
             "merged": True, "sha": "M" * 40,
             "message": "Pull Request successfully merged",
         })
+    # The post-merge head-branch deletion (defect 3): tolerated 404/422.
+    if gh_args[:4] == ("api", "-X", "DELETE",
+                       "repos/acme/a/git/refs/heads/topic-branch"):
+        return 0, ""  # 204 No Content
     if gh_args[:5] == ("api", f"repos/acme/a/commits/{SHA1}/status"):
         data = {
             "state": "success",
@@ -452,18 +457,24 @@ class TestMergeExecutor:
 
     def test_merge_calls_api_with_expected_sha(self):
         """The merge API call carries sha=<expected_sha> — GitHub rejects the
-        merge if the head moved (Extra B / B2 spec: REST merge API with sha)."""
+        merge if the head moved (Extra B / B2 spec: REST merge API with sha).
+        The bogus `delete_branch=true` form field (not a merge-API parameter)
+        is gone — branch deletion is an explicit ref DELETE (defect 3)."""
         calls: list = []
 
         def fake_gh(token, *args, **kw):
             gh_args = args
             if gh_args[:3] == ("pr", "view", "1"):
                 data = {"headRefOid": SHA1, "state": "OPEN",
-                        "mergeable": "MERGEABLE"}
+                        "mergeable": "MERGEABLE",
+                        "headRefName": "topic-branch"}
                 return 0, json.dumps(data)
             if gh_args[0] == "api" and gh_args[3] == "repos/acme/a/pulls/1/merge":
                 calls.append(list(gh_args))
                 return 0, json.dumps({"merged": True, "sha": "M" * 40})
+            if gh_args[:4] == ("api", "-X", "DELETE",
+                               "repos/acme/a/git/refs/heads/topic-branch"):
+                return 0, ""
             raise AssertionError(f"unexpected call: {args}")
 
         evidence = {"ok": True, "head_sha": SHA1, "decided_sha": SHA1}
@@ -476,6 +487,7 @@ class TestMergeExecutor:
         assert call[call.index("-X") + 1] == "PUT", call
         assert f"sha={SHA1}" in call, call
         assert "merge_method=squash" in call, call
+        assert "delete_branch=true" not in call, call
 
     def test_merge_api_rejects_changed_head(self):
         """GitHub rejects the merge when the head no longer matches the given
@@ -494,6 +506,79 @@ class TestMergeExecutor:
         with patch("src.merge_executor._gh", side_effect=fake_gh):
             with pytest.raises(HeadMoved):
                 merge("acme/a", 1, SHA1, evidence, "test-token")
+
+
+class TestMergeBranchDeletion:
+    """Defect 3 — `delete_branch=true` is NOT a merge-API parameter, so the
+    head branch silently stopped being deleted.  The merge executor now reads
+    headRefName and deletes the ref explicitly after a confirmed merge,
+    tolerating 404/422 (GitHub may already have auto-deleted it)."""
+
+    def test_merge_deletes_head_branch_after_merge(self):
+        deletes: list = []
+
+        def fake_gh(token, *args, **kw):
+            gh_args = args
+            if gh_args[:3] == ("pr", "view", "1"):
+                data = {"headRefOid": SHA1, "state": "OPEN",
+                        "mergeable": "MERGEABLE",
+                        "headRefName": "topic-branch"}
+                return 0, json.dumps(data)
+            if gh_args[0] == "api" and gh_args[3] == "repos/acme/a/pulls/1/merge":
+                return 0, json.dumps({"merged": True, "sha": "M" * 40})
+            if gh_args[:4] == ("api", "-X", "DELETE",
+                               "repos/acme/a/git/refs/heads/topic-branch"):
+                deletes.append(list(gh_args))
+                return 0, ""  # 204
+            raise AssertionError(f"unexpected call: {args}")
+
+        evidence = {"ok": True, "head_sha": SHA1, "decided_sha": SHA1}
+        with patch("src.merge_executor._gh", side_effect=fake_gh):
+            result = merge("acme/a", 1, SHA1, evidence, "test-token")
+        assert result["merged"] is True
+        assert deletes, "the head branch must be deleted explicitly"
+        d = deletes[0]
+        assert d[0] == "api" and "-X" in d and d[d.index("-X") + 1] == "DELETE", d
+        assert d[-1] == "repos/acme/a/git/refs/heads/topic-branch", d
+
+    def test_merge_tolerates_branch_already_gone(self):
+        """404/422 on the ref DELETE (GitHub already auto-deleted the branch)
+        is tolerated — the merge still counts as success."""
+        def fake_gh(token, *args, **kw):
+            gh_args = args
+            if gh_args[:3] == ("pr", "view", "1"):
+                data = {"headRefOid": SHA1, "state": "OPEN",
+                        "mergeable": "MERGEABLE",
+                        "headRefName": "topic-branch"}
+                return 0, json.dumps(data)
+            if gh_args[0] == "api" and gh_args[3] == "repos/acme/a/pulls/1/merge":
+                return 0, json.dumps({"merged": True, "sha": "M" * 40})
+            if gh_args[:4] == ("api", "-X", "DELETE",
+                               "repos/acme/a/git/refs/heads/topic-branch"):
+                return 1, "gh: Not Found (HTTP 404)"
+            raise AssertionError(f"unexpected call: {args}")
+
+        evidence = {"ok": True, "head_sha": SHA1, "decided_sha": SHA1}
+        with patch("src.merge_executor._gh", side_effect=fake_gh):
+            result = merge("acme/a", 1, SHA1, evidence, "test-token")
+        assert result["merged"] is True
+
+    def test_merge_skips_deletion_without_head_ref(self):
+        """No headRefName on the PR → no deletion attempted."""
+        def fake_gh(token, *args, **kw):
+            gh_args = args
+            if gh_args[:3] == ("pr", "view", "1"):
+                data = {"headRefOid": SHA1, "state": "OPEN",
+                        "mergeable": "MERGEABLE", "headRefName": ""}
+                return 0, json.dumps(data)
+            if gh_args[0] == "api" and gh_args[3] == "repos/acme/a/pulls/1/merge":
+                return 0, json.dumps({"merged": True, "sha": "M" * 40})
+            raise AssertionError(f"unexpected call: {args}")
+
+        evidence = {"ok": True, "head_sha": SHA1, "decided_sha": SHA1}
+        with patch("src.merge_executor._gh", side_effect=fake_gh):
+            result = merge("acme/a", 1, SHA1, evidence, "test-token")
+        assert result["merged"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -660,11 +745,11 @@ class TestSubmitAndPoll:
             out = submit_escalation(cfg, state, jobs, "acme/a", 1, SHA1,
                                     rounds, "", installation_id=7)
         assert out == {"action": "escalating", "advice_id": "advice-xyz"}
-        # The PR's state row records the advice_id with phase 'escalating'.
-        rec = state.record.call_args
-        assert rec[0][3] == "escalating"
-        assert rec.kwargs["detail"]["advice_id"] == "advice-xyz"
-        assert rec.kwargs["detail"]["installation_id"] == 7
+        # The PR's escalating marker is recorded under the per-PR advisory
+        # lock (defect 1), carrying the advice_id + installation_id.
+        rec = state.record_escalating.call_args
+        assert rec.kwargs["advice_id"] == "advice-xyz"
+        assert rec.kwargs["installation_id"] == 7
 
     def test_submit_escalation_parks_when_advisor_unreachable(self):
         """Advisor unreachable → fail closed, PR parked, no wait."""
@@ -993,9 +1078,9 @@ class TestAsyncAdvisor:
             assert out["action"] == "escalating"
             advice_id = out["advice_id"]
             assert advice_id
-            rec = state.record.call_args
-            assert rec[0][3] == "escalating"
-            assert rec.kwargs["detail"]["advice_id"] == advice_id
+            rec = state.record_escalating.call_args
+            assert rec.kwargs["advice_id"] == advice_id
+            assert rec.kwargs["installation_id"] is None  # no install id passed
 
             # Poll: sees running, then done.
             seen = set()
@@ -1219,6 +1304,8 @@ class TestRecoverEscalations:
             "created_at": datetime.now(timezone.utc),
         }]
         state.builder_rounds.return_value = 5
+        # No escalated round recorded yet — idempotent escalate_pr records one.
+        state.advisor_escalation_for.return_value = None
         jobs = MagicMock()
         cfg = SimpleNamespace(advisor_url="http://x", advisor_token="t")
         work_order = {"route": "claude:opus", "summary": "Fix auth",
@@ -1318,3 +1405,145 @@ class TestAdvisorNotFoundParks:
             handled = recover_escalations(cfg, state, jobs, timeout_secs=1800)
         assert len(handled) == 1 and handled[0]["action"] == "dropped", handled
         state.take_escalation.assert_called_once_with("o/r", 1, "advice-old")
+
+
+class TestTerminalActionFailure:
+    """Defect 2 — a terminal action that raises AFTER the escalating marker is
+    consumed (transient DB error in escalate_pr / _park_pr) must not strand
+    the PR.  The marker is re-recorded so the next poll retries; idempotent
+    escalate_pr prevents a duplicate round."""
+
+    def _state(self, advice_id="advice-1"):
+        state = MagicMock()
+        state.escalating_prs.return_value = [{
+            "repo": "o/r", "pr": 1, "head_sha": SHA1,
+            "advice_id": advice_id, "installation_id": 7,
+            "created_at": datetime.now(timezone.utc),
+        }]
+        state.take_escalation.return_value = True
+        return state
+
+    def test_done_act_failure_rerecords_marker(self):
+        """escalate_pr raises after consume → marker re-recorded, action
+        retried, and the PR is NOT parked or stranded."""
+        state = self._state()
+        jobs = MagicMock()
+        cfg = SimpleNamespace(advisor_url="http://x", advisor_token="t")
+        from src.escalation import recover_escalations, AdviceStatus
+        work_order = {"summary": "s", "root_cause": "rc",
+                      "steps": [{"file": "f", "change": "c", "why": "w"}],
+                      "tests": [], "risks": ""}
+
+        def boom(*a, **k):
+            raise RuntimeError("transient DB error")
+
+        with patch("src.escalation.poll_advice",
+                   return_value=AdviceStatus(status="done", work_order=work_order)), \
+             patch("src.escalation.escalate_pr", side_effect=boom):
+            handled = recover_escalations(cfg, state, jobs, timeout_secs=1800)
+        assert len(handled) == 1 and handled[0]["action"] == "retry", handled
+        assert "transient" in handled[0]["reason"].lower()
+        # The marker is re-recorded (via the advisory-lock record_escalating).
+        state.record_escalating.assert_called_once()
+        rec = state.record_escalating.call_args
+        assert rec.kwargs["advice_id"] == "advice-1"
+        assert rec.kwargs["installation_id"] == 7
+
+    def test_park_failure_rerecords_marker(self):
+        """_park_pr raises after consume (timeout path) → marker re-recorded,
+        not stranded."""
+        state = MagicMock()
+        state.escalating_prs.return_value = [{
+            "repo": "o/r", "pr": 1, "head_sha": SHA1,
+            "advice_id": "advice-1", "installation_id": None,
+            "created_at": datetime.now(timezone.utc) - timedelta(minutes=31),
+        }]
+        state.take_escalation.return_value = True
+        jobs = MagicMock()
+        cfg = SimpleNamespace(advisor_url="http://x", advisor_token="t")
+        from src.escalation import recover_escalations
+
+        def boom(*a, **k):
+            raise RuntimeError("db down")
+
+        with patch("src.escalation._park_pr", side_effect=boom):
+            handled = recover_escalations(cfg, state, jobs, timeout_secs=1800)
+        assert len(handled) == 1 and handled[0]["action"] == "retry", handled
+        state.record_escalating.assert_called_once()
+        assert state.record_escalating.call_args.kwargs["advice_id"] == "advice-1"
+
+
+class TestEscalatePrIdempotent:
+    """Defect 2 — escalate_pr is idempotent per advice_id: a retry after a
+    partial failure must not mint a second escalated round or a second
+    builder job."""
+
+    def test_second_call_returns_existing_round(self):
+        state = MagicMock()
+        state.builder_rounds.return_value = 5
+        # First call recorded round 6; the retry finds it and reuses it.
+        state.advisor_escalation_for.return_value = 6
+        jobs = MagicMock()
+        cfg = SimpleNamespace(advisor_url="http://x", advisor_token="t")
+        from src.escalation import escalate_pr, WorkOrder
+        wo = WorkOrder(route="claude:opus", summary="Fix", root_cause="rc",
+                       steps=[{"file": "f", "change": "c", "why": "w"}],
+                       tests=[], risks="")
+        out = escalate_pr(cfg, state, jobs, "o/r", 1, SHA1, wo,
+                          installation_id=7, advice_id="advice-1")
+        assert out["action"] == "escalated"
+        assert out["round"] == 6
+        # No duplicate record, but the builder job is ensured.
+        state.record.assert_not_called()
+        jobs.create_builder.assert_called_once()
+        assert jobs.create_builder.call_args[0][3] == 6
+
+    def test_first_call_records_round(self):
+        state = MagicMock()
+        state.builder_rounds.return_value = 5
+        state.advisor_escalation_for.return_value = None
+        jobs = MagicMock()
+        cfg = SimpleNamespace(advisor_url="http://x", advisor_token="t")
+        from src.escalation import escalate_pr, WorkOrder
+        wo = WorkOrder(route="claude:opus", summary="Fix", root_cause="rc",
+                       steps=[{"file": "f", "change": "c", "why": "w"}],
+                       tests=[], risks="")
+        out = escalate_pr(cfg, state, jobs, "o/r", 1, SHA1, wo,
+                          installation_id=7, advice_id="advice-1")
+        assert out["action"] == "escalated"
+        assert out["round"] == 6
+        state.record.assert_called_once()
+        assert state.record.call_args[0][3] == "escalated"
+        assert state.record.call_args.kwargs["detail"]["advice_id"] == "advice-1"
+        jobs.create_builder.assert_called_once()
+
+
+class TestConfigDefaults:
+    """Defect 5 — NEO_MAX_BUILDER_ROUNDS defaults to bounces_before_escalation
+    (5), so a stock Config reaches the 5-bounce escalation instead of the
+    builder lane parking at round 3.  A config with max < bounces refuses to
+    start (clear config error)."""
+
+    def test_default_max_builder_rounds_matches_bounces(self):
+        c = Config()
+        assert c.max_builder_rounds == 5, c.max_builder_rounds
+        assert c.max_builder_rounds == c.bounces_before_escalation == 5
+
+    def test_validate_refuses_max_lt_bounces(self):
+        c = Config()
+        c.max_builder_rounds = 2
+        c.bounces_before_escalation = 5
+        with pytest.raises(ValueError) as ei:
+            c.validate()
+        assert "max_builder_rounds" in str(ei.value).lower() or "escalat" in str(ei.value).lower()
+
+    def test_validate_accepts_max_eq_bounces(self):
+        c = Config()
+        c.max_builder_rounds = 5
+        c.bounces_before_escalation = 5
+        # validate() raises only on the escalation floor here (other checks
+        # are independent of the env); max == bounces must not trip it.
+        try:
+            c.validate()
+        except ValueError as exc:
+            assert "max_builder_rounds" not in str(exc).lower()

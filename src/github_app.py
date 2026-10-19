@@ -26,6 +26,7 @@ import logging
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime
 from pathlib import Path
@@ -56,6 +57,15 @@ class NoInstallation(GitHubAppError):
     """
 
 
+class InstallationGone(GitHubAppError):
+    """A stored installation id no longer exists (POST /app/installations/{id}/access_tokens
+    returned 404 — the App was uninstalled, or the id is stale).
+
+    NOT transient: the caller re-resolves the repo's installation (defect 6)
+    instead of retrying the dead id forever.
+    """
+
+
 class AppNotConfigured(GitHubAppError):
     """No App identity is configured (no app id / key). Fail closed."""
 
@@ -66,6 +76,24 @@ def _parse_iso(iso: str) -> float:
     if s.endswith("Z") or s.endswith("z"):
         s = s[:-1] + "+00:00"
     return datetime.fromisoformat(s).timestamp()
+
+
+def _next_link(link_header: str) -> str:
+    """Extract the rel='next' URL from a GitHub Link header, or '' if absent.
+
+    Handles '<https://...>; rel="next"' and '<...>; rel="next", <...>; rel="last"'
+    multi-part headers.
+    """
+    for part in (link_header or "").split(","):
+        segs = [s.strip() for s in part.split(";")]
+        if len(segs) < 2:
+            continue
+        if not any('rel="next"' in s for s in segs[1:]):
+            continue
+        url = segs[0].strip()
+        if url.startswith("<") and url.endswith(">"):
+            return url[1:-1]
+    return ""
 
 
 def load_app_key(cfg) -> str:
@@ -212,6 +240,17 @@ class GitHubApp:
             f"/app/installations/{inst}/access_tokens",
             body=body,
         )
+        if status == 404:
+            # The installation no longer exists (the App was uninstalled or the
+            # id is stale).  Drop the cached entry so a later call re-mints,
+            # and raise a TYPED error so token_for_repo can re-resolve from the
+            # repo instead of treating this as a transient error forever
+            # (defect 6).
+            with self._lock:
+                self._token_cache.pop(cache_key, None)
+            raise InstallationGone(
+                f"installation {inst} no longer exists (HTTP 404)"
+            )
         if status != 201:
             raise GitHubAppError(
                 f"installation token for {inst} failed: HTTP {status}"
@@ -237,24 +276,76 @@ class GitHubApp:
         installation.id), is used directly; otherwise it is resolved from the
         repo. `permissions` scopes the token (default: full installation
         permissions). Raises NoInstallation when the repo has no installation.
+
+        Defect 6: when the stored installation id 404s on token mint (the App
+        was uninstalled), the cached mapping is dropped, the repo is
+        re-resolved with installation_for_repo, and if that also 404s the call
+        fails closed with NoInstallation (terminal) — never an infinite
+        transient retry.
         """
         if installation_id is None:
             installation_id = self.installation_for_repo(repo, now=now)
-        return self.installation_token(installation_id, now=now,
-                                       permissions=permissions)
+        try:
+            return self.installation_token(installation_id, now=now,
+                                           permissions=permissions)
+        except InstallationGone:
+            with self._lock:
+                self._repo_cache.pop(repo, None)
+            try:
+                fresh = self.installation_for_repo(repo, now=now)
+            except NoInstallation:
+                raise NoInstallation(
+                    f"repo {repo} has no GitHub App installation (stale "
+                    f"installation {installation_id} also 404s)"
+                ) from None
+            return self.installation_token(fresh, now=now, permissions=permissions)
+
+    def list_installations(self, *, per_page: int = 100) -> list[int]:
+        """Every GitHub App installation id (for the repo allowlist / scope).
+
+        Paged: GET /app/installations?per_page=100, following the Link
+        header's rel='next' until exhausted (defect 6: any installation/repo
+        listing must page).  Raises GitHubAppError on failure.
+        """
+        out: list[int] = []
+        path = f"/app/installations?per_page={per_page}"
+        for _ in range(100):  # hard bound — never loop on a malformed header
+            status, raw, resp_headers = self._api_hdrs("GET", path)
+            if status != 200:
+                raise GitHubAppError(
+                    f"list installations failed: HTTP {status}"
+                )
+            try:
+                data = json.loads(raw)
+            except (TypeError, ValueError) as exc:
+                raise GitHubAppError(
+                    f"list installations malformed: {exc}"
+                ) from exc
+            out.extend(int(d["id"]) for d in (data or []))
+            nxt = _next_link(resp_headers.get("Link", ""))
+            if not nxt:
+                break
+            # Link headers carry ABSOLUTE URLs; keep only the path for _api
+            # (which prefixes API_BASE itself).
+            parts = urllib.parse.urlsplit(nxt)
+            if parts.netloc:
+                nxt = urllib.parse.urlunsplit(("", "", parts.path, parts.query, ""))
+            path = nxt
+        return out
 
     # ------------------------------------------------------------------
     # Internal: HTTPS
     # ------------------------------------------------------------------
 
-    def _api(
+    def _api_hdrs(
         self, method: str, path: str, *, headers: dict | None = None, body=None
-    ) -> tuple[int, bytes]:
-        """One authenticated call to api.github.com.
+    ) -> tuple[int, bytes, dict]:
+        """One authenticated call to api.github.com, also returning the response
+        headers (for Link-header pagination).
 
         `body` is JSON-encoded when not already bytes. Returns (status, raw
-        body). 4xx/5xx are returned, not raised, so callers can distinguish
-        e.g. a 404 (no installation) from a transport failure.
+        body, headers). 4xx/5xx are returned, not raised, so callers can
+        distinguish e.g. a 404 (no installation) from a transport failure.
         """
         hdrs = {
             "Accept": "application/vnd.github+json",
@@ -267,24 +358,37 @@ class GitHubApp:
             body = json.dumps(body).encode("utf-8")
             hdrs["Content-Type"] = "application/json"
         try:
-            return self._http(method, path, hdrs, body)
+            result = self._http(method, path, hdrs, body)
         except GitHubAppError:
             raise
         except Exception as exc:  # noqa: BLE001 — network layer, fail closed
             raise GitHubAppError(
                 f"github api {method} {path} failed: {type(exc).__name__}"
             ) from exc
+        if len(result) == 3:
+            status, raw, resp_headers = result
+        else:
+            status, raw = result
+            resp_headers = {}
+        return status, raw, resp_headers
+
+    def _api(
+        self, method: str, path: str, *, headers: dict | None = None, body=None
+    ) -> tuple[int, bytes]:
+        """One authenticated call to api.github.com (headers discarded)."""
+        status, raw, _ = self._api_hdrs(method, path, headers=headers, body=body)
+        return status, raw
 
     def _default_http(
         self, method: str, path: str, headers: dict, body: bytes | None
-    ) -> tuple[int, bytes]:
+    ) -> tuple[int, bytes, dict]:
         url = API_BASE + path
         req = urllib.request.Request(url, data=body, method=method, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=self._http_timeout) as resp:
-                return resp.status, resp.read()
+                return resp.status, resp.read(), dict(resp.headers)
         except urllib.error.HTTPError as exc:
-            return exc.code, exc.read()
+            return exc.code, exc.read(), dict(exc.headers)
 
 
 # ---------------------------------------------------------------------------

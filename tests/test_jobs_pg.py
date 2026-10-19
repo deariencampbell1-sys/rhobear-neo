@@ -1258,3 +1258,312 @@ class TestEscalationInstallationIdPG:
         assert pr_rows, "PR must be escalating"
         assert pr_rows[0]["advice_id"] == "advice-inst-1", pr_rows
         assert pr_rows[0]["installation_id"] == 11, pr_rows
+
+
+# ---------------------------------------------------------------------------
+# FIX ROUND 4 — defects 1/2/4 + item 5 (real Postgres where the fix touches
+# neo_actions / neo_jobs)
+# ---------------------------------------------------------------------------
+
+def _bounce_default(jobs, state, cfg, sha, pr=95):
+    """A BOUNCE-BUILDER wake through run_neo with the escalation plumbing
+    patched out (used by the default-config escalation test)."""
+    from src.neo_worker import run_neo
+    wake = {"repo": "o/r", "sha": sha, "green": False,
+            "context": "rhobear-reviews", "pr_number": pr}
+    with patch("src.neo_worker.resolve_pr", return_value=pr), \
+         patch("src.neo_worker._review_evidence", return_value=_evidence(sha)), \
+         patch("src.neo_worker._jev_for_pr",
+               return_value=JevAssessment(False, reason="no key")), \
+         patch("src.neo_worker._compute_diff_stat", return_value=""), \
+         patch("src.neo_worker._run_agent",
+               return_value=({"input_tokens": 1, "output_tokens": 1},
+                             "BOUNCE-BUILDER still broken")):
+        run_neo(cfg, state, jobs, wake)
+
+
+class TestTakeEscalationLockPG:
+    """Defect 1 — take_escalation's check-then-delete-all runs under the
+    per-PR advisory lock (pg_advisory_xact_lock(hashtext(repo||':'||pr))), and
+    record_escalating (the escalating-marker INSERT in submit_escalation / the
+    worker's phase row) takes the same lock.  A consume can never interleave
+    with a concurrent submit and clobber a newer escalation's marker."""
+
+    def test_take_escalation_blocks_while_lock_held(self, db):
+        """While the per-PR advisory lock is held (a concurrent submit mid-
+        INSERT), take_escalation BLOCKS instead of interleaving."""
+        import time as _time
+        state = NeoState(DSN)
+        state.record_escalating("o/r", 80, SHA1, advice_id="advice-A",
+                                installation_id=1)
+        conn = psycopg.connect(DSN, autocommit=False)
+        t = None
+        result: dict = {}
+        try:
+            conn.execute("SELECT pg_advisory_xact_lock(hashtext('o/r:80'))")
+            def do_take():
+                try:
+                    result["value"] = state.take_escalation("o/r", 80, "advice-A")
+                except Exception as exc:  # noqa: BLE001
+                    result["error"] = exc
+            t = threading.Thread(target=do_take)
+            t.start()
+            _time.sleep(0.5)
+            assert t.is_alive(), ("take_escalation must block while the "
+                                  "advisory lock is held (defect 1)")
+        finally:
+            conn.rollback()  # release the lock so the thread can proceed
+            if t is not None:
+                t.join(timeout=10)
+        assert "error" not in result, result
+        assert result.get("value") is True
+
+    def test_record_escalating_blocks_while_lock_held(self, db):
+        """The escalating-marker INSERT also takes the lock, so a consume
+        cannot slip between two rows of one escalation."""
+        import time as _time
+        state = NeoState(DSN)
+        conn = psycopg.connect(DSN, autocommit=False)
+        t = None
+        result: dict = {}
+        try:
+            conn.execute("SELECT pg_advisory_xact_lock(hashtext('o/r:81'))")
+            def do_record():
+                try:
+                    state.record_escalating("o/r", 81, SHA1, advice_id="advice-B",
+                                            installation_id=1)
+                    result["done"] = True
+                except Exception as exc:  # noqa: BLE001
+                    result["error"] = exc
+            t = threading.Thread(target=do_record)
+            t.start()
+            _time.sleep(0.5)
+            assert t.is_alive(), ("record_escalating must block while the "
+                                  "advisory lock is held (defect 1)")
+        finally:
+            conn.rollback()
+            if t is not None:
+                t.join(timeout=10)
+        assert "error" not in result, result
+        assert result.get("done") is True
+
+    def test_concurrent_submit_not_clobbered_by_take(self, db):
+        """Whichever interleaving, a concurrently-inserted newer escalation's
+        marker is NEVER deleted by take_escalation (defect 1)."""
+        state = NeoState(DSN)
+        state.record_escalating("o/r", 82, SHA1, advice_id="advice-A",
+                                installation_id=1)
+        barrier = threading.Barrier(2)
+        results: dict = {}
+
+        def do_take():
+            barrier.wait()
+            results["take"] = state.take_escalation("o/r", 82, "advice-A")
+
+        def do_submit():
+            barrier.wait()
+            state.record_escalating("o/r", 82, SHA2, advice_id="advice-B",
+                                    installation_id=1)
+            results["submit_done"] = True
+
+        t1 = threading.Thread(target=do_take)
+        t2 = threading.Thread(target=do_submit)
+        t1.start()
+        t2.start()
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+        with psycopg.connect(DSN, autocommit=True) as c:
+            remaining = [r[0] for r in c.execute(
+                "SELECT detail->>'advice_id' FROM neo_actions WHERE repo='o/r' "
+                "AND pr_number=82 AND phase='escalating' ORDER BY id").fetchall()]
+        # Both orderings leave advice-B as the (sole) surviving marker.
+        assert "advice-B" in remaining, remaining
+
+
+class TestTerminalActionFailurePG:
+    """Defect 2 — a terminal action that raises AFTER the escalating marker is
+    consumed (transient DB error) re-records the marker so the next poll
+    retries; idempotent escalate_pr means no duplicate round or job."""
+
+    def test_escalate_pr_raise_rerecords_marker_then_retry_ok(self, db):
+        jobs = db
+        state = NeoState(DSN)
+        state.record_escalating("o/r", 92, SHA1, advice_id="advice-1",
+                                installation_id=1)
+        cfg = _cfg()
+        cfg.advisor_url = "http://127.0.0.1:9"
+        cfg.advisor_token = "test-token"
+        from src.escalation import recover_escalations, AdviceStatus
+        work_order = {"route": "claude:opus", "summary": "Fix auth",
+                      "root_cause": "rc",
+                      "steps": [{"file": "src/a.py", "change": "c", "why": "w"}],
+                      "tests": [], "risks": ""}
+
+        def boom(*a, **k):
+            raise RuntimeError("transient DB error")
+
+        with patch("src.escalation.poll_advice",
+                   return_value=AdviceStatus(status="done", work_order=work_order)), \
+             patch("src.escalation.escalate_pr", side_effect=boom):
+            handled = recover_escalations(cfg, state, jobs, timeout_secs=1800)
+        assert len(handled) == 1 and handled[0]["action"] == "retry", handled
+        # The marker is re-recorded — the PR is still escalating, not stranded.
+        rows = [r for r in state.escalating_prs() if r["pr"] == 92]
+        assert rows and rows[0]["advice_id"] == "advice-1", rows
+        # Second pass succeeds — ONE escalated round and ONE builder job.
+        with patch("src.escalation.poll_advice",
+                   return_value=AdviceStatus(status="done", work_order=work_order)):
+            handled2 = recover_escalations(cfg, state, jobs, timeout_secs=1800)
+        assert len(handled2) == 1 and handled2[0]["action"] == "escalated", handled2
+        with psycopg.connect(DSN, autocommit=True) as c:
+            n_esc = c.execute(
+                "SELECT COUNT(*) FROM neo_actions WHERE phase='escalated' "
+                "AND repo='o/r' AND pr_number=92").fetchone()[0]
+            n_job = c.execute(
+                "SELECT COUNT(*) FROM neo_jobs WHERE kind='builder' "
+                "AND repo='o/r' AND pr_number=92").fetchone()[0]
+        assert n_esc == 1, n_esc
+        assert n_job == 1, n_job
+
+    def test_partial_failure_then_retry_is_idempotent(self, db):
+        """Real partial failure: escalate_pr records the escalated row, then
+        jobs.create_builder raises.  The marker is re-recorded; the retry
+        reuses the recorded round and creates the job — still ONE of each."""
+        jobs = db
+        state = NeoState(DSN)
+        state.record_escalating("o/r", 93, SHA1, advice_id="advice-1",
+                                installation_id=1)
+        cfg = _cfg()
+        cfg.advisor_url = "http://127.0.0.1:9"
+        cfg.advisor_token = "test-token"
+        from src.escalation import recover_escalations, AdviceStatus
+        work_order = {"route": "claude:opus", "summary": "Fix auth",
+                      "root_cause": "rc",
+                      "steps": [{"file": "src/a.py", "change": "c", "why": "w"}],
+                      "tests": [], "risks": ""}
+
+        with patch("src.escalation.poll_advice",
+                   return_value=AdviceStatus(status="done", work_order=work_order)), \
+             patch.object(jobs, "create_builder",
+                          side_effect=RuntimeError("db blip")):
+            handled = recover_escalations(cfg, state, jobs, timeout_secs=1800)
+        assert len(handled) == 1 and handled[0]["action"] == "retry", handled
+        # The escalated row was recorded before create_builder failed...
+        with psycopg.connect(DSN, autocommit=True) as c:
+            n_esc = c.execute(
+                "SELECT COUNT(*) FROM neo_actions WHERE phase='escalated' "
+                "AND repo='o/r' AND pr_number=93").fetchone()[0]
+        assert n_esc == 1, n_esc
+        # ...and the marker was re-recorded so the next poll retries.
+        assert [r for r in state.escalating_prs() if r["pr"] == 93]
+        # Second pass: idempotent escalate_pr reuses round 1 + creates the job.
+        with patch("src.escalation.poll_advice",
+                   return_value=AdviceStatus(status="done", work_order=work_order)):
+            handled2 = recover_escalations(cfg, state, jobs, timeout_secs=1800)
+        assert len(handled2) == 1 and handled2[0]["action"] == "escalated", handled2
+        with psycopg.connect(DSN, autocommit=True) as c:
+            n_esc2 = c.execute(
+                "SELECT COUNT(*) FROM neo_actions WHERE phase='escalated' "
+                "AND repo='o/r' AND pr_number=93").fetchone()[0]
+            n_job = c.execute(
+                "SELECT COUNT(*) FROM neo_jobs WHERE kind='builder' "
+                "AND repo='o/r' AND pr_number=93").fetchone()[0]
+        assert n_esc2 == 1, n_esc2
+        assert n_job == 1, n_job
+
+    def test_park_failure_rerecords_marker(self, db):
+        """A _park_pr failure after the consume (timeout path) also re-records
+        the marker — never strands the PR."""
+        jobs = db
+        state = NeoState(DSN)
+        state.record_escalating("o/r", 91, SHA1, advice_id="advice-1",
+                                installation_id=None)
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute(
+                "UPDATE neo_actions SET created_at = now() - interval '31 minutes' "
+                "WHERE repo='o/r' AND pr_number=91")
+        cfg = _cfg()
+        cfg.advisor_url = "http://127.0.0.1:9"
+        cfg.advisor_token = "test-token"
+        from src.escalation import recover_escalations
+
+        def boom(*a, **k):
+            raise RuntimeError("db down")
+
+        with patch("src.escalation._park_pr", side_effect=boom):
+            handled = recover_escalations(cfg, state, jobs, timeout_secs=1800)
+        assert len(handled) == 1 and handled[0]["action"] == "retry", handled
+        assert [r for r in state.escalating_prs() if r["pr"] == 91]
+
+
+class TestTimeoutNoAdviceIdPG:
+    """Defect 4 — an escalating marker without an advice_id that has waited
+    past the timeout is cleared (all escalating rows) and the PR is parked —
+    the recovery loop never spins on it forever."""
+
+    def test_timeout_marker_without_advice_id_parks(self, db):
+        jobs = db
+        state = NeoState(DSN)
+        state.record_escalating("o/r", 94, SHA1, advice_id="")
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute(
+                "UPDATE neo_actions SET created_at = now() - interval '31 minutes' "
+                "WHERE repo='o/r' AND pr_number=94")
+        cfg = _cfg()
+        cfg.advisor_url = "http://127.0.0.1:9"
+        cfg.advisor_token = "test-token"
+        from src.escalation import recover_escalations
+        handled = recover_escalations(cfg, state, jobs, timeout_secs=1800)
+        assert len(handled) == 1 and handled[0]["action"] == "parked", handled
+        with psycopg.connect(DSN, autocommit=True) as c:
+            esc = c.execute(
+                "SELECT COUNT(*) FROM neo_actions WHERE phase='escalating' "
+                "AND repo='o/r' AND pr_number=94").fetchone()[0]
+            parked = c.execute(
+                "SELECT COUNT(*) FROM neo_actions WHERE phase='parked' "
+                "AND repo='o/r' AND pr_number=94").fetchone()[0]
+        assert esc == 0, "the un-pollable marker must be cleared (no infinite loop)"
+        assert parked >= 1, parked
+
+
+class TestDefaultConfigEscalationPG:
+    """Defect 5 — NEO_MAX_BUILDER_ROUNDS defaults to bounces_before_escalation
+    (5), so a stock Config reaches the 5-bounce escalation: the advisor is
+    called once and the ONE escalated round is dispatched (claimable)."""
+
+    def test_default_config_reaches_escalation(self, db):
+        jobs = db
+        state = NeoState(DSN)
+        cfg = Config()  # defaults: max_builder_rounds == bounces == 5
+        cfg.database_url = DSN
+        cfg.gh_token = "test-token"
+        cfg.advisor_url = "http://127.0.0.1:9"
+        cfg.advisor_token = "test-token"
+        setattr(cfg, "_rhobear_github_app", _FakeGitHubApp("test-ghs-token"))
+        assert cfg.max_builder_rounds == 5, cfg.max_builder_rounds
+        assert cfg.max_builder_rounds == cfg.bounces_before_escalation == 5
+        pr = 95
+        for i in range(5):
+            _bounce_default(jobs, state, cfg, f"{i:040d}", pr)
+        assert state.builder_rounds("o/r", pr) == 5
+        submits: list = []
+
+        def fake_post(*a, **k):
+            submits.append(a)
+            return "advice-default-1"
+
+        with patch("src.escalation._post_advise", side_effect=fake_post):
+            _bounce_default(jobs, state, cfg, "c" * 40, pr)
+        assert len(submits) == 1, submits
+        # (fake advisor done) -> ONE escalated round, then claimable.
+        from src.escalation import recover_escalations, AdviceStatus
+        work_order = {"route": "claude:opus", "summary": "Fix auth",
+                      "root_cause": "rc",
+                      "steps": [{"file": "src/a.py", "change": "c", "why": "w"}],
+                      "tests": [], "risks": ""}
+        with patch("src.escalation.poll_advice",
+                   return_value=AdviceStatus(status="done", work_order=work_order)):
+            handled = recover_escalations(cfg, state, jobs, timeout_secs=1800)
+        assert len(handled) == 1 and handled[0]["action"] == "escalated", handled
+        claimed = jobs.claim_queued("builder")
+        assert claimed is not None and claimed["builder_round"] == 6, claimed

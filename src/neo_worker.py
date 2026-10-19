@@ -631,17 +631,22 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict) -> None:
     # verdict's work is already done (see the gate above).  An `escalating` row
     # carries the advisor advice_id (submit_escalation already recorded one with
     # the full detail; this row keeps the advice_id too so the recovery loop's
-    # newest-first escalating_prs() always finds it).
-    _phase_detail = {"green": wake.get("green"), "wake_job": job_id}
+    # newest-first escalating_prs() always finds it) and the webhook
+    # installation_id so the escalated round uses the id Neo already had instead
+    # of a repo->installation lookup (defect 4).  It is recorded under the
+    # per-PR advisory lock (record_escalating) so a concurrent take_escalation
+    # can never clobber it (defect 1).
     if phase == "escalating":
-        _phase_detail["advice_id"] = advice_id
-        # Defect 4: carry the webhook installation_id on the NEWEST escalating
-        # row (the one escalating_prs() reads) so the escalated round uses the
-        # id Neo already had instead of a repo->installation lookup.
-        _phase_detail["installation_id"] = wake.get("installation_id")
-    state.record(repo, pr, sha, phase, verdict=verdict,
-                 builder_round=new_round, credits=credits,
-                 detail=_phase_detail)
+        state.record_escalating(repo, pr, sha, verdict=verdict,
+                                builder_round=new_round, credits=credits,
+                                advice_id=advice_id,
+                                installation_id=wake.get("installation_id"),
+                                extra={"green": wake.get("green"),
+                                       "wake_job": job_id})
+    else:
+        state.record(repo, pr, sha, phase, verdict=verdict,
+                     builder_round=new_round, credits=credits,
+                     detail={"green": wake.get("green"), "wake_job": job_id})
     # The triage marker goes LAST: it vouches that the phase row and any builder job above
     # exist. A crash before this line leaves the phase row, which the gate above detects.
     state.record(repo, pr, sha, "triage", detail={"context": wake.get("context"),
