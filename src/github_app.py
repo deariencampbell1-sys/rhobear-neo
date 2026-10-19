@@ -317,12 +317,15 @@ class GitHubApp:
                 )
             try:
                 data = json.loads(raw)
-            except (TypeError, ValueError) as exc:
+                out.extend(int(d["id"]) for d in (data or []))
+            except (TypeError, ValueError, KeyError) as exc:
                 raise GitHubAppError(
                     f"list installations malformed: {exc}"
                 ) from exc
-            out.extend(int(d["id"]) for d in (data or []))
-            nxt = _next_link(resp_headers.get("Link", ""))
+            # Header names are case-insensitive (HTTP/2 sends `link`).
+            link = next((v for k, v in (resp_headers or {}).items()
+                         if k.lower() == "link"), "")
+            nxt = _next_link(link)
             if not nxt:
                 break
             # Link headers carry ABSOLUTE URLs; keep only the path for _api

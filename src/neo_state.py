@@ -39,6 +39,18 @@ CREATE TABLE IF NOT EXISTS neo_installs (
 """
 
 
+def _started_at(detail: dict, created_at) -> float:
+    """Epoch seconds when the escalation first started (detail's
+    escalation_started, else the row's created_at)."""
+    try:
+        started = float(detail.get("escalation_started"))
+        if started > 0:
+            return started
+    except (TypeError, ValueError):
+        pass
+    return created_at.timestamp()
+
+
 @dataclass
 class NeoState:
     """Thread-safe Postgres state store. Every method opens a fresh
@@ -141,6 +153,10 @@ class NeoState:
                 "advice_id": str(detail.get("advice_id", "") or ""),
                 "installation_id": detail.get("installation_id"),
                 "created_at": r[4],
+                # When this escalation first started: a re-recorded marker (retry
+                # after a failed terminal action) keeps the original start, so
+                # the give-up timeout is never pushed out by retries.
+                "started_at": _started_at(detail, r[4]),
             })
         return out
 
@@ -168,13 +184,13 @@ class NeoState:
                     (f"{repo}:{pr}",),
                 )
                 newest = c.execute(
-                    "SELECT detail->>'advice_id' FROM neo_actions "
+                    "SELECT COALESCE(detail->>'advice_id', '') FROM neo_actions "
                     "WHERE repo=%s AND pr_number=%s AND phase='escalating' "
                     "ORDER BY id DESC LIMIT 1",
                     (repo, pr),
                 ).fetchone()
                 newest_id = newest[0] if newest else None
-                if newest_id == advice_id:
+                if newest is not None and newest_id == (advice_id or ""):
                     # Still the newest escalation — consume it AND any
                     # superseded older rows (they are stale; nothing newer
                     # exists to protect).
@@ -189,8 +205,8 @@ class NeoState:
                 # rows — a newer escalation's marker is never touched.
                 c.execute(
                     "DELETE FROM neo_actions WHERE repo=%s AND pr_number=%s "
-                    "AND phase='escalating' AND detail->>'advice_id'=%s",
-                    (repo, pr, advice_id),
+                    "AND phase='escalating' AND COALESCE(detail->>'advice_id', '')=%s",
+                    (repo, pr, advice_id or ""),
                 )
                 c.commit()
                 return False
@@ -228,23 +244,6 @@ class NeoState:
                  json.dumps(detail)),
             )
             c.commit()
-
-    def clear_escalating(self, repo: str, pr: int) -> int:
-        """Delete ALL escalating rows for (repo, pr), under the per-PR advisory
-        lock (old clear_escalating semantics — used when a marker can never be
-        polled, e.g. one without an advice_id past the timeout)."""
-        with psycopg.connect(self.dsn, autocommit=False) as c:
-            c.execute(
-                "SELECT pg_advisory_xact_lock(hashtext(%s))",
-                (f"{repo}:{pr}",),
-            )
-            cur = c.execute(
-                "DELETE FROM neo_actions WHERE repo=%s AND pr_number=%s "
-                "AND phase='escalating'",
-                (repo, pr),
-            )
-            c.commit()
-            return cur.rowcount
 
     def advisor_escalation_for(self, repo: str, pr: int, advice_id: str):
         """The builder_round of the escalated row recorded for `advice_id`, or

@@ -82,7 +82,7 @@ def merge(
     rc, raw = _gh(
         token,
         "pr", "view", str(pr), "-R", repo,
-        "--json", "headRefOid,state,mergeable,headRefName",
+        "--json", "headRefOid,state,mergeable,headRefName,isCrossRepository",
         timeout=45,
     )
     if rc != 0:
@@ -95,6 +95,7 @@ def merge(
 
     head = str(data.get("headRefOid") or "")
     head_ref = str(data.get("headRefName") or "")
+    cross_repo = bool(data.get("isCrossRepository"))
     state = str(data.get("state") or "").lower()
 
     # --- Step 2: Verify head has not moved ---------------------------------
@@ -146,28 +147,51 @@ def merge(
 
     log.info("merged %s#%s at %s", repo, pr, expected_sha[:12])
 
-    # --- Step 5: delete the head branch (defect 3) -------------------------
+    # --- Step 5: delete the head branch -----------------------------------
     # The REST merge API never deletes the branch; gh's --delete-branch did it
-    # client-side.  Delete the ref explicitly, tolerating 404/422 (GitHub may
-    # already have auto-deleted it after the merge).
-    if head_ref:
-        rc_del, out_del = _gh(
-            token, "api", "-X", "DELETE",
-            f"repos/{repo}/git/refs/heads/{head_ref}",
-            timeout=60,
-        )
-        low = (out_del or "").lower()
-        if rc_del == 0:
-            log.info("deleted head branch %s for %s#%s", head_ref, repo, pr)
-        elif "404" in low or "422" in low:
-            log.info("head branch %s for %s#%s already gone (HTTP %s)",
-                     head_ref, repo, pr, "404" if "404" in low else "422")
-        else:
-            log.warning("could not delete head branch %s for %s#%s: %s",
-                        head_ref, repo, pr, out_del[:200])
+    # client-side.  Best-effort only: the merge is already confirmed, so nothing
+    # here may raise, and a shared branch is never deleted.
+    _delete_head_branch(token, repo, pr, head_ref, cross_repo)
 
     return {
         "merged": True,
         "sha": expected_sha,
         "detail": out[:500],
     }
+
+
+def _delete_head_branch(token: str, repo: str, pr: int, head_ref: str, cross_repo: bool) -> None:
+    """Delete a merged PR's own head branch; never raises.
+
+    Skipped for a fork PR (the branch is not in this repo), for the repo's
+    default branch, and when another open PR still uses the same head branch
+    (a shared `develop` or release branch must survive a squash merge).
+    """
+    if not head_ref or cross_repo:
+        return
+    try:
+        rc, default = _gh(token, "api", f"repos/{repo}", "--jq", ".default_branch", timeout=30)
+        if rc != 0 or not default.strip():
+            log.warning("head branch %s for %s#%s kept: default branch unknown", head_ref, repo, pr)
+            return
+        if head_ref == default.strip():
+            return
+        rc, others = _gh(token, "pr", "list", "-R", repo, "--head", head_ref, "--state", "open",
+                         "--json", "number", "--jq", ".[].number", timeout=30)
+        if rc != 0:
+            log.warning("head branch %s for %s#%s kept: open-PR check failed", head_ref, repo, pr)
+            return
+        if any(line.strip() and line.strip() != str(pr) for line in others.splitlines()):
+            log.info("head branch %s for %s#%s kept: another open PR uses it", head_ref, repo, pr)
+            return
+        rc_del, out_del = _gh(token, "api", "-X", "DELETE",
+                              f"repos/{repo}/git/refs/heads/{head_ref}", timeout=60)
+        low = (out_del or "").lower()
+        if rc_del == 0:
+            log.info("deleted head branch %s for %s#%s", head_ref, repo, pr)
+        elif "404" in low or "422" in low:
+            log.info("head branch %s for %s#%s already gone", head_ref, repo, pr)
+        else:
+            log.warning("could not delete head branch %s for %s#%s: %s", head_ref, repo, pr, (out_del or "")[:200])
+    except Exception as exc:  # noqa: BLE001 — the merge is confirmed; deletion is best-effort
+        log.warning("head branch delete for %s#%s errored (merge already confirmed): %s", repo, pr, exc)
