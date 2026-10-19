@@ -4,14 +4,23 @@ The webhook handler must return 200 fast (GitHub retries slow hooks), but a Neo 
 takes minutes. So the dispatcher submits normalized verdict wakes to a
 ThreadPoolExecutor (NEO_MAX_WORKERS, default 8) and returns immediately.
 
-Durable jobs: wakes are persisted to neo_jobs BEFORE the worker picks them up.
-If the executor is saturated, the job stays queued — nothing is ever dropped.
-The existing recovery loop handles expired leases.
+Durable jobs: every wake is persisted to neo_jobs BEFORE the worker picks it up
+(keyed by repo + head SHA + verdict color — the PR number is resolved later and
+may be NULL at create time, which is how `status` events, which carry no PR, are
+never dropped).  If the executor is saturated the job stays queued — nothing is
+ever dropped.
+
+A lease-recovery loop (the only background loop in this process, and it touches
+only the local job store — no external polling, no notifications) re-queues
+expired wake leases and re-submits orphaned queued wakes, so a crashed worker or
+a restarted process cannot strand a head SHA.
 """
 from __future__ import annotations
 
 import logging
 import os
+import threading
+import time
 import concurrent.futures
 
 from . import config as _config
@@ -27,14 +36,18 @@ logging.basicConfig(
 )
 log = logging.getLogger("rhobear_neo")
 
+# How often the wake lease-recovery loop sweeps expired/orphaned wake jobs.
+RECOVERY_SECS = int(os.environ.get("NEO_WAKE_RECOVERY_SECS", "30"))
+
 
 def main() -> None:
     cfg = _config.load().require().validate()
     state = NeoState(cfg.database_url)
     state.ensure_schema()
 
-    # Durable job store for wake and builder jobs.
+    # Durable job store for wake and builder jobs (one schema definition).
     jobs = Jobs(cfg.database_url)
+    jobs.ensure_schema()
 
     # Parallel triage: up to NEO_MAX_WORKERS agent runs concurrent. run_neo is
     # thread-safe — subprocess calls (gh, hermes) + independent Postgres
@@ -44,34 +57,35 @@ def main() -> None:
         max_workers=max_workers, thread_name_prefix="neo-worker",
     )
 
+    def _submit(wake: dict) -> None:
+        try:
+            executor.submit(_run_wake, wake)
+        except RuntimeError:
+            # Executor shutting down — the job is already persisted; the
+            # recovery loop (or a future wake) re-submits it.
+            log.warning("neo executor shutting down — wake stays queued for %s",
+                        wake.get("repo"))
+
     def on_verdict(wake: dict) -> None:
         # Persist the wake as a durable job BEFORE the executor picks it up.
-        # The job is keyed by (repo, pr_number, head_sha) — UNIQUE constraint
-        # deduplicates concurrent duplicate wakes.  If the executor is
-        # saturated the job stays queued and will be picked up when a slot
-        # frees; nothing is ever dropped.
+        # Status events carry no pr_number (resolved later via the head SHA), so
+        # the job key is (kind, repo, head_sha, verdict color) — pr may be NULL.
         repo = wake.get("repo", "")
-        pr = wake.get("pr_number") or wake.get("pr")
         sha = wake.get("sha", "")
-        if repo and pr and sha:
-            job_id = jobs.create(repo, pr, sha, payload=wake)
-            if job_id is None:
-                log.debug("duplicate wake %s#%s@%s — already queued", repo, pr, sha[:8])
-                return  # duplicate — nothing to do
-            log.debug("wake queued %s#%s@%s job=%s", repo, pr, sha[:8], job_id)
-        else:
+        green = bool(wake.get("green"))
+        if not (repo and sha):
             log.warning("incomplete wake: %s", wake)
-
-        def _task():
-            try:
-                _run_wake(wake)
-            except Exception:
-                log.exception("run_neo crashed on %s", wake.get("repo"))
-
-        try:
-            executor.submit(_task)
-        except RuntimeError:
-            log.warning("neo executor shutting down — wake stays queued for %s", wake.get("repo"))
+            return
+        job_id = jobs.create_wake(repo, sha, green,
+                                  pr_number=wake.get("pr_number"),
+                                  payload=wake)
+        if job_id is None:
+            log.debug("duplicate wake %s@%s — an active job already owns it",
+                      repo, sha[:8])
+            return  # deduped — another queued/running job handles this SHA
+        wake["job_id"] = job_id
+        log.debug("wake queued %s@%s job=%s", repo, sha[:8], job_id)
+        _submit(wake)
 
     def _run_wake(wake: dict) -> None:
         try:
@@ -79,8 +93,45 @@ def main() -> None:
         except Exception:
             log.exception("run_neo crashed on %s", wake.get("repo"))
 
+    def _recovery_loop() -> None:
+        """Re-queue expired wake leases and orphaned queued wakes, re-submitting
+        them to the executor.  This is lease recovery for the durable job store
+        (a wake the old code handled is never dropped), not an external poller."""
+        while True:
+            time.sleep(RECOVERY_SECS)
+            try:
+                for r in jobs.recover_expired("wake"):
+                    repo, sha = r["repo"], r["head_sha"]
+                    if r["attempt"] >= r["max_attempts"]:
+                        jobs.park(r["id"],
+                                  reason=f"lease expired {r['attempt']}/{r['max_attempts']} times")
+                        log.info("park wake %s@%s attempt=%s >= max=%s — owner must re-arm",
+                                 repo, sha[:8], r["attempt"], r["max_attempts"])
+                    else:
+                        log.info("recovered expired wake lease %s@%s attempt=%s",
+                                 repo, sha[:8], r["attempt"])
+                        wake = dict(r.get("payload") or {})
+                        wake["job_id"] = r["id"]
+                        if wake.get("repo") and wake.get("sha"):
+                            _submit(wake)
+                # After a restart, executor tasks for queued wakes are lost;
+                # re-submit any wake left queued long enough to be an orphan.
+                for r in jobs.stale_queued("wake", older_than_secs=RECOVERY_SECS):
+                    log.info("re-submitting orphaned queued wake %s@%s",
+                             r["repo"], r["head_sha"][:8])
+                    wake = dict(r.get("payload") or {})
+                    wake["job_id"] = r["id"]
+                    if wake.get("repo") and wake.get("sha"):
+                        _submit(wake)
+            except Exception:
+                log.exception("wake lease-recovery loop failed")
+
+    threading.Thread(target=_recovery_loop, daemon=True,
+                     name="neo-wake-recovery").start()
+
     log.info("rhobear-neo up — app_id=%s orgs=%s auto_merge_default=%s max_workers=%s",
-             cfg.__dict__.get("_app_id", "4347986"), ",".join(cfg.orgs), cfg.auto_merge_default, max_workers)
+             cfg.__dict__.get("_app_id", "4347986"), ",".join(cfg.orgs),
+             cfg.auto_merge_default, max_workers)
     serve(cfg, NeoDispatcher(cfg, on_verdict))
 
 

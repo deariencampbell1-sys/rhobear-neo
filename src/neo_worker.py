@@ -234,8 +234,12 @@ def _run_agent(agent: ClaudeAgent, brief: str) -> tuple[dict, str]:
     the agent full tool access (gh, git, edit, test runner).  DeepSeek Direct
     provides the Anthropic-compatible endpoint.
 
-    Returns (normalised usage, verdict line).  On any error both are empty
-    so the caller skips merge and escalates."""
+    Returns (normalised usage, verdict line).  AgentError is caught here (the
+    caller retries the job); any OTHER exception from the agent spawn is
+    allowed to propagate so the caller's broad handler releases the job too
+    (defect 3: FileNotFoundError/OSError/UnicodeDecodeError must never strand
+    the SHA).
+    """
     try:
         usage, verdict = agent.run(brief)
         return usage, verdict
@@ -244,24 +248,54 @@ def _run_agent(agent: ClaudeAgent, brief: str) -> tuple[dict, str]:
         return {}, ""
 
 
+def _wake_lease(cfg: Config) -> int:
+    """Wake triage leases must cover the whole agent run (a 600 s default lease
+    with a 30-minute agent would expire mid-run and let a second worker claim
+    the same SHA)."""
+    timeout = int(getattr(cfg, "deepseek_timeout", 1800) or 1800)
+    return max(600, timeout + 120)
+
+
 def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict) -> None:
     repo, sha = wake["repo"], wake["sha"]
+    green = bool(wake.get("green"))
+
+    # --- durable wake job -------------------------------------------------
+    # on_verdict() already persisted the job (keyed by repo + head sha +
+    # verdict color, PR resolved later).  If we were called without a job row
+    # (tests / manual replay), create it here — dedupe-on-outcome means a
+    # terminal or expired job is re-armed, an active one is left alone.
+    job_id = wake.get("job_id")
+    if not job_id:
+        job_id = jobs.create_wake(repo, sha, green,
+                                  pr_number=wake.get("pr_number"), payload=wake)
+        if job_id is None:
+            log.info("deduped wake %s@%s — an active job already owns it", repo, sha[:8])
+            return
+
     pr = resolve_pr(cfg, repo, sha, wake.get("pr_number"))
     if not pr:
-        log.info("no open PR for %s@%s — skip", repo, sha[:8])
+        # Transient gh failure, or a commit status that fired before any PR
+        # exists.  Release the job retryably (claim-then-retry: claim() marks
+        # the run so the attempt cap bounds it, retry() returns it to queued +
+        # outcome='failed').  The recovery loop re-submits it; after the cap the
+        # job parks and a future wake re-arms it — the SHA is never permanently
+        # poisoned (defect 5 / GLM 5).
+        log.info("no open PR for %s@%s — job released retryably", repo, sha[:8])
+        if jobs.claim(job_id, pr_number=None, lease_secs=_wake_lease(cfg)):
+            jobs.retry(job_id, reason="no open PR for head sha")
+        else:
+            log.info("job %s already claimed for %s@%s — another worker resolves PR",
+                     job_id, repo, sha[:8])
         return
 
-    # --- claim the durable job (dedupe + triage record in one transaction) --
-    # The job was already created by on_verdict() in __main__.  Here we claim
-    # it atomically.  If another worker already claimed it (concurrent wake),
-    # we skip — the job keyed by (repo, pr, sha) UNIQUE constraint prevents
-    # duplicates.
-    job = jobs.claim(repo, pr, sha)
-    if job is None:
-        log.info("job already claimed %s#%s@%s — skip (deduped)", repo, pr, sha[:8])
+    # --- claim the durable job (dedupe + triage in one transaction) -------
+    # Atomic UPDATE ... WHERE state='queued' — if another worker already
+    # claimed it (concurrent re-submit), we skip.
+    if not jobs.claim(job_id, pr_number=pr, lease_secs=_wake_lease(cfg)):
+        log.info("job already claimed %s job=%s — skip (deduped)", repo, job_id)
         return
 
-    green = bool(wake.get("green"))
     rounds = state.builder_rounds(repo, pr)
 
     # --- entitlement (per-install credit balance) ---------------------------
@@ -272,7 +306,7 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict) -> None:
                      detail={"reason": "out of credits"})
         _gh(cfg, "pr", "comment", str(pr), "-R", repo,
             "--body", "Neo: this install is out of credits — top up to resume auto-fix/merge.")
-        jobs.resolve(job, "failed", payload={"reason": "out of credits"})
+        jobs.park(job_id, reason="out of credits — owner must top up")
         log.info("%s#%s: install out of credits — gated", repo, pr)
         return
     # P0 hotfix: nullable inheritance for auto-merge.
@@ -288,7 +322,7 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict) -> None:
         state.record(repo, pr, sha, "stale_head", verdict="STALE",
                      detail={"context": wake.get("context"),
                              "head_sha": evidence["head_sha"], "decided_sha": sha})
-        jobs.resolve(job, "no_change", payload={"reason": "stale head"})
+        jobs.resolve(job_id, "no_change", payload={"reason": "stale head"})
         log.info("%s#%s@%s head moved to %s — stale evidence, not mergeable",
                  repo, pr, sha[:8], evidence["head_sha"][:8])
         return
@@ -327,17 +361,22 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict) -> None:
     )
     agent = ClaudeAgent.from_config(cfg)
     try:
-        usage, verdict = _run_agent(agent, brief)
+        # Lease renewal: a static lease shorter than the agent run would let a
+        # second worker claim the same SHA mid-run (GLM 6 applies to wakes too).
+        with jobs.lease_renewal(job_id, lease_secs=_wake_lease(cfg)):
+            usage, verdict = _run_agent(agent, brief)
     except Exception as exc:
-        # Defect 3 fix: catch any exception from agent spawn so the job
-        # is released via lease expiry instead of stranding the SHA.
-        log.exception("%s#%s@%s agent crashed (%s) — job released for retry",
+        # Any exception from the agent spawn (FileNotFoundError/OSError/
+        # UnicodeDecodeError included) releases the job for retry instead of
+        # stranding the SHA (defect 3 / GLM 4).
+        log.exception("%s#%s@%s agent crashed (%s) — job retried",
                       repo, pr, sha[:8], type(exc).__name__)
+        jobs.retry(job_id, reason=f"agent crashed ({type(exc).__name__})")
         return
 
     if not verdict:
-        log.warning("%s#%s@%s agent produced no verdict — job released for retry",
-                    repo, pr, sha[:8])
+        log.warning("%s#%s@%s agent produced no verdict — job retried", repo, pr, sha[:8])
+        jobs.retry(job_id, reason="agent produced no verdict")
         return
 
     is_builder = verdict.startswith("BOUNCE-BUILDER")
@@ -346,20 +385,23 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict) -> None:
         "ACCEPT-MERGED": "merged", "ACCEPT-READY": "ready", "FIX-FORWARD": "fix_forward",
         "BOUNCE-BUILDER": "builder", "ESCALATE": "escalated",
     }.get(verdict.split()[0] if verdict else "", "triage")
+    new_round = (rounds + 1) if is_builder else rounds
+    if is_builder:
+        # The builder lane only consumes kind='builder' jobs; create one here,
+        # where the bounce is recorded (integrator finding 1), so a BOUNCE
+        # verdict always reaches Hermes.  Idempotent by (repo, pr, round).
+        jobs.create_builder(repo, pr, sha, new_round, payload={
+            "verdict": verdict, "wake_job": job_id,
+            "head_sha": sha, "phase": phase, "round": new_round,
+            "context": wake.get("context"),
+        })
     state.record(repo, pr, sha, phase, verdict=verdict,
-                 builder_round=(rounds + 1) if is_builder else rounds, credits=credits)
-    # Resolve the job with a terminal outcome.
-    outcome = "done"
-    if phase == "escalated":
-        outcome = "failed"
-    elif phase in ("merged", "ready"):
-        outcome = "done"
-    elif phase == "fix_forward":
-        outcome = "done"
-    elif phase == "builder":
-        outcome = "done"  # builder round dispatched; the builder job handles it
-    jobs.resolve(job, outcome, payload={"verdict": verdict, "phase": phase,
-                                         "credits": credits})
+                 builder_round=new_round, credits=credits)
+    # Resolve the wake job with a terminal outcome.  The triage completed; a
+    # builder round is a SEPARATE job the builder lane claims (the wake job is
+    # not left running or 'failed' — 'done' + the phase in the payload).
+    jobs.resolve(job_id, "done", payload={"verdict": verdict, "phase": phase,
+                                            "credits": credits})
     if inst.get("plan"):
         state.debit(org, credits)
     log.info("%s#%s@%s verdict=%s credits=%d (auto_merge=%s round=%d)",

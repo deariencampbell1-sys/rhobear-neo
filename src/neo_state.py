@@ -9,7 +9,6 @@ button and the credit meter.
 from __future__ import annotations
 
 import json
-import time
 from dataclasses import dataclass
 
 import psycopg  # psycopg3
@@ -28,27 +27,6 @@ CREATE TABLE IF NOT EXISTS neo_actions (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS neo_actions_pr ON neo_actions(repo, pr_number, head_sha);
-
-CREATE TABLE IF NOT EXISTS neo_jobs (
-    id            BIGSERIAL PRIMARY KEY,
-    repo          TEXT NOT NULL,
-    pr_number     INTEGER NOT NULL,
-    head_sha      TEXT NOT NULL,
-    kind          TEXT NOT NULL DEFAULT 'wake',   -- wake | builder
-    state         TEXT NOT NULL DEFAULT 'queued', -- queued | running | done
-    outcome       TEXT,                           -- done | no_change | failed | superseded | parked
-    attempt       INTEGER NOT NULL DEFAULT 0,
-    max_attempts  INTEGER NOT NULL DEFAULT 3,
-    lease_expires TIMESTAMPTZ,
-    payload       JSONB NOT NULL DEFAULT '{}',
-    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (repo, pr_number, head_sha)
-);
-CREATE INDEX IF NOT EXISTS neo_jobs_queued ON neo_jobs(state, lease_expires)
-    WHERE state = 'queued';
-CREATE INDEX IF NOT EXISTS neo_jobs_expired ON neo_jobs(lease_expires)
-    WHERE lease_expires IS NOT NULL AND state = 'running';
 
 CREATE TABLE IF NOT EXISTS neo_installs (
     install_id  TEXT PRIMARY KEY,           -- github app installation id (or org)
@@ -74,6 +52,11 @@ class NeoState:
     def ensure_schema(self) -> None:
         with self._conn() as c:
             c.execute(SCHEMA)
+        # ONE schema definition for neo_jobs lives in jobs.py (including the
+        # in-place migration of the pre-B1 table).  NeoState delegates so the
+        # two modules can never drift.
+        from .jobs import Jobs
+        Jobs(self.dsn).ensure_schema()
 
     # --- loop / thrash guard ------------------------------------------------
     def builder_rounds(self, repo: str, pr: int) -> int:
