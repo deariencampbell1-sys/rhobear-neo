@@ -402,7 +402,7 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict) -> None:
     # before writing the triage marker. Re-running the agent would mint a second builder
     # round; finish the bookkeeping instead.
     for done_phase in ("builder", "ready", "fix_forward", "escalated",
-                       "escalating", "parked", "blocked"):
+                       "escalating", "builder_blocked", "blocked"):
         if state.already_acted(repo, pr, sha, done_phase, green=green):
             state.record(repo, pr, sha, "triage",
                          detail={"green": wake.get("green"), "recovered": done_phase})
@@ -626,7 +626,9 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict) -> None:
         phase = {
             "FIXED": "ready",
             "NO-CHANGE": "ready",
-            "BLOCKED": "parked",
+            # Not "parked": credits/advisor parks share that phase and are
+            # transient — the recovery gate must not treat them as acted.
+            "BLOCKED": "builder_blocked",
             "FIX-FORWARD": "fix_forward",
             "ESCALATE": "escalated",
         }.get(verdict_base, "blocked")
