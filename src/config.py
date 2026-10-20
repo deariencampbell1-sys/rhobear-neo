@@ -81,6 +81,10 @@ class Config:
     # Client credential for the agent. Direct DeepSeek uses the DeepSeek key;
     # when the local Claude-wire bridge is the base URL, this is the bridge's
     # shared handshake value and the bridge holds the real provider keys.
+    # NOTE: the bridge serves DeepSeek/Bedrock only — it does NOT accept
+    # forwarded provider credentials or serve GLM or other models.  Routes
+    # with no Anthropic-wire endpoint (e.g. deepinfra) are skipped for the
+    # Claude agent with one log line.
     deepseek_key: str = field(default_factory=lambda: (
         _get("NEO_DEEPSEEK_API_KEY") or _get("DEEPSEEK_API_KEY")))
     deepseek_model: str = field(default_factory=lambda: _get(
@@ -312,11 +316,16 @@ class Config:
 
 # Anthropic-wire endpoints for Claude Code, keyed by provider name.
 # A provider not in this dict cannot be served by Claude Code (skipped).
-# The bridge endpoint is the existing local Claude-wire bridge.
+#
+# The local Claude-wire bridge (127.0.0.1:8790) holds its own keys and serves
+# DeepSeek primary with a Bedrock fallback — it does NOT accept forwarded
+# provider credentials or serve arbitrary models.  Only providers with a real
+# Anthropic-wire endpoint (DeepSeek, Z.ai) are listed here.  DeepInfra routes
+# are skipped for the Claude agent with one log line — they are served by the
+# Hermes Builder lane instead.
 CLAUDE_WIRE_ENDPOINTS: dict[str, str] = {
     "deepseek": "https://api.deepseek.com/anthropic",
     "zai": "https://api.z.ai/api/anthropic",
-    "deepinfra": "http://127.0.0.1:8790",
 }
 
 # Providers that Claude Code CANNOT serve (no Anthropic-wire endpoint).

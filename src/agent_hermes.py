@@ -180,6 +180,7 @@ class HermesAgent:
         gh_token: str,
         usage_store=None,
         job_id: int | None = None,
+        attempt_number: int = 1,
     ) -> tuple[dict[str, int], str, int | None, Route | None]:
         """Walk the available route chain, trying each in order.
 
@@ -210,7 +211,7 @@ class HermesAgent:
                          idx, route.provider, route.model)
                 if usage_store is not None and job_id is not None:
                     attempt = UsageAttempt(
-                        job_id=job_id, attempt_number=1, route_idx=idx,
+                        job_id=job_id, attempt_number=attempt_number, route_idx=idx,
                         provider=route.provider, model=route.model,
                         outcome="skipped",
                         error_class="no_hermes_provider",
@@ -237,7 +238,7 @@ class HermesAgent:
                     # Record the failed attempt.
                     if usage_store is not None and job_id is not None:
                         attempt = UsageAttempt(
-                            job_id=job_id, attempt_number=1, route_idx=idx,
+                            job_id=job_id, attempt_number=attempt_number, route_idx=idx,
                             provider=route.provider, model=route.model,
                             latency_ms=elapsed_ms,
                             outcome="fallthrough" if fallthrough else "error",
@@ -248,8 +249,10 @@ class HermesAgent:
                         except Exception:  # noqa: BLE001
                             log.exception("failed to record attempt %s", idx)
                     if not fallthrough:
-                        # Non-fallthrough failure — stop the chain.
-                        return {}, "", idx, route
+                        # Non-fallthrough failure — re-raise so the
+                        # caller's except AgentError handler retries
+                        # the job rather than treating it as completed.
+                        raise exc
                     # Fallthrough — try next route.
                     continue
 
@@ -257,7 +260,7 @@ class HermesAgent:
                 elapsed_ms = int((time.monotonic() - route_start) * 1000)
                 if usage_store is not None and job_id is not None:
                     attempt = UsageAttempt(
-                        job_id=job_id, attempt_number=1, route_idx=idx,
+                        job_id=job_id, attempt_number=attempt_number, route_idx=idx,
                         provider=route.provider, model=route.model,
                         uncached_input=usage.get("input_tokens"),
                         output_tokens=usage.get("output_tokens"),
@@ -285,17 +288,34 @@ class HermesAgent:
         Falls back to error type classification.
         """
         # Check stderr for HTTP status codes.
+        # Uses anchored patterns to avoid false positives from bare substrings
+        # (e.g. "150 files", "Retry-After: 400", "read 400 bytes").
+        # Check timeout FIRST so "timed out after reading 400 bytes" is
+        # classified as timeout, not as 400.
         if proc is not None and proc.stderr:
-            stderr = proc.stderr.lower()
-            for code_str in ("429", "402"):
-                if code_str in stderr:
-                    return True, code_str
-            if "50" in stderr and any(f"{i}0" in stderr for i in range(0, 10)):
-                return True, "5xx"
-            if "400" in stderr or "bad request" in stderr:
-                return False, "400"
-            if "timeout" in stderr or "timed out" in stderr:
+            stderr = proc.stderr
+            stderr_lower = stderr.lower()
+
+            # Timeout check first (anchored)
+            if re.search(r'\btime(?:d\s+)?out\b', stderr_lower):
                 return True, "timeout"
+
+            # 429 / 402 (anchored near HTTP/status — handles both
+            # "HTTP 429" and "HTTP: 429" formats)
+            if re.search(r'(?:\bHTTP\s+|status\s*:\s*)429\b', stderr, re.IGNORECASE):
+                return True, "429"
+            if re.search(r'(?:\bHTTP\s+|status\s*:\s*)402\b', stderr, re.IGNORECASE):
+                return True, "402"
+
+            # 5xx (anchored near HTTP/status)
+            if re.search(r'(?:\bHTTP\s+|status\s*:\s*)5\d{2}\b', stderr, re.IGNORECASE):
+                return True, "5xx"
+
+            # 400 (anchored near HTTP/status) — does NOT fall through
+            if re.search(r'(?:\bHTTP\s+|status\s*:\s*)400\b', stderr, re.IGNORECASE):
+                return False, "400"
+            if re.search(r'\bbad request\b', stderr_lower):
+                return False, "400"
 
         # Fall back to error type classification.
         if isinstance(exc, TimeoutError):

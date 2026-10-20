@@ -323,6 +323,9 @@ class TestDefect3AgentErrors:
         state.already_escalated.return_value = False  # PR has not escalated yet
         wake = {"repo": "o/r", "sha": "a" * 40, "green": True,
                 "context": "test", "pr_number": 1, "job_id": 42}
+        # Provide a realistic return for jobs.get (Defect 5: attempt_number).
+        if hasattr(jobs, 'get') and not callable(getattr(jobs, 'get', None)):
+            jobs.get = MagicMock(return_value={"attempt": 1})
         with patch("src.neo_worker.resolve_pr", return_value=1), \
              patch("src.neo_worker._review_evidence", return_value={
                  "ok": True, "head_sha": "a" * 40, "decided_sha": "a" * 40,

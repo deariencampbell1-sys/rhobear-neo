@@ -42,7 +42,7 @@ import sys
 import time
 from pathlib import Path
 
-from .agent_hermes import AgentError, HermesAgent, MissingResult, NonZeroExit
+from .agent_hermes import AgentError, HermesAgent, MissingResult, NonZeroExit, TimeoutError
 from .config import Config
 from .usage import Route
 from .github_app import (
@@ -113,7 +113,8 @@ class BuilderAgent(HermesAgent):
             proc = subprocess.run(cmd, cwd=self.work_dir, env=env,
                                   capture_output=True, text=True, timeout=self.timeout)
         except subprocess.TimeoutExpired:
-            raise AgentError(f"builder hermes timed out after {self.timeout}s")
+            raise TimeoutError(f"builder hermes timed out after {self.timeout}s")
+        self._last_proc = proc
         log.info("builder hermes exit=%d elapsed=%.0fs stdout=%d stderr=%d",
                  proc.returncode, time.monotonic() - start,
                  len(proc.stdout or ""), len(proc.stderr or ""))
@@ -136,18 +137,44 @@ class BuilderAgent(HermesAgent):
         gh_token: str,
         usage_store=None,
         job_id: int | None = None,
+        attempt_number: int = 1,
     ) -> tuple[dict[str, int], str, int | None, Route | None]:
         """Walk the available route chain for the builder, trying each in order.
 
         Each route runs inside the shared worktree (self.work_dir).
+        The worktree is reset (git reset --hard <sha> + git clean -fd) before
+        each route attempt so a killed route's partial edits never bleed into
+        the next route (Defect 8).
         Returns (usage, verdict, route_idx, route).
         """
+        # Determine the base SHA for worktree resets.
+        _sha = ""
+        try:
+            _sha = subprocess.run(
+                ["git", "-C", self.work_dir, "rev-parse", "HEAD"],
+                capture_output=True, text=True, timeout=30,
+            ).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            pass
+
         for idx, route in available_routes:
             hermes_provider = cfg.hermes_provider_for(route.provider)
             if hermes_provider is None:
                 log.info("builder route %d (%s/%s) skipped — "
                          "no Hermes provider mapping",
                          idx, route.provider, route.model)
+                if usage_store is not None and job_id is not None:
+                    try:
+                        from .usage import UsageAttempt
+                        usage_store.record_attempt(UsageAttempt(
+                            job_id=job_id, attempt_number=attempt_number,
+                            route_idx=idx,
+                            provider=route.provider, model=route.model,
+                            outcome="skipped",
+                            error_class="no_hermes_provider",
+                        ))
+                    except Exception:  # noqa: BLE001
+                        log.exception("failed to record skipped route %s", idx)
                 continue
 
             route_agent = BuilderAgent(
@@ -159,6 +186,21 @@ class BuilderAgent(HermesAgent):
                 gh_token=gh_token,
             )
 
+            # Reset the worktree before each route attempt (Defect 8) so a
+            # killed route's partial edits never bleed into the next route.
+            if _sha:
+                try:
+                    subprocess.run(
+                        ["git", "-C", self.work_dir, "reset", "--hard", _sha],
+                        capture_output=True, timeout=60,
+                    )
+                    subprocess.run(
+                        ["git", "-C", self.work_dir, "clean", "-fd"],
+                        capture_output=True, timeout=60,
+                    )
+                except (OSError, subprocess.SubprocessError):
+                    log.warning("worktree reset failed for route %d", idx)
+
             route_start = time.monotonic()
             try:
                 usage, verdict = route_agent.run(brief)
@@ -168,13 +210,44 @@ class BuilderAgent(HermesAgent):
                     exc, route_agent)
                 log.info("builder route %d (%s/%s) failed: %s (fallthrough=%s)",
                          idx, route.provider, route.model, exc, fallthrough)
+                # Record the failed attempt (Defect 7: meter builder lane).
+                if usage_store is not None and job_id is not None:
+                    try:
+                        from .usage import UsageAttempt
+                        usage_store.record_attempt(UsageAttempt(
+                            job_id=job_id, attempt_number=attempt_number,
+                            route_idx=idx,
+                            provider=route.provider, model=route.model,
+                            latency_ms=elapsed_ms,
+                            outcome="fallthrough" if fallthrough else "error",
+                            error_class=err_class,
+                        ))
+                    except Exception:  # noqa: BLE001
+                        log.exception("failed to record attempt %s", idx)
                 if not fallthrough:
-                    return {}, "", idx, route
+                    # Non-fallthrough failure — re-raise so dispatch_one
+                    # retries the job instead of treating it as completed.
+                    raise exc
                 continue
 
             elapsed_ms = int((time.monotonic() - route_start) * 1000)
             log.info("builder route %d (%s/%s) succeeded — verdict=%s",
                      idx, route.provider, route.model, verdict)
+            # Record the successful attempt (Defect 7: meter builder lane).
+            if usage_store is not None and job_id is not None:
+                try:
+                    from .usage import UsageAttempt
+                    usage_store.record_attempt(UsageAttempt(
+                        job_id=job_id, attempt_number=attempt_number,
+                        route_idx=idx,
+                        provider=route.provider, model=route.model,
+                        uncached_input=usage.get("input_tokens") if usage.get("input_tokens") is not None else usage.get("uncached_input"),
+                        output_tokens=usage.get("output_tokens"),
+                        latency_ms=elapsed_ms,
+                        outcome="success",
+                    ))
+                except Exception:  # noqa: BLE001
+                    log.exception("failed to record success %s", idx)
             return usage, verdict, idx, route
 
         return {}, "", None, None
@@ -635,8 +708,13 @@ def dispatch_one(cfg: Config, jobs: Jobs, row: dict) -> None:
     head_before = (head_before or "").strip()
 
     # Build the agent with the route chain.
-    from .usage import available_routes as _avail
+    from .usage import available_routes as _avail, UsageStore
     avail_routes = _avail(cfg.parsed_routes or []) if cfg.parsed_routes else []
+
+    # Create usage store for metering the builder lane (Defect 7).
+    usage_store = UsageStore(cfg.database_url) if cfg.database_url else None
+    builder_job_id = int(row["id"])
+    builder_attempt = int(row.get("attempt", 1))
 
     if avail_routes:
         # Use route chain for the builder agent.
@@ -651,6 +729,8 @@ def dispatch_one(cfg: Config, jobs: Jobs, row: dict) -> None:
                                     worker_token=wtoken):
                 usage, verdict, ridx, route = base_agent.run_with_chain(
                     brief, avail_routes, cfg, token,
+                    usage_store=usage_store, job_id=builder_job_id,
+                    attempt_number=builder_attempt,
                 )
             log.info("fixer done %s#%s verdict=%s route=%s/%s usage=%s",
                      repo, pr, verdict or "?",

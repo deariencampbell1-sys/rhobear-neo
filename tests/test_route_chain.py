@@ -23,8 +23,8 @@ import pytest
 
 from src.config import Config, CLAUDE_WIRE_ENDPOINTS, HERMES_PROVIDER_MAP
 from src.usage import Route, UsageAttempt, UsageStore, available_routes, resolve_route_chain
-from src.agent_claude import ClaudeAgent
-from src.agent_hermes import HermesAgent
+from src.agent_claude import ClaudeAgent, ApiError
+from src.agent_hermes import HermesAgent, AgentError as HermesAgentError
 
 # ---------------------------------------------------------------------------
 # Test database
@@ -134,21 +134,21 @@ class TestFallthrough429:
     """Route 1 returns 429 → route 2 runs and is recorded."""
 
     def test_claude_429_fallthrough(self, cfg, store):
-        """Claude agent: route 1 (deepinfra) returns 429, route 2 (zai) succeeds."""
+        """Claude agent: deepinfra skipped (no Anthropic endpoint),
+        zai returns 429, deepseek succeeds."""
         agent = _make_claude_agent()
 
-        # Mock subprocess.run to simulate 429 on first call, success on second.
         calls = []
 
         def fake_subprocess_run(cmd, **kw):
             calls.append(cmd)
             if len(calls) == 1:
-                # Route 1 (deepinfra) — 429 error
+                # Route zai (idx 1) — 429 error
                 return _fake_proc(
                     stdout=_claude_json(api_error_status="429"),
                     returncode=0,
                 )
-            # Route 2 (zai) — success
+            # Route deepseek (idx 4) — success
             return _fake_proc(
                 stdout=_claude_json(result_text="VERDICT: ACCEPT-READY", in_tok=50, out_tok=20),
                 returncode=0,
@@ -167,23 +167,30 @@ class TestFallthrough429:
                 )
 
         assert verdict == "ACCEPT-READY"
-        assert ridx == 1  # second route (zai) won
+        # cfg has 3 routes: deepinfra(0), zai(1), deepseek(2)
+        # deepinfra skipped for Claude, zai(1) 429 -> fallthrough, deepseek(2) wins
+        assert ridx == 2  # deepseek (idx 2) won after zai (idx 1) fell through
         assert route is not None
-        assert route.provider == "zai"
+        assert route.provider == "deepseek"
         assert len(calls) == 2
 
-        # Check usage store: route 0 recorded as fallthrough, route 1 as success
+        # Check usage store: zai (1) fallthrough, deepseek (2) success
         attempts = store.get_attempts(42)
-        assert len(attempts) == 2
-        assert attempts[0].route_idx == 0
-        assert attempts[0].outcome == "fallthrough"
-        assert attempts[0].error_class == "429"
-        assert attempts[1].route_idx == 1
-        assert attempts[1].outcome == "success"
-        assert attempts[1].output_tokens == 20
+        # deepinfra (0) skipped + zai (1) fallthrough + deepseek (2) success
+        assert len(attempts) == 3
+        fallthroughs = [a for a in attempts if a.outcome == "fallthrough"]
+        successes = [a for a in attempts if a.outcome == "success"]
+        skipped = [a for a in attempts if a.outcome == "skipped"]
+        assert len(fallthroughs) == 1
+        assert fallthroughs[0].route_idx == 1  # zai
+        assert fallthroughs[0].error_class == "429"
+        assert len(successes) == 1
+        assert successes[0].route_idx == 2  # deepseek
+        assert successes[0].output_tokens == 20
+        assert len(skipped) == 1  # deepinfra (0)
 
     def test_hermes_429_fallthrough(self, cfg, store):
-        """Hermes agent: route 1 returns 429, route 2 succeeds."""
+        """Hermes agent: deepinfra returns 429, zai succeeds."""
         agent = _make_hermes_agent()
         calls = []
 
@@ -206,7 +213,7 @@ class TestFallthrough429:
                 )
 
         assert verdict == "ACCEPT-READY"
-        assert ridx == 1
+        assert ridx == 1  # zai (idx 1) won after deepinfra (idx 0) fell through
         assert len(calls) == 2
 
         attempts = store.get_attempts(43)
@@ -225,6 +232,7 @@ class TestFallthrough402:
     """402 (payment required) fall through."""
 
     def test_claude_402_fallthrough(self, cfg, store):
+        """Claude: deepinfra skipped, zai 402 falls through to deepseek."""
         agent = _make_claude_agent()
         calls = []
 
@@ -242,13 +250,16 @@ class TestFallthrough402:
                 usage, verdict, ridx, route = agent.run_with_chain(
                     "brief", avail, cfg, "t", usage_store=store, job_id=44)
 
+        # cfg has 3 routes: deepinfra(0), zai(1), deepseek(2)
+        # deepinfra skipped for Claude, zai(1) 402 -> fallthrough, deepseek(2) wins
         assert verdict == "ACCEPT-READY"
-        assert ridx == 1
+        assert ridx == 2  # deepseek (idx 2) won after zai (idx 1) fell through
         assert len(calls) == 2
 
         attempts = store.get_attempts(44)
-        assert attempts[0].outcome == "fallthrough"
-        assert attempts[0].error_class == "402"
+        fallthroughs = [a for a in attempts if a.outcome == "fallthrough"]
+        assert len(fallthroughs) == 1
+        assert fallthroughs[0].error_class == "402"
 
 
 # ===================================================================
@@ -259,6 +270,7 @@ class TestFallthrough5xx:
     """5xx errors fall through."""
 
     def test_claude_5xx_fallthrough(self, cfg, store):
+        """Claude: deepinfra skipped, zai 503 falls through to deepseek."""
         agent = _make_claude_agent()
         calls = []
 
@@ -276,11 +288,14 @@ class TestFallthrough5xx:
                 usage, verdict, ridx, route = agent.run_with_chain(
                     "brief", avail, cfg, "t", usage_store=store, job_id=45)
 
+        # cfg has 3 routes: deepinfra(0), zai(1), deepseek(2)
+        # deepinfra skipped for Claude, zai(1) 503 -> fallthrough, deepseek(2) wins
         assert verdict == "ACCEPT-READY"
-        assert ridx == 1
+        assert ridx == 2  # deepseek (idx 2) won after zai (idx 1) fell through
         attempts = store.get_attempts(45)
-        assert attempts[0].outcome == "fallthrough"
-        assert attempts[0].error_class == "5xx"
+        fallthroughs = [a for a in attempts if a.outcome == "fallthrough"]
+        assert len(fallthroughs) == 1
+        assert fallthroughs[0].error_class == "5xx"
 
 
 # ===================================================================
@@ -291,6 +306,7 @@ class TestNoFallthrough400:
     """400 (bad request) does NOT fall through — stops the chain."""
 
     def test_claude_400_stops_chain(self, cfg, store):
+        """Claude: deepinfra skipped, zai 400 raises ApiError (re-raised)."""
         agent = _make_claude_agent()
         calls = []
 
@@ -303,20 +319,22 @@ class TestNoFallthrough400:
         }, clear=True):
             avail = available_routes(cfg.parsed_routes)
             with patch("src.agent_claude.subprocess.run", side_effect=fake_run):
-                usage, verdict, ridx, route = agent.run_with_chain(
-                    "brief", avail, cfg, "t", usage_store=store, job_id=46)
+                with pytest.raises(ApiError):
+                    agent.run_with_chain(
+                        "brief", avail, cfg, "t", usage_store=store, job_id=46)
 
-        # Should have stopped after route 0 — no fallthrough
-        assert verdict == ""
-        assert ridx == 0  # route 0 is where it stopped
-        assert len(calls) == 1  # only one route attempted
+        # Only one route attempted (zai, idx 1 — deepinfra idx 0 skipped)
+        assert len(calls) == 1
 
         attempts = store.get_attempts(46)
-        assert len(attempts) == 1
-        assert attempts[0].outcome == "error"
-        assert attempts[0].error_class == "400"
+        # deepinfra (0) skipped + zai (1) error
+        assert len(attempts) == 2
+        assert attempts[0].outcome == "skipped"
+        assert attempts[1].outcome == "error"
+        assert attempts[1].error_class == "400"
 
     def test_hermes_400_stops_chain(self, cfg, store):
+        """Hermes: deepinfra 400 raises AgentError (re-raised)."""
         agent = _make_hermes_agent()
         calls = []
 
@@ -329,14 +347,14 @@ class TestNoFallthrough400:
         }, clear=True):
             avail = available_routes(cfg.parsed_routes)
             with patch("src.agent_hermes.subprocess.run", side_effect=fake_run):
-                usage, verdict, ridx, route = agent.run_with_chain(
-                    "brief", avail, cfg, "t", usage_store=store, job_id=47)
+                with pytest.raises(HermesAgentError):
+                    agent.run_with_chain(
+                        "brief", avail, cfg, "t", usage_store=store, job_id=47)
 
-        assert verdict == ""
-        assert ridx == 0
         assert len(calls) == 1
 
         attempts = store.get_attempts(47)
+        assert len(attempts) == 1
         assert attempts[0].outcome == "error"
 
 
@@ -348,6 +366,7 @@ class TestAllRoutesExhausted:
     """All routes return fallthrough errors — all recorded, no winner."""
 
     def test_all_routes_429(self, cfg, store):
+        """Claude: deepinfra skipped, zai and deepseek both 429 — all exhausted."""
         agent = _make_claude_agent()
         calls = []
 
@@ -365,12 +384,13 @@ class TestAllRoutesExhausted:
 
         assert verdict == ""
         assert ridx is None
-        assert len(calls) == 3  # all 3 routes tried
+        # cfg has 3 routes: deepinfra(0), zai(1), deepseek(2)
+        # deepinfra skipped, zai(1) 429, deepseek(2) 429 = 2 attempts
+        assert len(calls) == 2
 
         attempts = store.get_attempts(48)
-        assert len(attempts) == 3
-        for a in attempts:
-            assert a.outcome == "fallthrough"
+        fallthroughs = [a for a in attempts if a.outcome == "fallthrough"]
+        assert len(fallthroughs) == 2  # zai and deepseek
 
 
 # ===================================================================
@@ -381,6 +401,7 @@ class TestZeroTokenUsage:
     """Zero-token usage stays 0 (not None)."""
 
     def test_zero_tokens_recorded(self, cfg, store):
+        """Claude: deepinfra skipped, zai succeeds with zero tokens."""
         agent = _make_claude_agent()
         calls = []
 
@@ -399,14 +420,16 @@ class TestZeroTokenUsage:
                     "brief", avail, cfg, "t", usage_store=store, job_id=49)
 
         assert verdict == "ACCEPT-READY"
-        assert ridx == 0
+        assert ridx == 1  # zai (idx 1) is first non-skipped route
         assert usage["input_tokens"] == 0
         assert usage["output_tokens"] == 0
 
         attempts = store.get_attempts(49)
-        assert len(attempts) == 1
-        assert attempts[0].uncached_input == 0
-        assert attempts[0].output_tokens == 0
+        # deepinfra (0) skipped + zai (1) success
+        successes = [a for a in attempts if a.outcome == "success"]
+        assert len(successes) == 1
+        assert successes[0].uncached_input == 0
+        assert successes[0].output_tokens == 0
 
 
 # ===================================================================
@@ -608,7 +631,10 @@ class TestClaudePerRouteAgent:
         assert CLAUDE_WIRE_ENDPOINTS.get("zai") == "https://api.z.ai/api/anthropic"
 
     def test_claude_endpoint_for_deepinfra(self):
-        assert CLAUDE_WIRE_ENDPOINTS.get("deepinfra") == "http://127.0.0.1:8790"
+        # Defect 3: deepinfra has no Anthropic-wire endpoint — the local
+        # Claude-wire bridge serves DeepSeek/Bedrock only and does NOT
+        # accept forwarded provider credentials for GLM.
+        assert CLAUDE_WIRE_ENDPOINTS.get("deepinfra") is None
 
     def test_claude_skips_unknown_provider(self):
         assert CLAUDE_WIRE_ENDPOINTS.get("openrouter") is None
