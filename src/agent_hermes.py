@@ -300,19 +300,19 @@ class HermesAgent:
             if re.search(r'\btime(?:d\s+)?out\b', stderr_lower):
                 return True, "timeout"
 
-            # 429 / 402 (anchored near HTTP/status — handles both
-            # "HTTP 429" and "HTTP: 429" formats)
-            if re.search(r'(?:\bHTTP\s+|status\s*:\s*)429\b', stderr, re.IGNORECASE):
+            # 429 / 402 (anchored near HTTP/status: "HTTP 429", "HTTP: 429",
+            # "HTTP/1.1 429 …", "status: 429", "status 429")
+            if re.search(r'(?:\bHTTP(?:/\d(?:\.\d)?)?\s*:?\s*|\bstatus\s*:?\s*)429\b', stderr, re.IGNORECASE):
                 return True, "429"
-            if re.search(r'(?:\bHTTP\s+|status\s*:\s*)402\b', stderr, re.IGNORECASE):
+            if re.search(r'(?:\bHTTP(?:/\d(?:\.\d)?)?\s*:?\s*|\bstatus\s*:?\s*)402\b', stderr, re.IGNORECASE):
                 return True, "402"
 
             # 5xx (anchored near HTTP/status)
-            if re.search(r'(?:\bHTTP\s+|status\s*:\s*)5\d{2}\b', stderr, re.IGNORECASE):
+            if re.search(r'(?:\bHTTP(?:/\d(?:\.\d)?)?\s*:?\s*|\bstatus\s*:?\s*)5\d{2}\b', stderr, re.IGNORECASE):
                 return True, "5xx"
 
             # 400 (anchored near HTTP/status) — does NOT fall through
-            if re.search(r'(?:\bHTTP\s+|status\s*:\s*)400\b', stderr, re.IGNORECASE):
+            if re.search(r'(?:\bHTTP(?:/\d(?:\.\d)?)?\s*:?\s*|\bstatus\s*:?\s*)400\b', stderr, re.IGNORECASE):
                 return False, "400"
             if re.search(r'\bbad request\b', stderr_lower):
                 return False, "400"
