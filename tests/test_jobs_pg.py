@@ -30,6 +30,7 @@ Run:  NEO_TEST_DSN='<dsn>' .venv/bin/python -m pytest tests/test_jobs_pg.py -q
 """
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import threading
@@ -59,6 +60,12 @@ pytestmark = pytest.mark.skipif(not DSN, reason="NEO_TEST_DSN not set")
 
 SHA1 = "a" * 40
 SHA2 = "b" * 40
+# B3: Builder reads the trusted assessment check run; a minimal valid one.
+_ASSESSMENT = json.dumps({"schema_version": 1, "repo": "o/r", "pr": 5, "head_sha": SHA1,
+                          "base_sha": "c" * 40, "coverage": "complete", "unresolved_critical_high": 1,
+                          "coverage_manifest": {"reviewed": ["a.py"], "skipped": []},
+                          "findings": [{"id": "f1", "status": "confirmed", "severity": "HIGH",
+                                        "file": "a.py", "line": 1, "title": "t", "body": "b"}]})
 
 
 def _wipe() -> None:
@@ -384,7 +391,7 @@ class TestLeaseRenewal:
         with patch("src.neo_builder.pr_state", return_value="OPEN\tmain"), \
              patch("src.neo_builder.prepare_worktree",
                    return_value=("/tmp/wt", "main")), \
-             patch("src.neo_builder.fetch_findings", return_value=""), \
+             patch("src.neo_builder.fetch_findings", return_value=(_ASSESSMENT, None)), \
              patch("src.neo_builder.gh", return_value=(0, SHA2)), \
              patch("src.neo_builder.BRIEFS", tmp_path / "briefs"), \
              patch("src.neo_builder.BuilderAgent.run",
@@ -728,7 +735,7 @@ class TestBuilderVerdictBranches:
         assert row is not None and row["id"] == row_id
         with patch("src.neo_builder.pr_state", return_value="OPEN\tmain"), \
              patch("src.neo_builder.prepare_worktree", return_value=("/tmp/wt", "main")), \
-             patch("src.neo_builder.fetch_findings", return_value=""), \
+             patch("src.neo_builder.fetch_findings", return_value=(_ASSESSMENT, None)), \
              patch("src.neo_builder.gh", return_value=(0, SHA2)), \
              patch("src.neo_builder.BRIEFS", Path("/tmp/briefs")), \
              patch("src.neo_builder.BuilderAgent.run", return_value=run_result):
@@ -1674,3 +1681,28 @@ class TestDefaultConfigEscalationPG:
         assert len(handled) == 1 and handled[0]["action"] == "escalated", handled
         claimed = jobs.claim_queued("builder")
         assert claimed is not None and claimed["builder_round"] == 6, claimed
+
+
+@pytest.mark.skipif(not os.environ.get("NEO_TEST_DSN"), reason="NEO_TEST_DSN not set")
+class TestNoAssessmentPG:
+    def test_no_assessment_resolves_without_launching_fixer(self, db, tmp_path):
+        """B3: no trusted assessment → the round ends with outcome no_assessment;
+        the fixer is never launched (no tokens spent)."""
+        from src.neo_builder import dispatch_one
+        cfg = _cfg()
+        cfg.max_builder_rounds = 3
+        row_id = db.create_builder("o/r", 5, SHA1, 1)
+        row = db.claim_queued("builder")
+        assert row is not None and row["id"] == row_id
+        with patch("src.neo_builder.pr_state", return_value="OPEN\tmain"), \
+             patch("src.neo_builder.prepare_worktree", return_value=("/tmp/wt", "main")), \
+             patch("src.neo_builder.fetch_findings",
+                   return_value=(None, "no_assessment: no trusted check run for this head SHA")), \
+             patch("src.neo_builder.BRIEFS", tmp_path / "briefs"), \
+             patch("src.neo_builder.BuilderAgent.run") as run:
+            dispatch_one(cfg, db, row)
+        run.assert_not_called()
+        row2 = db.get(row_id)
+        assert row2["state"] == "done"
+        assert row2["outcome"] == "no_change"
+        assert (row2.get("payload") or {}).get("outcome") == "no_assessment"
