@@ -175,7 +175,7 @@ class TestNeoBuilder:
         brief = build_brief(
             repo="owner/repo", pr=42, sha="abc123def456",
             round_="1", head_branch="fix-pr-42",
-            findings="[finding: missing error handling]",
+            findings_block="<neo-assessment>\nmissing error handling\n</neo-assessment>",
         )
         assert "owner/repo" in brief
         assert "PR #42" in brief
@@ -192,9 +192,9 @@ class TestNeoBuilder:
         brief = build_brief(
             repo="owner/repo", pr=42, sha="abc123def456",
             round_="1", head_branch="fix-pr-42",
-            findings="",
+            findings_block="",
         )
-        assert "apply the review timeline comments" in brief
+        assert "no assessment available" in brief
 
     def test_gh_command(self):
         """Verify gh() builds the right env — no real execution."""
