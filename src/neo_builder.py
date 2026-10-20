@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+import re
 import logging
 import os
 import subprocess
@@ -226,6 +227,20 @@ def prepare_worktree(token: str, repo: str, pr: int) -> tuple[str, str]:
     return str(dest), head_branch
 
 
+def head_moved(worktree: str, sha: str) -> str | None:
+    """None when the worktree is at `sha`; the live SHA when it moved; "" when
+    the worktree head cannot be read (transient — the caller retries)."""
+    try:
+        out = subprocess.run(["git", "-C", worktree, "rev-parse", "HEAD"],
+                             capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    head = out.stdout.strip() if out.returncode == 0 else ""
+    if not re.fullmatch(r"[0-9a-f]{40}", head):
+        return ""
+    return None if head == sha else head
+
+
 ASSESSMENT_SCHEMA_VERSION = 1
 
 
@@ -246,8 +261,15 @@ def fetch_findings(token: str, repo: str, pr: int, sha: str, cfg: Config) -> tup
     The caller receives assessment_json_string and must fence it in
     build_brief before handing it to the fixer agent.
     """
-    # Fetch check runs for the exact head SHA.
-    rc, raw = gh(token, "api", f"repos/{repo}/commits/{sha}/check-runs", timeout=30)
+    trusted_app = str(getattr(cfg, "trusted_reviewer_app_id", "") or "").strip()
+    if not trusted_app:
+        return None, "no_assessment: no trusted reviewer app id configured"
+    # Fetch check runs for the exact head SHA, filtered server-side to the
+    # trusted App: a busy head can carry more runs than one page holds, and an
+    # unpaginated list would silently miss the assessment.
+    rc, raw = gh(token, "api",
+                 f"repos/{repo}/commits/{sha}/check-runs?app_id={trusted_app}&per_page=100",
+                 timeout=30)
     if rc != 0:
         return None, f"no_assessment: check-runs API failed for {sha[:12]}"
     try:
@@ -256,9 +278,6 @@ def fetch_findings(token: str, repo: str, pr: int, sha: str, cfg: Config) -> tup
         return None, "no_assessment: check-runs response not valid JSON"
 
     check_runs = data.get("check_runs") or []
-    trusted_app = str(getattr(cfg, "trusted_reviewer_app_id", "") or "").strip()
-    if not trusted_app:
-        return None, "no_assessment: no trusted reviewer app id configured"
 
     trusted = review_evidence._trusted_check_run(check_runs, trusted_app, sha)
     if trusted is None:
@@ -316,7 +335,13 @@ def _fence_finding_body(body: str, max_chars: int = 4000) -> str:
     body = body.replace("```", "`\u200b`\u200b`")
     # Replace null bytes.
     body = body.replace("\x00", "")
+    # Neutralize the data block's own delimiters: a body that could open or
+    # close <neo-assessment> would put the rest of its text outside the fence.
+    body = _FENCE_TAG.sub(lambda m: m.group(0).replace("<", "<\u200b", 1), body)
     return body
+
+
+_FENCE_TAG = re.compile(r"<\s*/?\s*neo-assessment\b", re.IGNORECASE)
 
 
 def _findings_to_brief_list(findings: list) -> str:
@@ -346,9 +371,9 @@ def _findings_to_brief_list(findings: list) -> str:
         fid = f.get("id", f"f{i}")
         severity = f.get("severity", "LOW")
         status = f.get("status", "unverified")
-        file_path = f.get("file", "?")
+        file_path = _fence_finding_body(str(f.get("file", "?")), max_chars=300).replace("\n", " ")
         line = f.get("line", 0)
-        title = (f.get("title") or "").strip()
+        title = _fence_finding_body(f.get("title") or "", max_chars=300).replace("\n", " ")
         body = _fence_finding_body(f.get("body") or "")
         lines.append(f"### {i}. [{severity}] [{status}] {file_path}:{line}")
         lines.append(f"**ID:** {fid}")
@@ -476,6 +501,18 @@ def dispatch_one(cfg: Config, jobs: Jobs, row: dict) -> None:
         log.error("worktree prep failed %s#%s: %s (rc=%s)", repo, pr,
                   type(e).__name__, getattr(e, "returncode", None))
         return  # job stays running — lease expiry handles recovery
+    # The fixer works on the worktree's code; the assessment must be for that
+    # exact commit. A head that moved since this round was queued (a push or a
+    # force-push) gets its own review and round — never stale findings.
+    moved = head_moved(worktree, sha)
+    if moved == "":
+        log.warning("worktree head unreadable %s#%s — job stays running", repo, pr)
+        return
+    if moved:
+        log.info("stale round %s#%s: queued for %s, head is now %s", repo, pr, sha[:12], moved[:12])
+        jobs.resolve(row["id"], "no_change", worker_token=wtoken,
+                     payload={"outcome": "stale_head", "reason": f"head moved to {moved}"})
+        return
     assessment_json, fetch_reason = fetch_findings(token, repo, pr, sha, cfg)
     if assessment_json is None:
         # No trusted assessment — builder does not guess. The round ends
