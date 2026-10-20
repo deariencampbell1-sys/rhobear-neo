@@ -644,3 +644,57 @@ class TestClaudePerRouteAgent:
         assert HERMES_PROVIDER_MAP.get("deepinfra") == "deepinfra"
         assert HERMES_PROVIDER_MAP.get("zai") == "zai"
         assert HERMES_PROVIDER_MAP.get("deepseek") == "deepseek"
+
+
+# ===================================================================
+# Integrator round: status-line formats, builder stderr, no reset over a push
+# ===================================================================
+
+class TestStatusLineFormats:
+    @pytest.mark.parametrize("stderr,expected", [
+        ("HTTP/1.1 400 invalid model id", (False, "400")),
+        ("HTTP: 400", (False, "400")),
+        ("http status 400", (False, "400")),
+        ("HTTP/2 429 slow down", (True, "429")),
+        ("status 503 upstream", (True, "5xx")),
+        ("read 400 bytes then 150 files", (True, "exit_nonzero")),
+    ])
+    def test_classification(self, stderr, expected):
+        from src.agent_hermes import HermesAgent, NonZeroExit
+        agent = HermesAgent.__new__(HermesAgent)
+        got = agent._classify_agent_error(NonZeroExit("x"), agent, proc=_fake_proc(stderr=stderr, returncode=1))
+        assert got == expected
+
+
+class TestBuilderChainNeverResetsOverCommittedWork:
+    def test_failed_route_that_committed_stops_the_chain(self, cfg, tmp_path):
+        from src import neo_builder as nb
+        from src.agent_hermes import NonZeroExit
+        repo = tmp_path / "wt"
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        git = ["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t"]
+        subprocess.run(git + ["commit", "-q", "--allow-empty", "-m", "base"], check=True)
+        runs = []
+
+        def fake_run(self, brief):
+            runs.append(self.provider)
+            subprocess.run(git + ["commit", "-q", "--allow-empty", "-m", "route fix"], check=True)
+            self._last_proc = _fake_proc(stderr="HTTP 503 upstream", returncode=1)
+            raise NonZeroExit("exit 1")
+
+        agent = nb.BuilderAgent(work_dir=str(repo), hermes_bin="/bin/false", provider="zai", model="glm-5.3-flash")
+        with patch.dict(os.environ, {"DEEPINFRA_API_KEY": "k1", "ZAI_API_KEY": "k2", "DEEPSEEK_API_KEY": "k3"}, clear=True), \
+             patch.object(nb.BuilderAgent, "run", fake_run):
+            avail = available_routes(cfg.parsed_routes)
+            usage, verdict, idx, route = agent.run_with_chain("brief", avail, cfg, "t")
+        assert len(runs) == 1, "the next route never runs over committed work"
+        assert verdict == "" and route is not None
+        log = subprocess.run(git + ["log", "--format=%s"], capture_output=True, text=True).stdout
+        assert "route fix" in log, "the committed fix was not reset away"
+
+
+def test_builder_main_ensures_usage_schema():
+    import inspect
+    from src import neo_builder as nb
+    src = inspect.getsource(nb.main)
+    assert "UsageStore(cfg.database_url).ensure_schema()" in src

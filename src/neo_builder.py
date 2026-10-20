@@ -83,6 +83,15 @@ CONCURRENCY = int(os.environ.get("NEO_BUILDER_CONCURRENCY", "4"))
 BUILDER_CANONICAL_VERDICTS = frozenset({"FIXED", "NO-CHANGE", "BLOCKED"})
 
 
+def _worktree_head(work_dir: str) -> str:
+    try:
+        out = subprocess.run(["git", "-C", work_dir, "rev-parse", "HEAD"],
+                             capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return out.stdout.strip() if out.returncode == 0 else ""
+
+
 class BuilderAgent(HermesAgent):
     """Hermes agent pinned to a real worktree cwd (no per-run temp dir).
 
@@ -207,7 +216,7 @@ class BuilderAgent(HermesAgent):
             except AgentError as exc:
                 elapsed_ms = int((time.monotonic() - route_start) * 1000)
                 fallthrough, err_class = route_agent._classify_agent_error(
-                    exc, route_agent)
+                    exc, route_agent, proc=getattr(route_agent, "_last_proc", None))
                 log.info("builder route %d (%s/%s) failed: %s (fallthrough=%s)",
                          idx, route.provider, route.model, exc, fallthrough)
                 # Record the failed attempt (Defect 7: meter builder lane).
@@ -228,6 +237,15 @@ class BuilderAgent(HermesAgent):
                     # Non-fallthrough failure — re-raise so dispatch_one
                     # retries the job instead of treating it as completed.
                     raise exc
+                # The failed route may already have committed (and pushed —
+                # the brief asks for early pushes). Resetting for the next
+                # route would throw that work away and invite a force-push
+                # over it: stop here and let dispatch_one's head comparison
+                # resolve the round from what actually landed.
+                if _sha and _worktree_head(self.work_dir) not in ("", _sha):
+                    log.warning("builder route %d failed after committing; not "
+                                "resetting over its work — chain stops", idx)
+                    return {}, "", idx, route
                 continue
 
             elapsed_ms = int((time.monotonic() - route_start) * 1000)
@@ -834,6 +852,11 @@ def main() -> int:
         )
     jobs = Jobs(cfg.database_url)
     jobs.ensure_schema()
+    # This process writes builder usage rows; it must not depend on the webhook
+    # process having created the table first.
+    from .usage import UsageStore
+    if isinstance(cfg.database_url, str) and cfg.database_url:
+        UsageStore(cfg.database_url).ensure_schema()
     pool = concurrent.futures.ThreadPoolExecutor(
         max_workers=CONCURRENCY, thread_name_prefix="neo-builder")
     log.info("builder lane up: concurrency=%d poll=%ds lease=%ds allowlist=%s",
