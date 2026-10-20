@@ -34,6 +34,9 @@ import tempfile
 import time
 
 from .config import Config
+from .usage import (
+    Route, UsageAttempt, classify_cli_fallthrough,
+)
 
 log = logging.getLogger("rhobear_neo.agent")
 
@@ -101,6 +104,7 @@ class HermesAgent:
         self.model = model.strip()
         self.timeout = timeout
         self.gh_token = gh_token
+        self._last_proc = None
 
     # ------------------------------------------------------------------
     # Factory
@@ -120,11 +124,24 @@ class HermesAgent:
         )
 
     # ------------------------------------------------------------------
+    # Route chain: subclass hook for _for_route
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _for_route_hermes_provider(cls, cfg: Config, route: Route) -> str | None:
+        """Resolve the Hermes --provider name for a route.
+
+        Overridden by BuilderAgent to use the builder's own provider config.
+        Returns None if the route cannot be served.
+        """
+        return cfg.hermes_provider_for(route.provider)
+
+    # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def run(self, brief: str) -> tuple[dict[str, int], str]:
-        """Run the Neo brief through the Hermes CLI.
+        """Run the Neo brief through the Hermes CLI on the configured route.
 
         Returns (usage, verdict) where usage is {input_tokens, output_tokens}
         (best-effort — see note in _parse_output) and verdict is the
@@ -135,6 +152,160 @@ class HermesAgent:
         """
         with tempfile.TemporaryDirectory(prefix="neo-work-") as work_dir:
             return self._run_in(brief, work_dir)
+
+    # ------------------------------------------------------------------
+    # Route chain: walk available routes, fall through on transient errors
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _for_route(cls, cfg: Config, route: Route, gh_token: str,
+                   hermes_provider: str) -> HermesAgent:
+        """Create a HermesAgent for a specific route in the chain.
+
+        `hermes_provider` is the Hermes --provider name for this route.
+        """
+        return cls(
+            hermes_bin=cfg.hermes_bin,
+            provider=hermes_provider,
+            model=route.model,
+            timeout=cfg.deepseek_timeout,
+            gh_token=gh_token,
+        )
+
+    def run_with_chain(
+        self,
+        brief: str,
+        available_routes: list[tuple[int, Route]],
+        cfg: Config,
+        gh_token: str,
+        usage_store=None,
+        job_id: int | None = None,
+    ) -> tuple[dict[str, int], str, int | None, Route | None]:
+        """Walk the available route chain, trying each in order.
+
+        For each route:
+          - Skip routes Hermes can't serve (no provider mapping).
+          - Launch on route 1.
+          - If the run fails with a fallthrough class (429/402/5xx/timeout
+            before any output), record the attempt and try the next route.
+          - A non-fallthrough failure stops the chain.
+          - A successful run returns with its usage, verdict, route info.
+
+        Each launch records one UsageAttempt with its real route (provider,
+        model).  Failed attempts record the error class.
+
+        Returns (usage, verdict, route_idx, route).
+        usage is the final successful attempt's usage.
+        verdict is the final successful verdict.
+        route_idx/route are the winning route (None if all failed).
+        """
+        start_time = time.monotonic()
+
+        for idx, route in available_routes:
+            # Skip routes Hermes can't serve.
+            hermes_provider = cfg.hermes_provider_for(route.provider)
+            if hermes_provider is None:
+                log.info("route %d (%s/%s) skipped for Hermes agent — "
+                         "no Hermes provider mapping",
+                         idx, route.provider, route.model)
+                if usage_store is not None and job_id is not None:
+                    attempt = UsageAttempt(
+                        job_id=job_id, attempt_number=1, route_idx=idx,
+                        provider=route.provider, model=route.model,
+                        outcome="skipped",
+                        error_class="no_hermes_provider",
+                    )
+                    try:
+                        usage_store.record_attempt(attempt)
+                    except Exception:  # noqa: BLE001
+                        log.exception("failed to record skipped route %s", idx)
+                continue
+
+            route_agent = self._for_route(cfg, route, gh_token, hermes_provider)
+
+            with tempfile.TemporaryDirectory(prefix="neo-work-") as work_dir:
+                route_start = time.monotonic()
+                try:
+                    usage, verdict = route_agent._run_in(brief, work_dir)
+                except AgentError as exc:
+                    elapsed_ms = int((time.monotonic() - route_start) * 1000)
+                    fallthrough, err_class = self._classify_agent_error(
+                        exc, route_agent,
+                        proc=getattr(route_agent, '_last_proc', None))
+                    log.info("route %d (%s/%s) failed: %s (fallthrough=%s)",
+                             idx, route.provider, route.model, exc, fallthrough)
+                    # Record the failed attempt.
+                    if usage_store is not None and job_id is not None:
+                        attempt = UsageAttempt(
+                            job_id=job_id, attempt_number=1, route_idx=idx,
+                            provider=route.provider, model=route.model,
+                            latency_ms=elapsed_ms,
+                            outcome="fallthrough" if fallthrough else "error",
+                            error_class=err_class,
+                        )
+                        try:
+                            usage_store.record_attempt(attempt)
+                        except Exception:  # noqa: BLE001
+                            log.exception("failed to record attempt %s", idx)
+                    if not fallthrough:
+                        # Non-fallthrough failure — stop the chain.
+                        return {}, "", idx, route
+                    # Fallthrough — try next route.
+                    continue
+
+                # Success.
+                elapsed_ms = int((time.monotonic() - route_start) * 1000)
+                if usage_store is not None and job_id is not None:
+                    attempt = UsageAttempt(
+                        job_id=job_id, attempt_number=1, route_idx=idx,
+                        provider=route.provider, model=route.model,
+                        uncached_input=usage.get("input_tokens"),
+                        output_tokens=usage.get("output_tokens"),
+                        latency_ms=elapsed_ms,
+                        outcome="success",
+                    )
+                    try:
+                        usage_store.record_attempt(attempt)
+                    except Exception:  # noqa: BLE001
+                        log.exception("failed to record success %s", idx)
+                log.info("route %d (%s/%s) succeeded — verdict=%s",
+                         idx, route.provider, route.model, verdict)
+                return usage, verdict, idx, route
+
+        # All routes exhausted.
+        return {}, "", None, None
+
+    def _classify_agent_error(
+        self, exc: AgentError, agent: HermesAgent,
+        proc: subprocess.CompletedProcess | None = None,
+    ) -> tuple[bool, str | None]:
+        """Classify an agent error into (is_fallthrough, error_class).
+
+        For Hermes output, examines stderr for HTTP status codes.
+        Falls back to error type classification.
+        """
+        # Check stderr for HTTP status codes.
+        if proc is not None and proc.stderr:
+            stderr = proc.stderr.lower()
+            for code_str in ("429", "402"):
+                if code_str in stderr:
+                    return True, code_str
+            if "50" in stderr and any(f"{i}0" in stderr for i in range(0, 10)):
+                return True, "5xx"
+            if "400" in stderr or "bad request" in stderr:
+                return False, "400"
+            if "timeout" in stderr or "timed out" in stderr:
+                return True, "timeout"
+
+        # Fall back to error type classification.
+        if isinstance(exc, TimeoutError):
+            return True, "timeout"
+        if isinstance(exc, NonZeroExit):
+            # Nonzero exit without stderr classification — could be a
+            # transient provider error; fall through.
+            return True, "exit_nonzero"
+        # MissingResult, UnknownVerdict — not fallthrough
+        return False, type(exc).__name__.lower()
 
     def _run_in(self, brief: str, work_dir: str) -> tuple[dict[str, int], str]:
         env = self._build_env()
@@ -161,6 +332,7 @@ class HermesAgent:
         log.info("hermes exit=%d elapsed=%.0fs stdout=%d stderr=%d",
                  proc.returncode, elapsed, len(proc.stdout or ""), len(proc.stderr or ""))
 
+        self._last_proc = proc
         return self._parse_output(proc)
 
     # ------------------------------------------------------------------

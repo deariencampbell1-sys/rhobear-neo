@@ -292,3 +292,68 @@ def is_fallthrough(status_code: int | None, timeout_before_first_token: bool = F
     if 500 <= status_code < 600:
         return True
     return False
+
+
+def classify_cli_fallthrough(
+    returncode: int,
+    stderr: str = "",
+    stdout: str = "",
+    *,  # keyword-only
+    is_claude_json: bool = False,
+    claude_json: dict | None = None,
+) -> tuple[bool, str | None]:
+    """Classify whether a CLI agent run should cause fallthrough to the next route.
+
+    Examines exit code, stderr, and (for Claude Code) the JSON result envelope
+    to determine if the failure is a transient provider issue that justifies
+    trying the next route.
+
+    Fallthrough: busy/429/402/5xx/timeout-before-first-token.
+    400 does NOT fall through (bad request — retrying the same route won't help).
+    Non-fallthrough errors (400, auth errors, permission errors) stop the chain.
+
+    Returns (is_fallthrough, error_class).
+    """
+    stderr_lower = stderr.lower()
+
+    # For Claude Code JSON output, check the JSON envelope first.
+    if is_claude_json and claude_json is not None:
+        api_error_status = claude_json.get("api_error_status")
+        if api_error_status is not None and api_error_status != "":
+            err_str = str(api_error_status).strip()
+            # Try to extract HTTP status code
+            for code_str in ("429", "402"):
+                if code_str in err_str:
+                    return is_fallthrough(int(code_str)), classify_http_error(int(code_str))
+            if "5" in err_str[:1] or "timeout" in err_str.lower():
+                return True, "5xx" if any(c.isdigit() for c in err_str[:4]) else "timeout"
+            if "400" in err_str or "bad_request" in err_str.lower():
+                return False, "400"
+            # Unknown API error — not fallthrough
+            return False, err_str[:32]
+
+    # Timeout exit (124 = timeout on POSIX)
+    if returncode in (124, -9):
+        return True, "timeout"
+
+    # Nonzero exit — check stderr for status codes
+    if returncode != 0:
+        # Check for HTTP status codes in stderr
+        for code_str in ("429", "402"):
+            if code_str in stderr_lower:
+                return is_fallthrough(int(code_str)), classify_http_error(int(code_str))
+        # 5xx in stderr
+        if "50" in stderr and any(f"{i}0" in stderr for i in range(0, 10)):
+            return True, "5xx"
+        if "timeout" in stderr_lower or "timed out" in stderr_lower:
+            return True, "timeout"
+        if "400" in stderr_lower or "bad request" in stderr_lower:
+            return False, "400"
+        # Other error — not fallthrough
+        return False, f"exit_{returncode}"
+
+    # Zero exit with no output (empty response before first token)
+    if not stdout and not stderr:
+        return True, "empty_response"
+
+    return False, None

@@ -44,6 +44,7 @@ from pathlib import Path
 
 from .agent_hermes import AgentError, HermesAgent, MissingResult, NonZeroExit
 from .config import Config
+from .usage import Route
 from .github_app import (
     AppNotConfigured,
     GitHubAppError,
@@ -126,6 +127,57 @@ class BuilderAgent(HermesAgent):
         # are retried by dispatch_one; an unparseable-but-completed run returns
         # (usage with raw_tail, "") and resolves no_change.
         return self._parse_output(proc)
+
+    def run_with_chain(
+        self,
+        brief: str,
+        available_routes: list[tuple[int, Route]],
+        cfg: Config,
+        gh_token: str,
+        usage_store=None,
+        job_id: int | None = None,
+    ) -> tuple[dict[str, int], str, int | None, Route | None]:
+        """Walk the available route chain for the builder, trying each in order.
+
+        Each route runs inside the shared worktree (self.work_dir).
+        Returns (usage, verdict, route_idx, route).
+        """
+        for idx, route in available_routes:
+            hermes_provider = cfg.hermes_provider_for(route.provider)
+            if hermes_provider is None:
+                log.info("builder route %d (%s/%s) skipped — "
+                         "no Hermes provider mapping",
+                         idx, route.provider, route.model)
+                continue
+
+            route_agent = BuilderAgent(
+                work_dir=self.work_dir,
+                hermes_bin=self.hermes_bin,
+                provider=hermes_provider,
+                model=route.model,
+                timeout=self.timeout,
+                gh_token=gh_token,
+            )
+
+            route_start = time.monotonic()
+            try:
+                usage, verdict = route_agent.run(brief)
+            except AgentError as exc:
+                elapsed_ms = int((time.monotonic() - route_start) * 1000)
+                fallthrough, err_class = route_agent._classify_agent_error(
+                    exc, route_agent)
+                log.info("builder route %d (%s/%s) failed: %s (fallthrough=%s)",
+                         idx, route.provider, route.model, exc, fallthrough)
+                if not fallthrough:
+                    return {}, "", idx, route
+                continue
+
+            elapsed_ms = int((time.monotonic() - route_start) * 1000)
+            log.info("builder route %d (%s/%s) succeeded — verdict=%s",
+                     idx, route.provider, route.model, verdict)
+            return usage, verdict, idx, route
+
+        return {}, "", None, None
 
     def _parse_output(self, proc: subprocess.CompletedProcess[str]) -> tuple[dict, str]:
         """Builder verdict parsing on real Hermes -z text output.
@@ -581,28 +633,61 @@ def dispatch_one(cfg: Config, jobs: Jobs, row: dict) -> None:
 
     rc, head_before = gh(token, "api", f"repos/{repo}/pulls/{pr}", "--jq", ".head.sha")
     head_before = (head_before or "").strip()
-    agent = BuilderAgent(
-        work_dir=worktree,
-        hermes_bin=cfg.hermes_bin, provider=cfg.hermes_provider, model=cfg.hermes_model,
-        timeout=int(os.environ.get("NEO_BUILDER_TIMEOUT") or cfg.deepseek_timeout), gh_token=token,
-    )
-    try:
-        # Lease renewal: the agent run can outlive a static lease — without it
-        # a second builder would claim the same round and two agents would work
-        # one worktree (GLM 6).  BUILDER_LEASE_SECS covers the whole run.
-        with jobs.lease_renewal(row["id"], lease_secs=BUILDER_LEASE_SECS,
-                                worker_token=wtoken):
-            usage, verdict = agent.run(brief)
-        log.info("fixer done %s#%s verdict=%s usage=%s", repo, pr, verdict or "?", usage)
-    except AgentError:
-        log.exception("fixer agent failed %s#%s", repo, pr)
-        jobs.retry(row["id"], worker_token=wtoken, reason="builder agent failed")
-        return
-    except Exception as exc:
-        log.exception("fixer agent crashed (%s) %s#%s", type(exc).__name__, repo, pr)
-        jobs.retry(row["id"], worker_token=wtoken,
-                   reason=f"builder agent crashed ({type(exc).__name__})")
-        return
+
+    # Build the agent with the route chain.
+    from .usage import available_routes as _avail
+    avail_routes = _avail(cfg.parsed_routes or []) if cfg.parsed_routes else []
+
+    if avail_routes:
+        # Use route chain for the builder agent.
+        base_agent = BuilderAgent(
+            work_dir=worktree,
+            hermes_bin=cfg.hermes_bin, provider=cfg.hermes_provider, model=cfg.hermes_model,
+            timeout=int(os.environ.get("NEO_BUILDER_TIMEOUT") or cfg.deepseek_timeout),
+            gh_token=token,
+        )
+        try:
+            with jobs.lease_renewal(row["id"], lease_secs=BUILDER_LEASE_SECS,
+                                    worker_token=wtoken):
+                usage, verdict, ridx, route = base_agent.run_with_chain(
+                    brief, avail_routes, cfg, token,
+                )
+            log.info("fixer done %s#%s verdict=%s route=%s/%s usage=%s",
+                     repo, pr, verdict or "?",
+                     route.provider if route else "?",
+                     route.model if route else "?",
+                     usage)
+        except AgentError:
+            log.exception("fixer agent failed %s#%s", repo, pr)
+            jobs.retry(row["id"], worker_token=wtoken, reason="builder agent failed")
+            return
+        except Exception as exc:
+            log.exception("fixer agent crashed (%s) %s#%s", type(exc).__name__, repo, pr)
+            jobs.retry(row["id"], worker_token=wtoken,
+                       reason=f"builder agent crashed ({type(exc).__name__})")
+            return
+    else:
+        # Fallback: single configured route.
+        agent = BuilderAgent(
+            work_dir=worktree,
+            hermes_bin=cfg.hermes_bin, provider=cfg.hermes_provider, model=cfg.hermes_model,
+            timeout=int(os.environ.get("NEO_BUILDER_TIMEOUT") or cfg.deepseek_timeout),
+            gh_token=token,
+        )
+        try:
+            with jobs.lease_renewal(row["id"], lease_secs=BUILDER_LEASE_SECS,
+                                    worker_token=wtoken):
+                usage, verdict = agent.run(brief)
+            log.info("fixer done %s#%s verdict=%s usage=%s", repo, pr, verdict or "?", usage)
+        except AgentError:
+            log.exception("fixer agent failed %s#%s", repo, pr)
+            jobs.retry(row["id"], worker_token=wtoken, reason="builder agent failed")
+            return
+        except Exception as exc:
+            log.exception("fixer agent crashed (%s) %s#%s", type(exc).__name__, repo, pr)
+            jobs.retry(row["id"], worker_token=wtoken,
+                       reason=f"builder agent crashed ({type(exc).__name__})")
+            return
 
     head_after = gh(token, "api", f"repos/{repo}/pulls/{pr}", "--jq", ".head.sha")[1].strip()
     # A push is the real outcome signal (more reliable than the advisory

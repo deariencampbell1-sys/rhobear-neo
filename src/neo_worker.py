@@ -270,25 +270,41 @@ def evidence_brief(evidence: dict, auto_merge: bool, reason: str) -> str:
     )
 
 
-def _run_agent(agent: ClaudeAgent, brief: str) -> tuple[dict, str]:
-    """Run the Neo brief headless via Claude Code CLI.
+def _run_agent(
+    agent: ClaudeAgent,
+    brief: str,
+    cfg: Config | None = None,
+    gh_token: str = "",
+    usage_store=None,
+    job_id: int | None = None,
+) -> tuple[dict, str, int | None, object | None]:
+    """Run the Neo brief headless via Claude Code CLI, walking the route chain.
 
-    Claude Code runs with isolated config dir + per-run temp workdir, giving
-    the agent full tool access (gh, git, edit, test runner).  DeepSeek Direct
-    provides the Anthropic-compatible endpoint.
+    Uses run_with_chain when cfg and routes are available; falls back to the
+    single configured route for backward compatibility.
 
-    Returns (normalised usage, verdict line).  AgentError is caught here (the
-    caller retries the job); any OTHER exception from the agent spawn is
-    allowed to propagate so the caller's broad handler releases the job too
-    (defect 3: FileNotFoundError/OSError/UnicodeDecodeError must never strand
-    the SHA).
+    Returns (normalised usage, verdict line, winning_route_idx, winning_route).
+    AgentError is caught here (the caller retries the job); any OTHER exception
+    from the agent spawn is allowed to propagate so the caller's broad handler
+    releases the job too (defect 3).
     """
+    from .usage import available_routes
+
     try:
+        if cfg is not None and cfg.parsed_routes:
+            avail = available_routes(cfg.parsed_routes)
+            if avail:
+                usage, verdict, ridx, route = agent.run_with_chain(
+                    brief, avail, cfg, gh_token,
+                    usage_store=usage_store, job_id=job_id,
+                )
+                return usage, verdict, ridx, route
+        # Fallback: single configured route (backward compat).
         usage, verdict = agent.run(brief)
-        return usage, verdict
+        return usage, verdict, None, None
     except AgentError:
         log.exception("neo claude agent run failed")
-        return {}, ""
+        return {}, "", None, None
 
 
 def _wake_lease(cfg: Config) -> int:
@@ -488,7 +504,11 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict,
         # second worker claim the same SHA mid-run (GLM 6 applies to wakes too).
         with jobs.lease_renewal(job_id, lease_secs=_wake_lease(cfg),
                                 worker_token=wtoken):
-            usage, verdict = _run_agent(agent, brief)
+            usage, verdict, winning_route_idx, winning_route = _run_agent(
+                agent, brief,
+                cfg=cfg, gh_token=token,
+                usage_store=usage_store, job_id=job_id,
+            )
     except Exception as exc:
         # Any exception from the agent spawn (FileNotFoundError/OSError/
         # UnicodeDecodeError included) releases the job for retry instead of
@@ -642,36 +662,46 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict,
             "ESCALATE": "escalated",
         }.get(verdict_base, "blocked")
 
-    # --- B4: record per-attempt usage and resolve which route ran ---------
-    # The agent's configured route is the first available route in the chain
-    # that has its API key set.  Record it on the phase row for audit.
-    route_provider = cfg.deepseek_base_url.split(".")[0].split("//")[-1] if "//" in cfg.deepseek_base_url else "deepseek"
-    route_model = cfg.deepseek_model
-    if cfg.parsed_routes:
+    # --- B4: record which route actually produced the verdict -------------
+    # The route chain already recorded per-attempt usage inside run_with_chain.
+    # The phase row records the winning route (the route that produced the
+    # verdict), not a guess.
+    if winning_route is not None:
+        route_provider = winning_route.provider
+        route_model = winning_route.model
+    elif cfg.parsed_routes:
         from .usage import available_routes
         avail = available_routes(cfg.parsed_routes)
         if avail:
             first_idx, first_route = avail[0]
             route_provider = first_route.provider
             route_model = first_route.model
+        else:
+            route_provider = "unknown"
+            route_model = ""
+    else:
+        route_provider = cfg.deepseek_base_url.split(".")[0].split("//")[-1] if "//" in cfg.deepseek_base_url else "deepseek"
+        route_model = cfg.deepseek_model
 
+    # Record the successful attempt in the usage store if not already recorded
+    # by the route chain (idempotent via ON CONFLICT DO NOTHING).
     if usage_store is not None and job_id is not None:
-        attempt = UsageAttempt(
-            job_id=job_id,
-            attempt_number=1,
-            route_idx=0,
-            provider=route_provider,
-            model=route_model,
-            uncached_input=usage.get("input_tokens") or usage.get("uncached_input"),
-            cached_input=usage.get("cache_read_input_tokens") or usage.get("cached_input"),
-            output_tokens=usage.get("output_tokens"),
-            latency_ms=None,
-            outcome="success" if verdict else "error",
-        )
+        from .usage import UsageAttempt
         try:
-            usage_store.record_attempt(attempt)
+            success_attempt = UsageAttempt(
+                job_id=job_id,
+                attempt_number=1,
+                route_idx=winning_route_idx if winning_route_idx is not None else 0,
+                provider=route_provider,
+                model=route_model,
+                uncached_input=usage.get("input_tokens") or usage.get("uncached_input"),
+                cached_input=usage.get("cache_read_input_tokens") or usage.get("cached_input"),
+                output_tokens=usage.get("output_tokens"),
+                outcome="success" if verdict else "error",
+            )
+            usage_store.record_attempt(success_attempt)
         except Exception:  # noqa: BLE001
-            log.exception("failed to record usage for job %s", job_id)
+            log.exception("failed to record successful usage for job %s", job_id)
 
     credits = credits_for(usage, builder=is_builder)
     new_round = (rounds + 1) if is_builder else rounds

@@ -38,6 +38,7 @@ from src.agent_claude import (
     MissingResult,
     UnknownVerdict,
     MalformedStream,
+    ApiError,
     CANONICAL_VERDICTS,
 )
 from src.config import Config
@@ -527,37 +528,46 @@ class TestTempCwdLifecycle:
 # ===================================================================
 
 class TestWorkerWrapper:
-    """_run_agent in neo_worker catches errors, passes through success."""
+    """_run_agent in neo_worker catches errors, passes through success.
+
+    _run_agent now returns 4 values: (usage, verdict, route_idx, route).
+    """
 
     def test_wrapper_catches_errors(self) -> None:
         from src.neo_worker import _run_agent
 
         agent = _make_agent()
         with patch.object(agent, "run", side_effect=TimeoutError("timed out")):
-            usage, verdict = _run_agent(agent, "test brief")
+            usage, verdict, ridx, route = _run_agent(agent, "test brief")
 
         assert usage == {}
         assert verdict == ""
+        assert ridx is None
+        assert route is None
 
     def test_wrapper_passes_success(self) -> None:
         from src.neo_worker import _run_agent
 
         agent = _make_agent()
         with patch.object(agent, "run", return_value=({"input_tokens": 150}, "ACCEPT-READY")):
-            usage, verdict = _run_agent(agent, "test brief")
+            usage, verdict, ridx, route = _run_agent(agent, "test brief")
 
         assert verdict == "ACCEPT-READY"
         assert usage["input_tokens"] == 150
+        assert ridx is None
+        assert route is None
 
     def test_wrapper_catches_generic_agent_error(self) -> None:
         from src.neo_worker import _run_agent
 
         agent = _make_agent()
         with patch.object(agent, "run", side_effect=UnknownVerdict("no VERDICT")):
-            usage, verdict = _run_agent(agent, "test brief")
+            usage, verdict, ridx, route = _run_agent(agent, "test brief")
 
         assert usage == {}
         assert verdict == ""
+        assert ridx is None
+        assert route is None
 
 
 # ===================================================================
@@ -885,7 +895,7 @@ class TestResultEnvelope:
         assert v == "ACCEPT-READY"
 
     def test_api_error_status_present_fails(self) -> None:
-        """Non-null api_error_status should raise MalformedStream."""
+        """Non-null api_error_status should raise ApiError."""
         output = json.dumps({
             "type": "result", "subtype": "success", "is_error": False,
             "result": "Analysis.\nVERDICT: ACCEPT-READY",
@@ -895,7 +905,7 @@ class TestResultEnvelope:
         })
         proc = _fake_proc(stdout=output)
         agent = _make_agent()
-        with pytest.raises(MalformedStream, match="api_error_status"):
+        with pytest.raises(ApiError, match="api_error"):
             agent._parse_output(proc)
 
     def test_api_error_status_null_ok(self) -> None:

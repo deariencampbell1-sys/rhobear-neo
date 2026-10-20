@@ -566,9 +566,10 @@ class TestWorkerWiring:
                 "installation_id": 999}
         agent_tokens = []
 
-        def fake_run_agent(agent, brief):
+        def fake_run_agent(agent, brief, cfg=None, gh_token="",
+                           usage_store=None, job_id=None):
             agent_tokens.append(agent.gh_token)
-            return ({"input_tokens": 0}, "ACCEPT-READY")
+            return ({"input_tokens": 0}, "ACCEPT-READY", 0, None)
 
         with patch("src.neo_worker.resolve_pr", return_value=1), \
              patch("src.neo_worker._review_evidence", return_value={

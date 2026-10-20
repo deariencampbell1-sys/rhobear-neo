@@ -123,7 +123,7 @@ class TestBuilderJobCreated:
                    return_value=JevAssessment(False, reason="no key")), \
              patch("src.neo_worker._run_agent",
                    return_value=({"input_tokens": 1000, "output_tokens": 100},
-                                 "BOUNCE-BUILDER substantial fix needed")):
+                                 "BOUNCE-BUILDER substantial fix needed", 0, None)):
             from src.neo_worker import run_neo
             run_neo(cfg, state, jobs, wake)
 
@@ -520,9 +520,9 @@ class TestIdempotencyGate:
                 "context": "rhobear-reviews", "pr_number": 5}
         agent_calls: list[int] = []
 
-        def fake_agent(agent, brief):
+        def fake_agent(agent, brief, **kw):
             agent_calls.append(1)
-            return {"input_tokens": 1000, "output_tokens": 100}, "BOUNCE-BUILDER fix it"
+            return {"input_tokens": 1000, "output_tokens": 100}, "BOUNCE-BUILDER fix it", 0, None
 
         from src.neo_worker import run_neo
         with patch("src.neo_worker.resolve_pr", return_value=5), \
@@ -558,9 +558,9 @@ class TestIdempotencyGate:
                 "context": "rhobear-reviews", "pr_number": 5}
         agent_calls: list[int] = []
 
-        def fake_agent(agent, brief):
+        def fake_agent(agent, brief, **kw):
             agent_calls.append(1)
-            return {"input_tokens": 1, "output_tokens": 1}, "ACCEPT-MERGED"
+            return {"input_tokens": 1, "output_tokens": 1}, "ACCEPT-MERGED", 0, None
 
         import json as _json
         def fake_merge_gh(token, *args, **kw):
@@ -618,9 +618,9 @@ class TestIdempotencyGate:
         cfg = _cfg()
         agent_calls: list[int] = []
 
-        def fake_agent(agent, brief):
+        def fake_agent(agent, brief, **kw):
             agent_calls.append(1)
-            return {"input_tokens": 1, "output_tokens": 1}, "ACCEPT-READY"
+            return {"input_tokens": 1, "output_tokens": 1}, "ACCEPT-READY", 0, None
 
         from src.neo_worker import run_neo
         red = {"repo": "o/r", "sha": SHA1, "green": False,
@@ -645,11 +645,11 @@ class TestIdempotencyGate:
         cfg = _cfg()
         agent_calls: list[int] = []
 
-        def flaky_agent(agent, brief):
+        def flaky_agent(agent, brief, **kw):
             agent_calls.append(1)
             if len(agent_calls) == 1:
                 raise FileNotFoundError("agent binary gone")
-            return {"input_tokens": 1, "output_tokens": 1}, "ACCEPT-READY"
+            return {"input_tokens": 1, "output_tokens": 1}, "ACCEPT-READY", 0, None
 
         wake = {"repo": "o/r", "sha": SHA1, "green": True,
                 "context": "rhobear-reviews", "pr_number": 7}
@@ -868,7 +868,7 @@ class TestCrashWindows:
                 else patch("src.neo_worker.resolve_pr", return_value=resolve),
                 patch("src.neo_worker._review_evidence", return_value=_evidence(SHA1)),
                 patch("src.neo_worker._jev_for_pr", return_value=JevAssessment(False, reason="no key")),
-                patch("src.neo_worker._run_agent", return_value=({"input_tokens": 10, "output_tokens": 1}, verdict))]
+                patch("src.neo_worker._run_agent", return_value=({"input_tokens": 10, "output_tokens": 1}, verdict, 0, None))]
 
     def test_resolve_pr_crash_releases_the_job_for_retry(self, db):
         import subprocess
@@ -905,7 +905,7 @@ class TestCrashWindows:
             with psycopg.connect(DSN, autocommit=True) as c:
                 c.execute("UPDATE neo_jobs SET state='queued', lease_expires=NULL, worker_token=NULL WHERE kind='wake'")
                 wake_id = c.execute("SELECT id FROM neo_jobs WHERE kind='wake'").fetchone()[0]
-            agent = MagicMock(return_value=({"input_tokens": 10, "output_tokens": 1}, "BOUNCE-BUILDER again"))
+            agent = MagicMock(return_value=({"input_tokens": 10, "output_tokens": 1}, "BOUNCE-BUILDER again", 0, None))
             with patch("src.neo_worker._run_agent", agent):
                 run_neo(cfg, state, jobs, dict(wake, job_id=wake_id))  # as the recovery sweep re-submits it
         finally:
@@ -985,7 +985,7 @@ class TestE2EEscalationPG:
                    return_value=JevAssessment(False, reason="no key")), \
              patch("src.neo_worker._run_agent",
                    return_value=({"input_tokens": 1, "output_tokens": 1},
-                                 "BOUNCE-BUILDER still broken")):
+                                 "BOUNCE-BUILDER still broken", 0, None)):
             run_neo(cfg, state, jobs, wake)
 
     def test_e2e_escalation_flow(self, db):
@@ -1156,9 +1156,9 @@ class TestEscalatingPhaseInRecoveryGatePG:
         from src.neo_worker import run_neo
         agent_calls: list = []
 
-        def fake_agent(agent, brief):
+        def fake_agent(agent, brief, **kw):
             agent_calls.append(1)
-            return {"input_tokens": 1, "output_tokens": 1}, "BOUNCE-BUILDER"
+            return {"input_tokens": 1, "output_tokens": 1}, "BOUNCE-BUILDER", 0, None
 
         with patch("src.neo_worker.resolve_pr", return_value=pr), \
              patch("src.neo_worker._review_evidence", return_value=_evidence(sha)), \
@@ -1245,7 +1245,7 @@ class TestEscalationInstallationIdPG:
              patch("src.neo_worker._compute_diff_stat", return_value=""), \
              patch("src.neo_worker._run_agent",
                    return_value=({"input_tokens": 1, "output_tokens": 1},
-                                 "BOUNCE-BUILDER still broken")):
+                                 "BOUNCE-BUILDER still broken", 0, None)):
             run_neo(cfg, state, jobs, wake)
 
     def test_escalating_phase_row_carries_installation_id(self, db):
@@ -1285,7 +1285,7 @@ def _bounce_default(jobs, state, cfg, sha, pr=95):
          patch("src.neo_worker._compute_diff_stat", return_value=""), \
          patch("src.neo_worker._run_agent",
                return_value=({"input_tokens": 1, "output_tokens": 1},
-                             "BOUNCE-BUILDER still broken")):
+                             "BOUNCE-BUILDER still broken", 0, None)):
         run_neo(cfg, state, jobs, wake)
 
 

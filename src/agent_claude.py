@@ -28,6 +28,9 @@ import tempfile
 import time
 
 from .config import Config
+from .usage import (
+    Route, UsageAttempt, classify_cli_fallthrough,
+)
 
 log = logging.getLogger("rhobear_neo.agent")
 
@@ -73,6 +76,14 @@ class MissingResult(AgentError):
 
 class MalformedStream(AgentError):
     """JSON output could not be parsed or has unexpected shape."""
+
+
+class ApiError(AgentError):
+    """API returned an error status (api_error_status in JSON)."""
+
+    def __init__(self, status: str, message: str = ""):
+        self.status = status
+        super().__init__(f"api_error: {status} — {message}")
 
 
 class UnknownVerdict(AgentError):
@@ -140,7 +151,7 @@ class ClaudeAgent:
     # ------------------------------------------------------------------
 
     def run(self, brief: str) -> tuple[dict[str, int], str]:
-        """Run the Neo brief through Claude Code CLI.
+        """Run the Neo brief through Claude Code CLI on the configured route.
 
         Returns (usage, verdict) where usage is normalised to
         {input_tokens, output_tokens} and verdict is the extracted
@@ -155,6 +166,211 @@ class ClaudeAgent:
             # (No settings file — --dangerously-skip-permissions replaces that.)
             with tempfile.TemporaryDirectory(prefix="neo-config-") as config_dir:
                 return self._run_in(brief, work_dir, config_dir)
+
+    # ------------------------------------------------------------------
+    # Route chain: walk available routes, fall through on transient errors
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _for_route(cls, cfg: Config, route: Route, gh_token: str,
+                   base_url: str) -> ClaudeAgent:
+        """Create a ClaudeAgent for a specific route in the chain.
+
+        `base_url` is the Anthropic-wire endpoint for this provider.
+        The API key is read from the route's env var.
+        """
+        api_key = cfg.api_key_for(route.provider)
+        return cls(
+            claude_bin=cfg.claude_bin,
+            api_key=api_key,
+            base_url=base_url,
+            model=route.model,
+            effort=cfg.deepseek_reasoning_effort,
+            max_tokens=cfg.deepseek_max_tokens,
+            timeout=cfg.deepseek_timeout,
+            gh_token=gh_token,
+        )
+
+    def run_with_chain(
+        self,
+        brief: str,
+        available_routes: list[tuple[int, Route]],
+        cfg: Config,
+        gh_token: str,
+        usage_store=None,
+        job_id: int | None = None,
+    ) -> tuple[dict[str, int], str, int | None, Route | None]:
+        """Walk the available route chain, trying each in order.
+
+        For each route:
+          - Skip routes with no Anthropic-wire endpoint (logged once).
+          - Skip routes whose API key is not set.
+          - Launch on route 1.
+          - If the run fails with a fallthrough class (429/402/5xx/timeout
+            before any output), record the attempt and try the next route.
+          - A non-fallthrough failure stops the chain.
+          - A successful run returns with its usage, verdict, route info.
+
+        Each launch records one UsageAttempt with its real route (provider,
+        model).  Failed attempts record the error class.
+
+        Returns (usage, verdict, route_idx, route).
+        usage is the final successful attempt's usage.
+        verdict is the final successful verdict.
+        route_idx/route are the winning route (None if all failed).
+        """
+        start_time = time.monotonic()
+
+        for idx, route in available_routes:
+            # Skip routes Claude Code can't serve (no Anthropic-wire endpoint).
+            base_url = cfg.claude_endpoint_for(route.provider)
+            if base_url is None:
+                log.info("route %d (%s/%s) skipped for Claude agent — "
+                         "no Anthropic-wire endpoint",
+                         idx, route.provider, route.model)
+                if usage_store is not None and job_id is not None:
+                    attempt = UsageAttempt(
+                        job_id=job_id, attempt_number=1, route_idx=idx,
+                        provider=route.provider, model=route.model,
+                        outcome="skipped",
+                        error_class="no_anthropic_wire",
+                    )
+                    try:
+                        usage_store.record_attempt(attempt)
+                    except Exception:  # noqa: BLE001
+                        log.exception("failed to record skipped route %s", idx)
+                continue
+
+            # Build per-route agent.
+            api_key = cfg.api_key_for(route.provider)
+            if not api_key:
+                log.info("route %d (%s/%s) skipped — API key not set",
+                         idx, route.provider, route.model)
+                if usage_store is not None and job_id is not None:
+                    attempt = UsageAttempt(
+                        job_id=job_id, attempt_number=1, route_idx=idx,
+                        provider=route.provider, model=route.model,
+                        outcome="skipped",
+                        error_class="missing_key",
+                    )
+                    try:
+                        usage_store.record_attempt(attempt)
+                    except Exception:  # noqa: BLE001
+                        log.exception("failed to record skipped route %s", idx)
+                continue
+
+            route_agent = self._for_route(cfg, route, gh_token, base_url)
+
+            with tempfile.TemporaryDirectory(prefix="neo-work-") as work_dir:
+                with tempfile.TemporaryDirectory(prefix="neo-config-") as config_dir:
+                    route_start = time.monotonic()
+                    try:
+                        usage, verdict = route_agent._run_in(
+                            brief, work_dir, config_dir)
+                    except AgentError as exc:
+                        elapsed_ms = int((time.monotonic() - route_start) * 1000)
+                        # Classify the failure for fallthrough decision.
+                        fallthrough, err_class = self._classify_agent_error(
+                            exc, route_agent,
+                            proc=getattr(route_agent, '_last_proc', None))
+                        log.info("route %d (%s/%s) failed: %s (fallthrough=%s)",
+                                 idx, route.provider, route.model, exc, fallthrough)
+                        # Record the failed attempt.
+                        if usage_store is not None and job_id is not None:
+                            attempt = UsageAttempt(
+                                job_id=job_id, attempt_number=1, route_idx=idx,
+                                provider=route.provider, model=route.model,
+                                latency_ms=elapsed_ms,
+                                outcome="fallthrough" if fallthrough else "error",
+                                error_class=err_class,
+                            )
+                            try:
+                                usage_store.record_attempt(attempt)
+                            except Exception:  # noqa: BLE001
+                                log.exception("failed to record attempt %s", idx)
+                        if not fallthrough:
+                            # Non-fallthrough failure — stop the chain.
+                            return {}, "", idx, route
+                        # Fallthrough — try next route.
+                        continue
+
+                    # Success.
+                    elapsed_ms = int((time.monotonic() - route_start) * 1000)
+                    if usage_store is not None and job_id is not None:
+                        attempt = UsageAttempt(
+                            job_id=job_id, attempt_number=1, route_idx=idx,
+                            provider=route.provider, model=route.model,
+                            uncached_input=usage.get("input_tokens"),
+                            output_tokens=usage.get("output_tokens"),
+                            latency_ms=elapsed_ms,
+                            outcome="success",
+                        )
+                        try:
+                            usage_store.record_attempt(attempt)
+                        except Exception:  # noqa: BLE001
+                            log.exception("failed to record success %s", idx)
+                    log.info("route %d (%s/%s) succeeded — verdict=%s",
+                             idx, route.provider, route.model, verdict)
+                    return usage, verdict, idx, route
+
+        # All routes exhausted.
+        return {}, "", None, None
+
+    def _classify_agent_error(
+        self, exc: AgentError, agent: ClaudeAgent,
+        proc: subprocess.CompletedProcess | None = None,
+    ) -> tuple[bool, str | None]:
+        """Classify an agent error into (is_fallthrough, error_class).
+
+        For Claude Code JSON output, examines the JSON envelope's
+        api_error_status to determine the HTTP status code.
+        Falls back to error type classification.
+        """
+        # Try to extract HTTP status from the JSON output first.
+        if proc is not None and proc.stdout:
+            try:
+                result = json.loads(proc.stdout.strip())
+                if isinstance(result, dict):
+                    api_status = result.get("api_error_status")
+                    if api_status is not None and api_status != "":
+                        err_str = str(api_status).strip()
+                        from .usage import classify_http_error, is_fallthrough
+                        # Try to extract numeric status code
+                        for code_str in ("429", "402", "400"):
+                            if code_str in err_str:
+                                return is_fallthrough(int(code_str)), \
+                                    classify_http_error(int(code_str))
+                        if any(f"{i}0" in err_str for i in range(5, 10)):
+                            return True, "5xx"
+                        if "timeout" in err_str.lower():
+                            return True, "timeout"
+                        # Unknown API error — not fallthrough
+                        return False, err_str[:32]
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass
+
+        # ApiError — extract status code from the exception.
+        if isinstance(exc, ApiError):
+            from .usage import classify_http_error, is_fallthrough
+            err_str = exc.status
+            for code_str in ("429", "402", "400"):
+                if code_str in err_str:
+                    return is_fallthrough(int(code_str)), \
+                        classify_http_error(int(code_str))
+            if any(f"{i}0" in err_str for i in range(5, 10)):
+                return True, "5xx"
+            if "timeout" in err_str.lower():
+                return True, "timeout"
+            return False, err_str[:32]
+
+        # Fall back to error type classification.
+        if isinstance(exc, TimeoutError):
+            return True, "timeout"
+        if isinstance(exc, NonZeroExit):
+            return True, "exit_nonzero"
+        # TruncatedOutput, MissingResult, MalformedStream, UnknownVerdict
+        # are all non-fallthrough — the model ran but produced bad output.
+        return False, type(exc).__name__.lower()
 
     def _run_in(
         self, brief: str, work_dir: str, config_dir: str,
@@ -187,6 +403,7 @@ class ClaudeAgent:
                  proc.returncode, elapsed, len(proc.stdout or ""),
                  len(proc.stderr or ""))
 
+        self._last_proc = proc
         return self._parse_output(proc)
 
     # ------------------------------------------------------------------
@@ -334,9 +551,8 @@ class ClaudeAgent:
         # --- API error status (fail-closed on any non-null status) ---
         api_error_status = result.get("api_error_status")
         if api_error_status is not None and api_error_status != "":
-            raise MalformedStream(
-                f"api_error_status present: {api_error_status}"
-            )
+            raise ApiError(str(api_error_status).strip(),
+                           f"api_error_status present: {api_error_status}")
 
         # --- At least one turn taken ---
         num_turns = result.get("num_turns", 0) or 0

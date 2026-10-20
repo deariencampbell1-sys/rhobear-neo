@@ -354,7 +354,7 @@ class TestDefect3AgentErrors:
         jobs.create_wake.return_value = 42
         jobs.claim.return_value = 42
         # _run_agent returns empty usage + empty verdict (AgentError path)
-        self._run(lambda: ({}, ""), jobs)
+        self._run(lambda *a, **kw: ({}, "", None, None), jobs)
         jobs.retry.assert_called_once()
 
 
@@ -465,7 +465,7 @@ class TestGLM2BuilderCreated:
                  "failing_checks": 0, "rollup_green": True}), \
              patch("src.neo_worker._jev_for_pr"), \
              patch("src.neo_worker._run_agent",
-                   return_value=({"input_tokens": 1}, "BOUNCE-BUILDER fix it")):
+                   return_value=({"input_tokens": 1}, "BOUNCE-BUILDER fix it", 0, None)):
             run_neo(cfg, state, jobs, wake)
         jobs.create_builder.assert_called_once()
         call = jobs.create_builder.call_args
@@ -534,7 +534,7 @@ class TestGLM6LeaseRenewal:
                  "failing_checks": 0, "rollup_green": True}), \
              patch("src.neo_worker._jev_for_pr"), \
              patch("src.neo_worker._run_agent",
-                   return_value=({"input_tokens": 1}, "ACCEPT-READY")):
+                   return_value=({"input_tokens": 1}, "ACCEPT-READY", 0, None)):
             run_neo(cfg, state, jobs, wake)
         assert jobs.lease_renewal.call_count == 1
         assert jobs.lease_renewal.call_args[0][0] == 42
