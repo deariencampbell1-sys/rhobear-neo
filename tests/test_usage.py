@@ -612,7 +612,7 @@ class TestE2EUsageRecording:
                    return_value=JevAssessment(False, reason="no key")), \
              patch("src.neo_worker._run_agent",
                    return_value=({"input_tokens": 1000, "output_tokens": 100},
-                                 "ACCEPT-READY")):
+                                 "ACCEPT-READY", 0, None)):
             run_neo(cfg, state, jobs, wake, usage_store=store)
 
         # Usage should be recorded — look up the job from the DB
@@ -651,7 +651,7 @@ class TestE2EUsageRecording:
                    return_value=JevAssessment(False, reason="no key")), \
              patch("src.neo_worker._run_agent",
                    return_value=({"input_tokens": 1, "output_tokens": 1},
-                                 "ACCEPT-READY")):
+                                 "ACCEPT-READY", 0, None)):
             # Should not crash despite no usage_store
             run_neo(cfg, state, jobs, wake, usage_store=None)
 
@@ -679,7 +679,7 @@ class TestE2EUsageRecording:
                    return_value=JevAssessment(False, reason="no key")), \
              patch("src.neo_worker._run_agent",
                    return_value=({"input_tokens": 100, "output_tokens": 50},
-                                 "ACCEPT-READY")):
+                                 "ACCEPT-READY", 0, None)):
             run_neo(cfg, state, jobs, wake, usage_store=store)
 
         # Check neo_actions for route info

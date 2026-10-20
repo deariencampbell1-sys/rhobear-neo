@@ -289,6 +289,53 @@ class Config:
 
         return self
 
+    def claude_endpoint_for(self, provider: str) -> str | None:
+        """Return the Anthropic-wire base URL for a provider, or None if
+        the provider cannot be served by Claude Code."""
+        return CLAUDE_WIRE_ENDPOINTS.get(provider)
+
+    def hermes_provider_for(self, provider: str) -> str | None:
+        """Return the Hermes --provider name for a provider, or None if
+        the provider cannot be served by Hermes."""
+        return HERMES_PROVIDER_MAP.get(provider)
+
+    def api_key_for(self, provider: str) -> str:
+        """Get the API key for a provider from the environment.
+
+        Returns empty string if the key is not set.
+        """
+        from .usage import Route
+        return _get(Route(provider, "").env_key_name)
+
+
+# ── Provider→endpoint tables for B4 route chain ─────────────────────────────
+
+# Anthropic-wire endpoints for Claude Code, keyed by provider name.
+# A provider not in this dict cannot be served by Claude Code (skipped).
+# The bridge endpoint is the existing local Claude-wire bridge.
+CLAUDE_WIRE_ENDPOINTS: dict[str, str] = {
+    "deepseek": "https://api.deepseek.com/anthropic",
+    "zai": "https://api.z.ai/api/anthropic",
+    "deepinfra": "http://127.0.0.1:8790",
+}
+
+# Providers that Claude Code CANNOT serve (no Anthropic-wire endpoint).
+# A route with one of these providers is skipped for the Claude agent.
+CLAUDE_WIRE_SKIP: frozenset[str] = frozenset()
+
+# Map provider to Hermes --provider name.
+# A provider not in this dict cannot be served by Hermes (skipped).
+HERMES_PROVIDER_MAP: dict[str, str] = {
+    "deepinfra": "deepinfra",
+    "zai": "zai",
+    "deepseek": "deepseek",
+    "openrouter": "openrouter",
+    "openai": "openai",
+}
+
+# Providers Hermes CANNOT serve (no Hermes provider profile).
+HERMES_SKIP: frozenset[str] = frozenset()
+
 
 def load() -> Config:
     return Config()
