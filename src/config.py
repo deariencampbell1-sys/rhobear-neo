@@ -172,6 +172,24 @@ class Config:
     advisor_timeout: int = field(default_factory=lambda: _get_int(
         "ADVISOR_TIMEOUT", 1200))  # 20 minutes
 
+    # --- route chain for Neo's triage agent and Hermes Builder -----------
+    # Ordered `provider:model` list, default chain (same order as Reviews B4):
+    #   GLM 5.3 Flash on DeepInfra -> Z.ai direct GLM 5.3 Flash ->
+    #   DeepInfra V4 Flash -> V4 Flash 0731 -> DeepSeek direct Flash ->
+    #   DeepInfra V4.1 Flash 1017, maximum reasoning
+    # Keys come from env names per provider (DEEPINFRA_API_KEY, ZAI_API_KEY,
+    # DEEPSEEK_API_KEY); missing key -> that route is skipped and logged once.
+    # Validated at startup (unknown provider/model -> refuse to start).
+    neo_routes: str = field(default_factory=lambda: _get(
+        "NEO_ROUTES",
+        "deepinfra:glm-5.3-flash,zai:glm-5.3-flash,"
+        "deepinfra:deepseek-v4-flash,deepinfra:deepseek-v4-flash-0731,"
+        "deepseek:deepseek-v4-flash,deepinfra:deepseek-v4.1-flash-1017",
+    ))
+    # Parsed routes (set by validate() during startup; None before that call).
+    # Not a dataclass field — set as an attribute by validate().
+    parsed_routes: list | None = None
+
     # Optional Jev review-of-the-reviewer call. This is a separate OpenRouter
     # credential from the Claude-wire DeepSeek route above.
     jev_api_key: str = field(default_factory=lambda: (
@@ -260,6 +278,15 @@ class Config:
                     raise ValueError(
                         f"claude_bin not found: {self.claude_bin}"
                     )
+
+        # --- B4: validate NEO_ROUTES ---
+        # Parse and validate the route chain at startup.  Unknown provider or
+        # malformed entry raises ValueError (refuse to start).  Missing API
+        # keys are handled later (route is skipped, logged once — never a
+        # crash mid-run).
+        from .usage import resolve_route_chain
+        self.parsed_routes = resolve_route_chain(self.neo_routes)
+
         return self
 
 

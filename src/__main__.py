@@ -27,6 +27,7 @@ from . import config as _config
 from .github_app import github_app_for
 from .jobs import Jobs
 from .neo_state import NeoState
+from .usage import UsageStore
 from .neo_worker import run_neo
 from .webhook_server import NeoDispatcher, serve
 
@@ -63,6 +64,10 @@ def main() -> None:
     # Durable job store for wake and builder jobs (one schema definition).
     jobs = Jobs(cfg.database_url)
     jobs.ensure_schema()
+
+    # Per-attempt usage store (B4).
+    usage_store = UsageStore(cfg.database_url)
+    usage_store.ensure_schema()
 
     # Parallel triage: up to NEO_MAX_WORKERS agent runs concurrent. run_neo is
     # thread-safe — subprocess calls (gh, hermes) + independent Postgres
@@ -113,7 +118,7 @@ def main() -> None:
 
     def _run_wake(wake: dict) -> None:
         try:
-            run_neo(cfg, state, jobs, wake)
+            run_neo(cfg, state, jobs, wake, usage_store=usage_store)
         except Exception:
             log.exception("run_neo crashed on %s", wake.get("repo"))
 
