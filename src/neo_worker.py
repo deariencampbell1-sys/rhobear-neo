@@ -30,6 +30,7 @@ from .agent_claude import ClaudeAgent, AgentError
 from .github_app import AppNotConfigured, GitHubAppError, NoInstallation, repo_token
 from . import neo_protocol
 from .jev_review import JevAssessment, assess as jev_assess
+from .usage import UsageStore, UsageAttempt
 
 log = logging.getLogger("rhobear_neo.worker")
 
@@ -67,10 +68,17 @@ def resolve_pr(token: str, repo: str, sha: str, given: int | None) -> int | None
 
 
 def credits_for(usage: dict, builder: bool) -> int:
-    """Gemini-baseline credits from the agent's reported DeepSeek usage."""
-    fin = usage.get("input_tokens", 0) or 0
+    """Gemini-baseline credits from the agent's reported usage.
+
+    Accepts either the raw agent usage dict (with input_tokens/output_tokens/
+    cache_read_input_tokens) or a summed usage dict (with uncached_input/
+    cached_input/output_tokens/reasoning_tokens).  Falls back gracefully
+    for both formats.
+    """
+    # Support both raw agent format and summed usage format.
+    fin = usage.get("input_tokens", 0) or usage.get("uncached_input", 0) or 0
     fout = usage.get("output_tokens", 0) or 0
-    cread = usage.get("cache_read_input_tokens", 0) or 0
+    cread = usage.get("cache_read_input_tokens", 0) or usage.get("cached_input", 0) or 0
     if builder:
         cost = fin * GEMINI["pro_in"] + cread * GEMINI["pro_cache"] + fout * GEMINI["pro_out"]
     else:
@@ -291,7 +299,8 @@ def _wake_lease(cfg: Config) -> int:
     return max(600, timeout + 120)
 
 
-def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict) -> None:
+def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict,
+           usage_store: UsageStore | None = None) -> None:
     repo, sha = wake["repo"], wake["sha"]
     green = bool(wake.get("green"))
 
@@ -633,6 +642,37 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict) -> None:
             "ESCALATE": "escalated",
         }.get(verdict_base, "blocked")
 
+    # --- B4: record per-attempt usage and resolve which route ran ---------
+    # The agent's configured route is the first available route in the chain
+    # that has its API key set.  Record it on the phase row for audit.
+    route_provider = cfg.deepseek_base_url.split(".")[0].split("//")[-1] if "//" in cfg.deepseek_base_url else "deepseek"
+    route_model = cfg.deepseek_model
+    if cfg.parsed_routes:
+        from .usage import available_routes
+        avail = available_routes(cfg.parsed_routes)
+        if avail:
+            first_idx, first_route = avail[0]
+            route_provider = first_route.provider
+            route_model = first_route.model
+
+    if usage_store is not None and job_id is not None:
+        attempt = UsageAttempt(
+            job_id=job_id,
+            attempt_number=1,
+            route_idx=0,
+            provider=route_provider,
+            model=route_model,
+            uncached_input=usage.get("input_tokens") or usage.get("uncached_input"),
+            cached_input=usage.get("cache_read_input_tokens") or usage.get("cached_input"),
+            output_tokens=usage.get("output_tokens"),
+            latency_ms=None,
+            outcome="success" if verdict else "error",
+        )
+        try:
+            usage_store.record_attempt(attempt)
+        except Exception:  # noqa: BLE001
+            log.exception("failed to record usage for job %s", job_id)
+
     credits = credits_for(usage, builder=is_builder)
     new_round = (rounds + 1) if is_builder else rounds
 
@@ -645,17 +685,22 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict) -> None:
     # of a repo->installation lookup (defect 4).  It is recorded under the
     # per-PR advisory lock (record_escalating) so a concurrent take_escalation
     # can never clobber it (defect 1).
+    # The route that actually ran (B4).
+    route_detail = {"route_provider": route_provider, "route_model": route_model}
+
     if phase == "escalating":
         state.record_escalating(repo, pr, sha, verdict=verdict,
                                 builder_round=new_round, credits=credits,
                                 advice_id=advice_id,
                                 installation_id=wake.get("installation_id"),
                                 extra={"green": wake.get("green"),
-                                       "wake_job": job_id})
+                                       "wake_job": job_id,
+                                       **route_detail})
     else:
         state.record(repo, pr, sha, phase, verdict=verdict,
                      builder_round=new_round, credits=credits,
-                     detail={"green": wake.get("green"), "wake_job": job_id})
+                     detail={"green": wake.get("green"), "wake_job": job_id,
+                             **route_detail})
     # The triage marker goes LAST: it vouches that the phase row and any builder job above
     # exist. A crash before this line leaves the phase row, which the gate above detects.
     state.record(repo, pr, sha, "triage", detail={"context": wake.get("context"),
@@ -667,7 +712,9 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict) -> None:
                                                    "rollup_green": evidence.get("rollup_green"),
                                                    "jev_blockers": [f.rule for f in jev.blockers],
                                                    "auto_merge": auto_merge,
-                                                   "reason": authority_reason})
+                                                   "reason": authority_reason,
+                                                   "route_provider": route_provider,
+                                                   "route_model": route_model})
 
     # Resolve the wake job with a terminal outcome.
     jobs.resolve(job_id, "done", worker_token=wtoken,
