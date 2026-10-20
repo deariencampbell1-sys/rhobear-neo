@@ -618,11 +618,18 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict) -> None:
                 "installation_id": wake.get("installation_id"),
             })
     else:
-        # FIX-FORWARD, ESCALATE, or other verdicts.
+        # FIXED/NO-CHANGE/BLOCKED from a builder-style agent, plus
+        # FIX-FORWARD, ESCALATE, and unknown verdicts.
+        # Builder contract: FIXED → wait for new head's review;
+        # NO-CHANGE → counts as a bounce (ready); BLOCKED → park with reason.
+        # Unknown verdicts → BLOCKED: unparseable, never silently dropped.
         phase = {
+            "FIXED": "ready",
+            "NO-CHANGE": "ready",
+            "BLOCKED": "parked",
             "FIX-FORWARD": "fix_forward",
             "ESCALATE": "escalated",
-        }.get(verdict_base, "triage")
+        }.get(verdict_base, "blocked")
 
     credits = credits_for(usage, builder=is_builder)
     new_round = (rounds + 1) if is_builder else rounds

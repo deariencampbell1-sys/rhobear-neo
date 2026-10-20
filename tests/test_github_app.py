@@ -608,7 +608,7 @@ class TestWorkerWiring:
              patch("src.neo_builder.pr_state", return_value="OPEN\tmain"), \
              patch("src.neo_builder.prepare_worktree",
                    return_value=("/tmp/wt", "main")), \
-             patch("src.neo_builder.fetch_findings", return_value=""), \
+             patch("src.neo_builder.fetch_findings", return_value=("{\"findings\": []}", None)), \
              patch("src.neo_builder.gh", side_effect=fake_gh), \
              patch.object(neo_builder.BuilderAgent, "run",
                           return_value=({"input_tokens": 0}, "FIXED")), \

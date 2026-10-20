@@ -254,7 +254,7 @@ class TestDefect1RoundCap:
         with patch("src.neo_builder.BRIEFS", tmp_path / "briefs"), \
              patch("src.neo_builder.pr_state", return_value="OPEN\tmain"), \
              patch("src.neo_builder.prepare_worktree", return_value=("/tmp/wt", "main")), \
-             patch("src.neo_builder.fetch_findings", return_value=""), \
+             patch("src.neo_builder.fetch_findings", return_value=("{\"findings\": []}", None)), \
              patch("src.neo_builder.gh", return_value=(0, "a" * 40)), \
              patch.object(BuilderAgent, "run",
                           return_value=({"input_tokens": 0}, "FIXED")):
@@ -549,7 +549,7 @@ class TestGLM6LeaseRenewal:
                "builder_round": 1, "attempt": 1}
         with patch("src.neo_builder.pr_state", return_value="OPEN\tmain"), \
              patch("src.neo_builder.prepare_worktree", return_value=("/tmp/wt", "main")), \
-             patch("src.neo_builder.fetch_findings", return_value=""), \
+             patch("src.neo_builder.fetch_findings", return_value=("{\"findings\": []}", None)), \
              patch("src.neo_builder.gh", return_value=(0, "a" * 40)), \
              patch("src.neo_builder.BRIEFS", tmp_path / "briefs"), \
              patch.object(BuilderAgent, "run",
