@@ -368,11 +368,14 @@ def _findings_to_brief_list(findings: list) -> str:
         "",
     ]
     for i, f in enumerate(actionable, 1):
-        fid = f.get("id", f"f{i}")
-        severity = f.get("severity", "LOW")
+        # Every rendered field is untrusted: whitelist or fence it.
+        fid = str(f.get("id") or f"f{i}")
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", fid):
+            fid = f"f{i}"
+        severity = f.get("severity") if f.get("severity") in _SEVERITY_ORDER else "LOW"
         status = f.get("status", "unverified")
         file_path = _fence_finding_body(str(f.get("file", "?")), max_chars=300).replace("\n", " ")
-        line = f.get("line", 0)
+        line = f.get("line") if isinstance(f.get("line"), int) and not isinstance(f.get("line"), bool) else 0
         title = _fence_finding_body(f.get("title") or "", max_chars=300).replace("\n", " ")
         body = _fence_finding_body(f.get("body") or "")
         lines.append(f"### {i}. [{severity}] [{status}] {file_path}:{line}")
