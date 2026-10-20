@@ -567,7 +567,7 @@ class TestWorkerWiring:
         agent_tokens = []
 
         def fake_run_agent(agent, brief, cfg=None, gh_token="",
-                           usage_store=None, job_id=None):
+                           usage_store=None, job_id=None, attempt_number=1):
             agent_tokens.append(agent.gh_token)
             return ({"input_tokens": 0}, "ACCEPT-READY", 0, None)
 

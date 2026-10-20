@@ -199,6 +199,7 @@ class ClaudeAgent:
         gh_token: str,
         usage_store=None,
         job_id: int | None = None,
+        attempt_number: int = 1,
     ) -> tuple[dict[str, int], str, int | None, Route | None]:
         """Walk the available route chain, trying each in order.
 
@@ -230,7 +231,7 @@ class ClaudeAgent:
                          idx, route.provider, route.model)
                 if usage_store is not None and job_id is not None:
                     attempt = UsageAttempt(
-                        job_id=job_id, attempt_number=1, route_idx=idx,
+                        job_id=job_id, attempt_number=attempt_number, route_idx=idx,
                         provider=route.provider, model=route.model,
                         outcome="skipped",
                         error_class="no_anthropic_wire",
@@ -248,7 +249,7 @@ class ClaudeAgent:
                          idx, route.provider, route.model)
                 if usage_store is not None and job_id is not None:
                     attempt = UsageAttempt(
-                        job_id=job_id, attempt_number=1, route_idx=idx,
+                        job_id=job_id, attempt_number=attempt_number, route_idx=idx,
                         provider=route.provider, model=route.model,
                         outcome="skipped",
                         error_class="missing_key",
@@ -278,7 +279,7 @@ class ClaudeAgent:
                         # Record the failed attempt.
                         if usage_store is not None and job_id is not None:
                             attempt = UsageAttempt(
-                                job_id=job_id, attempt_number=1, route_idx=idx,
+                                job_id=job_id, attempt_number=attempt_number, route_idx=idx,
                                 provider=route.provider, model=route.model,
                                 latency_ms=elapsed_ms,
                                 outcome="fallthrough" if fallthrough else "error",
@@ -289,8 +290,10 @@ class ClaudeAgent:
                             except Exception:  # noqa: BLE001
                                 log.exception("failed to record attempt %s", idx)
                         if not fallthrough:
-                            # Non-fallthrough failure — stop the chain.
-                            return {}, "", idx, route
+                            # Non-fallthrough failure — re-raise so the
+                            # caller's except AgentError handler retries
+                            # the job rather than treating it as completed.
+                            raise exc
                         # Fallthrough — try next route.
                         continue
 
@@ -298,7 +301,7 @@ class ClaudeAgent:
                     elapsed_ms = int((time.monotonic() - route_start) * 1000)
                     if usage_store is not None and job_id is not None:
                         attempt = UsageAttempt(
-                            job_id=job_id, attempt_number=1, route_idx=idx,
+                            job_id=job_id, attempt_number=attempt_number, route_idx=idx,
                             provider=route.provider, model=route.model,
                             uncached_input=usage.get("input_tokens"),
                             output_tokens=usage.get("output_tokens"),
@@ -511,6 +514,16 @@ class ClaudeAgent:
         # --- Validate envelope ---
         if result.get("type") != "result":
             raise MalformedStream(f"unexpected json type: {result.get('type')!r}")
+
+        # --- API error status: check BEFORE is_error/subtype guards so that
+        # a real provider 429/5xx (which carries is_error=true, subtype=
+        # "error_during_execution", and api_error_status=429) is classified as
+        # ApiError for fallthrough rather than MalformedStream.
+        api_error_status = result.get("api_error_status")
+        if api_error_status is not None and api_error_status != "":
+            raise ApiError(str(api_error_status).strip(),
+                           f"api_error_status present: {api_error_status}")
+
         if result.get("is_error", False):
             error_info = result.get("error", "unknown error")
             raise MalformedStream(f"claude returned error: {error_info}")
@@ -548,11 +561,7 @@ class ClaudeAgent:
                     f"non-terminal terminal_reason: {terminal_reason!r}"
                 )
 
-        # --- API error status (fail-closed on any non-null status) ---
-        api_error_status = result.get("api_error_status")
-        if api_error_status is not None and api_error_status != "":
-            raise ApiError(str(api_error_status).strip(),
-                           f"api_error_status present: {api_error_status}")
+
 
         # --- At least one turn taken ---
         num_turns = result.get("num_turns", 0) or 0

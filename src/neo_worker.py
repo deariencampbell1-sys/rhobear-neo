@@ -277,6 +277,7 @@ def _run_agent(
     gh_token: str = "",
     usage_store=None,
     job_id: int | None = None,
+    attempt_number: int = 1,
 ) -> tuple[dict, str, int | None, object | None]:
     """Run the Neo brief headless via Claude Code CLI, walking the route chain.
 
@@ -297,6 +298,7 @@ def _run_agent(
                 usage, verdict, ridx, route = agent.run_with_chain(
                     brief, avail, cfg, gh_token,
                     usage_store=usage_store, job_id=job_id,
+                    attempt_number=attempt_number,
                 )
                 return usage, verdict, ridx, route
         # Fallback: single configured route (backward compat).
@@ -504,10 +506,15 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict,
         # second worker claim the same SHA mid-run (GLM 6 applies to wakes too).
         with jobs.lease_renewal(job_id, lease_secs=_wake_lease(cfg),
                                 worker_token=wtoken):
+            # Read the job's real attempt counter for usage metering
+            # (Defect 5: attempt_number comes from the claimed row, never a constant).
+            job_row = jobs.get(job_id)
+            attempt_number = job_row["attempt"] if job_row else 1
             usage, verdict, winning_route_idx, winning_route = _run_agent(
                 agent, brief,
                 cfg=cfg, gh_token=token,
                 usage_store=usage_store, job_id=job_id,
+                attempt_number=attempt_number,
             )
     except Exception as exc:
         # Any exception from the agent spawn (FileNotFoundError/OSError/
@@ -680,7 +687,8 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict,
             route_provider = "unknown"
             route_model = ""
     else:
-        route_provider = cfg.deepseek_base_url.split(".")[0].split("//")[-1] if "//" in cfg.deepseek_base_url else "deepseek"
+        # Fallback: no parsed routes — hardcode deepseek for the configured direct route.
+        route_provider = "deepseek"
         route_model = cfg.deepseek_model
 
     # Record the successful attempt in the usage store if not already recorded
@@ -690,12 +698,13 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict,
         try:
             success_attempt = UsageAttempt(
                 job_id=job_id,
-                attempt_number=1,
+                attempt_number=attempt_number,
                 route_idx=winning_route_idx if winning_route_idx is not None else 0,
                 provider=route_provider,
                 model=route_model,
-                uncached_input=usage.get("input_tokens") or usage.get("uncached_input"),
-                cached_input=usage.get("cache_read_input_tokens") or usage.get("cached_input"),
+                # Defect 9: use None-coalescing get, never x or y (0 is real, None is unknown).
+                uncached_input=usage.get("input_tokens") if usage.get("input_tokens") is not None else usage.get("uncached_input"),
+                cached_input=usage.get("cache_read_input_tokens") if usage.get("cache_read_input_tokens") is not None else usage.get("cached_input"),
                 output_tokens=usage.get("output_tokens"),
                 outcome="success" if verdict else "error",
             )
