@@ -1,6 +1,16 @@
 """A failed triage must not strand a PR at its head forever."""
 from unittest import mock
+
+import pytest
+
 from src import neo_worker
+
+
+@pytest.fixture(autouse=True)
+def _not_a_lane_branch():
+    # These PRs are ordinary branches; lane branches never reach the agent (test_lane_gate.py).
+    with mock.patch.object(neo_worker, "_lane_pr", return_value=None):
+        yield
 
 
 class FakeState:

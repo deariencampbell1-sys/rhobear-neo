@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 
 from .config import Config
@@ -167,6 +168,83 @@ def merge_authority(install_auto_merge: bool, evidence: dict,
     return True, "exact-head evidence complete"
 
 
+# North Star lane branches ("l3-kit/...", "l8d-engine-mcps/...") belong to their lane: one writer
+# per branch, the lane's briefed worker. Neo never runs its agent on one (no fix-forward, no builder
+# bounce) and merges only the exact head that Apollo passed AND the lane architect accepted with a
+# commit status "architect/<lane>" set from the owner's account. L0 ruling 2026-10-25, north-star #1.
+LANE_BRANCH = re.compile(r"^(l\d+[a-d]?-[a-z0-9-]+)/", re.IGNORECASE)
+ARCHITECT_CONTEXT = "architect/"
+
+
+def lane_of(branch: str) -> str:
+    m = LANE_BRANCH.match(branch or "")
+    return m.group(1).lower() if m else ""
+
+
+def lane_merge_authority(install_auto_merge: bool, evidence: dict, lane: str,
+                         statuses: list[dict], reviews: list[dict], owner: str) -> tuple[bool, str]:
+    """Merge authority for a lane PR. Fails closed."""
+    if not install_auto_merge:
+        return False, "auto-merge disabled for this install"
+    if not evidence.get("ok"):
+        return False, f"review evidence unavailable ({evidence.get('reason')})"
+    head = evidence.get("head_sha") or ""
+    if not head or head != evidence.get("decided_sha"):
+        return False, "head moved since the wake — stale evidence cannot authorize this SHA"
+    if not evidence.get("trusted_green"):
+        return False, "Apollo's status is not success on this exact head SHA"
+    for r in reviews:
+        oid = str((r.get("commit") or {}).get("oid") or r.get("commit_id") or "")
+        if oid == head and str(r.get("state") or "").upper() == "CHANGES_REQUESTED":
+            return False, "Apollo requested changes on this exact head SHA"
+    # Statuses arrive newest first; only the latest one for the architect context counts.
+    latest = next((s for s in statuses
+                   if str(s.get("context") or "").lower() == ARCHITECT_CONTEXT + lane), None)
+    if not latest or str(latest.get("state") or "").lower() != "success":
+        return False, f"waiting for the {lane} architect to accept this exact head"
+    if str((latest.get("creator") or {}).get("login") or "").lower() != owner.lower():
+        return False, f"the {ARCHITECT_CONTEXT}{lane} status was not set from the owner's account"
+    return True, "Apollo and the lane architect both passed this exact head"
+
+
+def run_lane_gate(cfg: Config, state: NeoState, repo: str, pr: int, sha: str,
+                  lane: str, reviews: list[dict]) -> None:
+    """Decide a lane PR without the agent: merge the exact head, or hold and say why."""
+    if state.already_acted(repo, pr, sha, "merged"):
+        log.info("%s#%s@%s already merged by Neo — skip", repo, pr, sha[:8])
+        return
+    org = repo.split("/", 1)[0]
+    install_auto_merge = bool(state.install(org, org).get("auto_merge") or cfg.auto_merge_default)
+    evidence = _review_evidence(cfg, repo, pr, sha)
+    rc, raw = _gh(cfg, "api", f"repos/{repo}/commits/{sha}/statuses?per_page=100", timeout=30)
+    try:
+        statuses = json.loads(raw) if rc == 0 else []
+    except (TypeError, ValueError):
+        statuses = []
+    ok, reason = lane_merge_authority(install_auto_merge, evidence, lane,
+                                      statuses if isinstance(statuses, list) else [], reviews, org)
+    log.info("%s#%s@%s lane=%s merge authority=%s (%s)", repo, pr, sha[:8], lane, ok, reason)
+    if ok:
+        rc, out = _gh(cfg, "pr", "merge", str(pr), "-R", repo, "--squash",
+                      "--match-head-commit", sha, timeout=60)
+        if rc == 0:
+            state.record(repo, pr, sha, "merged", verdict="ACCEPT-MERGED",
+                         detail={"lane": lane, "reason": reason})
+            return
+        ok, reason = False, f"merge refused by GitHub: {out[:200]}"
+    state.record(repo, pr, sha, "lane_hold", verdict="HOLD", detail={"lane": lane, "reason": reason})
+
+
+def _lane_pr(cfg: Config, repo: str, pr: int) -> tuple[str, list[dict]] | None:
+    """(lane, reviews) when the PR's head branch is a North Star lane branch; None otherwise."""
+    rc, raw = _gh(cfg, "pr", "view", str(pr), "-R", repo, "--json", "headRefName,reviews", timeout=45)
+    if rc != 0:
+        raise AgentError("PR head branch unavailable — cannot tell whether it is a lane branch")
+    data = json.loads(raw)
+    lane = lane_of(str(data.get("headRefName") or ""))
+    return (lane, data.get("reviews") or []) if lane else None
+
+
 def _jev_for_pr(cfg: Config, repo: str, pr: int, sha: str = "") -> JevAssessment:
     """Read this PR's patch and review evidence for one cheap Jev decision."""
     if not isinstance(cfg.jev_api_key, str) or not cfg.jev_api_key:
@@ -200,6 +278,18 @@ def run_neo(cfg: Config, state: NeoState, wake: dict) -> None:
     if not pr:
         log.info("no open PR for %s@%s — skip", repo, sha[:8])
         return
+
+    # --- North Star lane branches: architect-gated merge, never the agent ---
+    try:
+        lane_pr = _lane_pr(cfg, repo, pr)
+    except (AgentError, TypeError, ValueError) as exc:
+        log.warning("%s#%s@%s %s — skip (fail closed)", repo, pr, sha[:8], exc)
+        return
+    if lane_pr:
+        run_lane_gate(cfg, state, repo, pr, sha, lane_pr[0], lane_pr[1])
+        return
+    if str(wake.get("context") or "").startswith(ARCHITECT_CONTEXT):
+        return  # an architect status only ever drives a lane PR
 
     # --- loop / thrash guard ------------------------------------------------
     # Keyed on verdict COLOR, not sha alone. A green verdict arriving after a
