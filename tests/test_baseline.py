@@ -196,16 +196,30 @@ class TestNeoBuilder:
         )
         assert "no assessment available" in brief
 
-    def test_gh_command(self):
-        """Verify gh() builds the right env — no real execution."""
-        from src.config import Config
-        from src.neo_builder import gh
+    def test_gh_command(self, monkeypatch):
+        """Call the REAL gh() with subprocess.run patched and assert the env
+        it actually passed — not a hand-built dict that proves nothing.
+        GH_TOKEN must travel in the env (a copy of the service env), never
+        on the argv (world-readable in /proc)."""
+        import os
+        import subprocess
+        from src import neo_builder
 
-        cfg = Config()
-        cfg.gh_token = "test-token"
-        # We don't run it, just verify it constructs the env correctly
-        env = {**__import__("os").environ, "GH_TOKEN": cfg.gh_token}
-        assert env["GH_TOKEN"] == "test-token"
+        captured = {}
+
+        def fake_run(cmd, **kw):
+            captured["cmd"] = list(cmd)
+            captured["env"] = kw.get("env")
+            return subprocess.CompletedProcess(cmd, 0, "ok\n", "")
+
+        monkeypatch.setattr(neo_builder.subprocess, "run", fake_run)
+        rc, out = neo_builder.gh("ghs_real_secret_token", "api", "repos/o/r")
+
+        assert rc == 0
+        assert out == "ok"
+        assert captured["cmd"] == ["gh", "api", "repos/o/r"]
+        assert captured["env"] == {**os.environ, "GH_TOKEN": "ghs_real_secret_token"}
+        assert all("ghs_real_secret_token" not in str(a) for a in captured["cmd"])
 
     def test_builder_agent_subclass(self):
         from src.neo_builder import BuilderAgent
@@ -224,16 +238,113 @@ class TestNeoBuilder:
 # ---------------------------------------------------------------------------
 
 class TestMainModule:
-    def test_main_import_and_invoke(self):
-        """Verify __main__.main() can be called without crashing when
-        config and state are faked. No network, no Hermes binary needed."""
+    def test_main_starts_with_fakes(self, monkeypatch):
+        """Drive the REAL __main__.main() with fakes instead of asserting
+        callable().  Config load, the GitHub App identity, the durable
+        stores and serve() are substituted; main() must wire the executor
+        and hand the dispatcher to serve().  The captured on_verdict is then
+        driven with a fake wake: the wake is persisted to neo_jobs BEFORE
+        the executor picks it up, then stamped submitted."""
         import src.__main__ as main_mod
-        from src.config import Config
 
-        # The real main() does cfg.require().validate() which checks
-        # DEEPSEEK_API_KEY etc. We test the import path only here;
-        # full startup requires env vars set in production.
-        assert callable(main_mod.main)
+        calls = {}
+        events = []
+
+        class _FakeCfg:
+            gh_token = ""
+            database_url = "postgresql://fake"
+            orgs = ["acme"]
+            auto_merge_default = False
+            github_app_id = 42
+            escalation_poll_secs = 3600
+            escalation_timeout_secs = 3600
+            parsed_routes = []
+
+            def require(self):
+                return self
+
+            def validate(self):
+                return self
+
+        class _FakeState:
+            def __init__(self, url):
+                calls["state_url"] = url
+
+            def ensure_schema(self):
+                calls["state_schema"] = True
+
+        class _FakeJobs:
+            def __init__(self, url):
+                calls["jobs"] = self
+                self.wakes = []
+
+            def ensure_schema(self):
+                pass
+
+            def reset_queued_submissions(self, kind):
+                pass
+
+            def create_wake(self, repo, sha, green, pr_number=None, payload=None):
+                self.wakes.append((repo, sha, green, pr_number))
+                events.append("create_wake")
+                return 7
+
+            def mark_submitted(self, job_id):
+                events.append(("mark_submitted", job_id))
+
+            def clear_submitted(self, job_id):
+                events.append(("clear_submitted", job_id))
+
+        class _FakeUsage:
+            def __init__(self, url):
+                pass
+
+            def ensure_schema(self):
+                pass
+
+        class _FakeExecutor:
+            def __init__(self, max_workers=None, thread_name_prefix=None):
+                calls["max_workers"] = max_workers
+                calls["executor"] = self
+                self.tasks = []
+
+            def submit(self, fn, wake):
+                self.tasks.append((fn, wake))
+                events.append("executor_submit")
+
+        class _FakeDispatcher:
+            def __init__(self, cfg, on_verdict):
+                calls["on_verdict"] = on_verdict
+
+        monkeypatch.delenv("NEO_MAX_WORKERS", raising=False)
+        monkeypatch.setattr(main_mod._config, "load", lambda: _FakeCfg())
+        monkeypatch.setattr(main_mod, "github_app_for", lambda cfg: object())
+        monkeypatch.setattr(main_mod, "NeoState", _FakeState)
+        monkeypatch.setattr(main_mod, "Jobs", _FakeJobs)
+        monkeypatch.setattr(main_mod, "UsageStore", _FakeUsage)
+        monkeypatch.setattr(main_mod.concurrent.futures, "ThreadPoolExecutor",
+                            _FakeExecutor)
+        monkeypatch.setattr(main_mod, "NeoDispatcher", _FakeDispatcher)
+        monkeypatch.setattr(
+            main_mod, "serve",
+            lambda cfg, dispatcher: calls.update(cfg=cfg, dispatcher=dispatcher))
+        # Keep the daemon recovery thread asleep for the test's duration.
+        monkeypatch.setattr(main_mod, "RECOVERY_SECS", 3600)
+
+        main_mod.main()
+
+        # Startup claims, asserted against the real call graph:
+        assert calls["state_schema"] is True, "state schema must be ensured"
+        assert calls["max_workers"] == 8, "NEO_MAX_WORKERS default is 8"
+        assert calls["dispatcher"] is not None, "serve() must get the dispatcher"
+
+        # Drive the REAL on_verdict wiring with a fake wake.
+        wake = {"repo": "acme/app", "sha": "b" * 40, "green": True,
+                "pr_number": 5}
+        calls["on_verdict"](wake)
+        assert calls["jobs"].wakes == [("acme/app", "b" * 40, True, 5)]
+        assert events == ["create_wake", "executor_submit",
+                          ("mark_submitted", 7)], events
 
     def test_submit_wake_does_not_stamp_on_executor_shutdown(self):
         """The old semaphore 'drop wake' path is gone; backpressure is now
