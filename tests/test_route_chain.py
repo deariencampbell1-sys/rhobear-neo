@@ -47,7 +47,7 @@ def _make_claude_agent(**kw):
         effort="max",
         max_tokens=32000,
         timeout=30,
-        gh_token="ghp_test",
+        gh_token="test-token",
     )
     defaults.update(kw)
     return ClaudeAgent(**defaults)
@@ -59,7 +59,7 @@ def _make_hermes_agent(**kw):
         provider="zai",
         model="glm-5.3-flash",
         timeout=30,
-        gh_token="ghp_test",
+        gh_token="test-token",
     )
     defaults.update(kw)
     return HermesAgent(**defaults)
@@ -74,7 +74,7 @@ def _cfg() -> Config:
     cfg.deepseek_timeout = 30
     cfg.neo_routes = "deepinfra:glm-5.3-flash,zai:glm-5.3-flash,deepseek:deepseek-v4-flash"
     cfg.claude_bin = "/usr/bin/claude"
-    cfg.gh_token = "ghp_test"
+    cfg.gh_token = "test-token"
     cfg.webhook_secret = "whs_test"
     cfg.database_url = DSN
     cfg.validate()
@@ -162,7 +162,7 @@ class TestFallthrough429:
             avail = available_routes(cfg.parsed_routes)
             with patch("src.agent_claude.subprocess.run", side_effect=fake_subprocess_run):
                 usage, verdict, ridx, route = agent.run_with_chain(
-                    "test brief", avail, cfg, "ghp_test",
+                    "test brief", avail, cfg, "test-token",
                     usage_store=store, job_id=42,
                 )
 
@@ -208,7 +208,7 @@ class TestFallthrough429:
             avail = available_routes(cfg.parsed_routes)
             with patch("src.agent_hermes.subprocess.run", side_effect=fake_subprocess_run):
                 usage, verdict, ridx, route = agent.run_with_chain(
-                    "test brief", avail, cfg, "ghp_test",
+                    "test brief", avail, cfg, "test-token",
                     usage_store=store, job_id=43,
                 )
 

@@ -534,7 +534,7 @@ class TestConfigRoutesValidation:
         cfg.webhook_secret = "whs_test"
         cfg.deepseek_key = "sk-test"
         cfg.database_url = "postgres://localhost/test"
-        cfg.gh_token = "ghp_test"
+        cfg.gh_token = "test-token"
         cfg.deepseek_base_url = "https://api.deepseek.com/anthropic"
         cfg.deepseek_model = "deepseek-v4-flash"
         cfg.deepseek_reasoning_effort = "max"

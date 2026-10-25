@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import tempfile
 from typing import Any
 from unittest.mock import patch
@@ -50,7 +51,7 @@ from src.config import Config
 BASE = "https://api.deepseek.com/anthropic"
 API_KEY = "sk-test-placeholder"
 MODEL = "deepseek-v4-flash"          # exact direct ID — no prefix, no [1m] suffix
-GH_TOKEN = "ghp_test_token_placeholder"
+GH_TOKEN = "test_token_placeholder"
 CLAUDE_BIN = "/usr/bin/claude"
 
 
@@ -616,7 +617,7 @@ class TestConfigValidation:
         cfg.webhook_secret = "whs_test"
         cfg.deepseek_key = "sk-test"
         cfg.database_url = "postgres://localhost/test"
-        cfg.gh_token = "ghp_test"
+        cfg.gh_token = "test-token"
         cfg.require()
 
 
@@ -654,7 +655,7 @@ class TestStaleOpenRouterEnv:
             cfg = Config()
             cfg.webhook_secret = "whs_test"
             cfg.database_url = "postgres://localhost/test"
-            cfg.gh_token = "ghp_test"
+            cfg.gh_token = "test-token"
             with pytest.raises(RuntimeError, match="DEEPSEEK_API_KEY"):
                 cfg.require()
 
@@ -949,6 +950,7 @@ class TestConfigValidate:
         """Trailing slash on the base URL should be tolerated."""
         cfg = Config()
         cfg.deepseek_base_url = "https://api.deepseek.com/anthropic/"
+        cfg.claude_bin = sys.executable  # hermetic: no production binary needed
         cfg.validate()  # should not raise
 
     def test_validate_rejects_stale_prefixed_model(self) -> None:
@@ -992,6 +994,7 @@ class TestConfigValidate:
         cfg.deepseek_model = "deepseek-v4-flash"
         cfg.deepseek_reasoning_effort = "max"
         cfg.deepseek_max_tokens = 32000
+        cfg.claude_bin = sys.executable  # hermetic: no production binary needed
         cfg.validate()  # should not raise
 
     def test_validate_missing_claude_bin_posix(self) -> None:
@@ -1068,7 +1071,7 @@ class TestStartupValidation:
         cfg.webhook_secret = "whs_test"
         cfg.deepseek_key = "sk-test"
         cfg.database_url = "postgres://localhost/test"
-        cfg.gh_token = "ghp_test"
+        cfg.gh_token = "test-token"
         cfg.deepseek_base_url = "https://api.deepseek.com/anthropic"
         cfg.deepseek_model = "deepseek-v4-flash"
         cfg.deepseek_reasoning_effort = "max"
@@ -1104,6 +1107,7 @@ class TestStartupValidation:
     def test_startup_validate_after_require_ok(self) -> None:
         """A valid config passes require().validate() chain."""
         cfg = self._make_invalid_cfg()  # all defaults are valid
+        cfg.claude_bin = sys.executable  # hermetic: no production binary needed
         cfg.require().validate()  # should not raise
 
     def test_main_uses_validate_chain(self) -> None:
@@ -1226,32 +1230,43 @@ data = {
 print(json.dumps(data))
 sys.exit(0)
 '''
-        with _tf.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as _f:
-            _f.write(_script)
-            _py_path = _f.name
-
-        # Temp batch file that calls the Python script (ignores all CLI args).
-        _bat_content = '@echo off\npython "' + _py_path + '"\nexit /b 0\n'
-        with _tf.NamedTemporaryFile(mode='w', suffix='.bat', delete=False) as _f:
-            _f.write(_bat_content)
-            _bat_path = _f.name
+        _cleanup = []
+        if _os.name == "nt":
+            # Windows: temp batch file that calls the Python script.
+            with _tf.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as _f:
+                _f.write(_script)
+                _py_path = _f.name
+            _cleanup.append(_py_path)
+            _bat_content = '@echo off\npython "' + _py_path + '"\nexit /b 0\n'
+            with _tf.NamedTemporaryFile(mode='w', suffix='.bat', delete=False) as _f:
+                _f.write(_bat_content)
+                _claude_bin = _f.name
+        else:
+            # POSIX (W1-02: made hermetic on the build box): the script itself
+            # is the CLI stub — shebang + exec bit. A .bat has no interpreter
+            # here and temp files are not executable by default.
+            with _tf.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as _f:
+                _f.write("#!" + sys.executable + "\n" + _script)
+                _claude_bin = _f.name
+            _os.chmod(_claude_bin, 0o755)
+        _cleanup.append(_claude_bin)
 
         try:
             agent = ClaudeAgent(
-                claude_bin=_bat_path,
+                claude_bin=_claude_bin,
                 api_key="sk-smoke",
                 base_url="https://api.deepseek.com/anthropic",
                 model="deepseek-v4-flash",
                 effort="max",
                 max_tokens=32000,
                 timeout=30,
-                gh_token="ghp_smoke",
+                gh_token="test-token-smoke",
             )
             usage, verdict = agent.run("test brief")
             assert verdict == "ACCEPT-READY"
             assert usage["input_tokens"] == 100
             assert usage["output_tokens"] == 50
         finally:
-            for _p in (_py_path, _bat_path):
+            for _p in _cleanup:
                 if _os.path.exists(_p):
                     _os.unlink(_p)

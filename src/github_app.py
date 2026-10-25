@@ -1,6 +1,6 @@
 """GitHub App identity for Neo — App JWT + per-installation tokens.
 
-Neo acts as the customer's GitHub App, not as the owner's personal `gho_`
+Neo acts as the customer's GitHub App, not as the owner's personal OAuth
 token. A customer grants Neo access to a private repo by installing the App on
 it; every GitHub action for a repo is then made with THAT repo's installation
 token. There is no fallback to a personal token: a repo with no installation is

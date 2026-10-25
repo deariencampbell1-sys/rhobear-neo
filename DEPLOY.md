@@ -11,7 +11,7 @@ Runs: `.venv/bin/python -m src`, reads `.env` via `EnvironmentFile`.
 
 ## GitHub App identity (N15-B1g, 2026-10-19)
 Neo acts as the customer's GitHub App (`rhobear-neo`, App ID 4347986), not as a
-personal `gho_` token. A customer grants Neo access to a private repo by
+personal OAuth token. A customer grants Neo access to a private repo by
 installing the App on it; every GitHub action for a repo uses that repo's
 installation token. `.env` must set:
 

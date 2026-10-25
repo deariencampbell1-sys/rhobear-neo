@@ -146,7 +146,7 @@ def _cfg_with_app(key: dict, http: FakeGitHubHTTP) -> Config:
     cfg = Config()
     cfg.github_app_id = "4347986"
     cfg.github_app_key = key["pem"]
-    cfg.gh_token = "gho_personal_secret"
+    cfg.gh_token = "personal_token_sentinel"
     setattr(cfg, "_rhobear_github_app", _make_app(key, http))
     return cfg
 
@@ -464,7 +464,7 @@ class TestWebhookInstallationId:
 
 class TestSubprocessTokenHygiene:
     def test_worker_gh_env_uses_installation_token(self, monkeypatch):
-        monkeypatch.setenv("GH_TOKEN", "gho_personal_secret")
+        monkeypatch.setenv("GH_TOKEN", "personal_token_sentinel")
         captured = {}
 
         def fake_run(args, **kw):
@@ -474,10 +474,10 @@ class TestSubprocessTokenHygiene:
         monkeypatch.setattr(neo_worker.subprocess, "run", fake_run)
         neo_worker._gh("ghs_install_a", "api", "repos/acme/a/pulls/1")
         assert captured["env"]["GH_TOKEN"] == "ghs_install_a"
-        assert captured["env"]["GH_TOKEN"] != "gho_personal_secret"
+        assert captured["env"]["GH_TOKEN"] != "personal_token_sentinel"
 
     def test_builder_gh_env_uses_installation_token(self, monkeypatch):
-        monkeypatch.setenv("GH_TOKEN", "gho_personal_secret")
+        monkeypatch.setenv("GH_TOKEN", "personal_token_sentinel")
         captured = {}
 
         def fake_run(args, **kw):
@@ -487,10 +487,10 @@ class TestSubprocessTokenHygiene:
         monkeypatch.setattr(neo_builder.subprocess, "run", fake_run)
         neo_builder.gh("ghs_install_b", "api", "repos/acme/b/pulls/1")
         assert captured["env"]["GH_TOKEN"] == "ghs_install_b"
-        assert captured["env"]["GH_TOKEN"] != "gho_personal_secret"
+        assert captured["env"]["GH_TOKEN"] != "personal_token_sentinel"
 
     def test_builder_clone_env_uses_installation_token(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("GH_TOKEN", "gho_personal_secret")
+        monkeypatch.setenv("GH_TOKEN", "personal_token_sentinel")
         calls = []
 
         def fake_run(args, **kw):
@@ -509,25 +509,25 @@ class TestSubprocessTokenHygiene:
         assert env_calls, "clone/fetch carried an env"
         for env in env_calls:
             assert env["GH_TOKEN"] == "ghs_install_a"
-            assert env["GH_TOKEN"] != "gho_personal_secret"
+            assert env["GH_TOKEN"] != "personal_token_sentinel"
 
     def test_claude_agent_env_uses_installation_token(self, monkeypatch):
-        monkeypatch.setenv("GH_TOKEN", "gho_personal_secret")
+        monkeypatch.setenv("GH_TOKEN", "personal_token_sentinel")
         agent = ClaudeAgent(claude_bin="/usr/bin/claude", api_key="sk-test",
                             base_url="https://api.deepseek.com/anthropic",
                             model="deepseek-v4-flash", gh_token="ghs_install_a")
         env = agent._build_env("/tmp/cfg")
         assert env["GH_TOKEN"] == "ghs_install_a"
-        assert env["GH_TOKEN"] != "gho_personal_secret"
+        assert env["GH_TOKEN"] != "personal_token_sentinel"
 
     def test_hermes_agent_env_uses_installation_token(self, monkeypatch):
-        monkeypatch.setenv("GH_TOKEN", "gho_personal_secret")
+        monkeypatch.setenv("GH_TOKEN", "personal_token_sentinel")
         agent = HermesAgent(hermes_bin="/opt/rhobear-hermes/bin/hermes",
                             provider="zai", model="glm-5.3-flash",
                             gh_token="ghs_install_b")
         env = agent._build_env()
         assert env["GH_TOKEN"] == "ghs_install_b"
-        assert env["GH_TOKEN"] != "gho_personal_secret"
+        assert env["GH_TOKEN"] != "personal_token_sentinel"
 
 
 # ---------------------------------------------------------------------------
@@ -722,13 +722,13 @@ class TestStartupIgnoredToken:
             "NEO_GITHUB_APP_ID": "4347986",
             "NEO_GITHUB_APP_KEY_PATH": "",
             "NEO_GITHUB_APP_KEY": rsa_key["pem"],
-            "GH_TOKEN": "gho_ignored_secret",
+            "GH_TOKEN": "ignored_personal_token",
             "DEEPSEEK_API_KEY": "",
         }, clear=False):
             cfg = Config()
         assert cfg.github_app_id == "4347986"
         assert cfg.github_app_key == rsa_key["pem"]
-        assert cfg.gh_token == "gho_ignored_secret"
+        assert cfg.gh_token == "ignored_personal_token"
 
     def test_require_no_longer_demands_gh_token(self):
         cfg = Config()
@@ -744,6 +744,6 @@ class TestStartupIgnoredToken:
         assert "IGNORED" in src_text
         assert "github_app_for" in src_text
         # A personal GH_TOKEN must never satisfy the identity requirement.
-        with patch.dict(os.environ, {"GH_TOKEN": "gho_ignored"}, clear=False):
+        with patch.dict(os.environ, {"GH_TOKEN": "ignored_personal"}, clear=False):
             cfg = Config()
             assert github_app_for(cfg) is None   # app identity is what matters
