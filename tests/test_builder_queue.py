@@ -147,3 +147,12 @@ def test_findings_empty_when_nothing_anywhere(monkeypatch):
     monkeypatch.setattr(nb, "_db", lambda: (_ for _ in ()).throw(RuntimeError("no db")))
     monkeypatch.setattr(nb, "gh", lambda cfg, *a, timeout=30: (0, ""))
     assert nb.fetch_findings(object(), "o/r", 42) == ""
+
+
+def test_builder_never_takes_a_lane_branch():
+    """One writer per lane branch (owner, 2026-10-25): full and short lane prefixes are skipped, others are not."""
+    from src.neo_builder import is_lane_branch
+    for lane in ("l8d-engine-mcps/engine-store", "l8b/mask-fix", "L1-reviews/apollo", "l4b-builds-app/a1"):
+        assert is_lane_branch(lane), lane
+    for other in ("feat/loop-watchdog", "main", "lane/reviewer-deepinfra-peak", "dependabot/npm/x", "fix-pr-12", ""):
+        assert not is_lane_branch(other), other

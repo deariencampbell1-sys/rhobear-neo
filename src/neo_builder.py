@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+import re
 import logging
 import os
 import subprocess
@@ -230,9 +231,24 @@ No markdown fences, nothing after the VERDICT line.
 """
 
 
+
+# North Star lane branches belong to their lane's worker (one writer per branch): Builder never pushes to one.
+# Conservative on purpose: the full `l8d-engine-mcps/` form and the short `l8b/` form both count.
+LANE_HEAD = re.compile(r"^l\d+[a-d]?(-[a-z0-9-]+)?/", re.IGNORECASE)
+
+
+def is_lane_branch(branch: str) -> bool:
+    return bool(LANE_HEAD.match(branch or ""))
+
 def dispatch_one(cfg: Config, row: dict) -> None:
     repo, pr, sha, round_ = row["repo"], row["pr_number"], row["head_sha"], row["builder_round"]
-    state = pr_state(cfg, repo, pr).split("\t")[0]
+    full_state = pr_state(cfg, repo, pr)
+    state = full_state.split("\t")[0]
+    head_ref = full_state.split("\t")[-1] if "\t" in full_state else ""
+    if is_lane_branch(head_ref):
+        log.info("skip (lane branch %s, its lane's worker fixes it): %s#%s", head_ref, repo, pr)
+        _mark(_db(), row["id"], {"skipped_lane": head_ref, "brief_dispatched": True})
+        return
     if state.upper() not in ("OPEN", "DRAFT"):
         log.info("skip (closed/merged): %s#%s", repo, pr)
         # brief_dispatched is what queued() filters on. Marking only
@@ -331,9 +347,11 @@ def main() -> int:
             rows = queued(conn, repo_filter, limit=CONCURRENCY,
                           allowlist=cfg.repo_allowlist)
             for row in rows:
-                log.info("dry-run: would dispatch %s#%s@%s round=%s",
+                head_ref = pr_state(cfg, row["repo"], row["pr_number"]).split("\t")[-1]
+                verb = "would SKIP (lane branch)" if is_lane_branch(head_ref) else "would dispatch"
+                log.info("dry-run: %s %s#%s@%s round=%s branch=%s model=%s", verb,
                          row["repo"], row["pr_number"], row["head_sha"][:8],
-                         row["builder_round"])
+                         row["builder_round"], head_ref, cfg.hermes_model)
             if once:
                 break
             if not rows:
