@@ -36,7 +36,10 @@ from unittest.mock import MagicMock, patch, ANY
 
 import pytest
 
-from src.jobs import Jobs, SCHEMA as JOBS_SCHEMA, INDEXES, MIGRATION, TERMINAL_OUTCOMES
+from src.jobs import (
+    Jobs, SCHEMA as JOBS_SCHEMA, INDEXES, MIGRATION, SCHEMA_VERSION,
+    TERMINAL_OUTCOMES,
+)
 from src.github_app import repo_token as _real_repo_token
 
 
@@ -220,10 +223,34 @@ class TestSchemaSingleDefinition:
         src = inspect.getsource(NeoState.ensure_schema)
         assert "Jobs(self.dsn).ensure_schema()" in src
 
-    def test_ensure_schema_runs_migration(self, mock_conn):
+    def test_ensure_schema_runs_migration_once(self, mock_conn):
+        """No neo_schema_version row (pre-B1 upgrade OR fresh install): the
+        legacy migration runs once and stamps the version — under the
+        advisory lock."""
+        mock_conn.execute.return_value.fetchone.return_value = None
         with patch("src.jobs.psycopg.connect", return_value=mock_conn):
             Jobs("postgresql://fake:5432/db").ensure_schema()
-            assert mock_conn.execute.call_count == 3  # SCHEMA, MIGRATION, INDEXES
+        executed = [c.args[0] for c in mock_conn.execute.call_args_list]
+        assert any("pg_advisory_lock" in s for s in executed)
+        assert JOBS_SCHEMA in executed            # create the table
+        assert MIGRATION in executed              # destructive — once
+        assert INDEXES in executed                # keys rebuilt after columns
+        assert any("INSERT INTO neo_schema_version" in s for s in executed)
+
+    def test_ensure_schema_second_call_is_noop(self, mock_conn):
+        """Version row already at SCHEMA_VERSION: the migration is GATED OFF —
+        a second ensure_schema() must never delete rows or rewrite constraints
+        (the poison MIGRATION would raise if it ever ran)."""
+        mock_conn.execute.return_value.fetchone.return_value = (SCHEMA_VERSION,)
+        with patch("src.jobs.psycopg.connect", return_value=mock_conn):
+            with patch("src.jobs.MIGRATION", "SELECT migration_must_not_run()"):
+                Jobs("postgresql://fake:5432/db").ensure_schema()
+        executed = [c.args[0] for c in mock_conn.execute.call_args_list]
+        assert "SELECT migration_must_not_run()" not in executed
+        assert MIGRATION not in executed
+        assert INDEXES not in executed
+        assert not any("INSERT INTO neo_schema_version" in s for s in executed)
+        assert any("pg_advisory_unlock" in s for s in executed)
 
 
 # ---------------------------------------------------------------------------

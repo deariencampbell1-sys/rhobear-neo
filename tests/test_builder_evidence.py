@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import subprocess
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -745,6 +746,53 @@ class TestAdvisorWorkOrderFence:
         # trick (case-insensitive, including whitespace variants).
         assert "<​/neo-advisor-work-order>" in rendered
         assert "<​NEO-ADVISOR-WORK-ORDER>" in rendered
+
+
+    def test_advisor_secrets_redacted_and_fenced(self):
+        """Round-2 item 4: the advisor's summary / root_cause / steps are
+        untrusted egress — a work order containing a PEM block and a DSN
+        comes out REDACTED and still FENCED (the fixer brief is
+        write-capable and pushes)."""
+        from src.neo_builder import _render_advisor_work_order
+        pem = ("-----BEGIN RSA PRIVATE KEY-----\n"
+               "MIIEpAIBAAKCAQEA0vssecretbase64==\n"
+               "-----END RSA PRIVATE KEY-----")
+        wo = {
+            "route": "claude:opus",
+            "summary": ("DB auth fails: "
+                        "postgresql://app:hunter2@db.internal/prod"),
+            "root_cause": pem,
+            "steps": [{"file": "db.py",
+                       "change": "rotate ghs_abcdefghijklmnopqrstuv",
+                       "why": "api_key: " + "a" * 40}],
+            "tests": ["use sk-abcdefghijklmnopqrstuv instead"],
+            "risks": "token=" + "b" * 40,
+        }
+        rendered = _render_advisor_work_order(wo)
+
+        # Redacted: no secret material survives anywhere in the brief...
+        for secret in ("MIIEpAIBAAKCAQEA0vssecretbase64==",
+                       "BEGIN RSA PRIVATE KEY",
+                       "hunter2",
+                       "ghs_abcdefghijklmnopqrstuv",
+                       "sk-abcdefghijklmnopqrstuv",
+                       "a" * 40,
+                       "b" * 40):
+            assert secret not in rendered, f"secret survived: {secret!r}"
+        assert "[REDACTED:PRIVATE KEY]" in rendered
+        assert "[REDACTED:DSN]" in rendered
+        assert "[REDACTED:GITHUB TOKEN]" in rendered
+        assert "[REDACTED:API KEY]" in rendered
+
+        # ...and it is still exactly one fenced block, with the redacted
+        # content INSIDE the fence.
+        assert rendered.count("<neo-advisor-work-order>") == 1
+        assert rendered.count("</neo-advisor-work-order>") == 1
+        assert rendered.startswith("<neo-advisor-work-order>\n")
+        assert rendered.endswith("\n</neo-advisor-work-order>")
+        close = rendered.index("</neo-advisor-work-order>")
+        assert rendered.index("[REDACTED:DSN]") < close
+        assert rendered.index("[REDACTED:PRIVATE KEY]") < close
 
 
 class TestFenceFindingBody:

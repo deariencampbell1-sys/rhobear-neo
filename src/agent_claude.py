@@ -29,10 +29,40 @@ import time
 
 from .config import Config
 from .usage import (
-    Route, UsageAttempt, classify_cli_fallthrough,
+    Route, UsageAttempt, classify_http_error, is_fallthrough,
 )
 
 log = logging.getLogger("rhobear_neo.agent")
+
+# Status-code extraction for fallthrough classification (the ONE surviving
+# classifier — usage.classify_cli_fallthrough, a divergent dead duplicate, is
+# deleted).  Anchored on `api_error_status` / `HTTP <code>` shapes ONLY:
+# a bare 3-digit value ("429") or a code next to an HTTP/status/error-code
+# marker ("HTTP/1.1 503 …", "status: 429", "Error code: 402 …").  Bare
+# substrings are never codes — "cost 1500 tokens" must not classify as 5xx
+# and "read 400 bytes" must not classify as 400.
+_STATUS_CODE = re.compile(
+    r'(?:\bHTTP(?:/\d(?:\.\d)?)?\s*:?\s*'
+    r'|\bstatus(?:\s*code)?\s*:?\s*'
+    r'|\berror\s+code\s*:?\s*)'
+    r'(\d{3})\b',
+    re.IGNORECASE,
+)
+
+
+def _status_code_from(err_str: str) -> int | None:
+    """Anchored status-code extraction from an api_error_status value or
+    provider error line.  Accepted shapes ONLY: a bare/leading code
+    ("429", "400 Bad Request", "503 Service Unavailable") or a code next to
+    an HTTP/status/error-code marker ("HTTP/1.1 503 …", "Error code: 402 …").
+    None when no anchored code is present — bare substrings ("cost 1500
+    tokens", "read 400 bytes") are never codes."""
+    err_str = (err_str or "").strip()
+    m = re.match(r"(\d{3})(?!\d)", err_str)
+    if m:
+        return int(m.group(1))
+    m = _STATUS_CODE.search(err_str)
+    return int(m.group(1)) if m else None
 
 # Canonical Neo verdicts — anything else is rejected.
 CANONICAL_VERDICTS = frozenset({
@@ -325,46 +355,23 @@ class ClaudeAgent:
     ) -> tuple[bool, str | None]:
         """Classify an agent error into (is_fallthrough, error_class).
 
-        For Claude Code JSON output, examines the JSON envelope's
-        api_error_status to determine the HTTP status code.
-        Falls back to error type classification.
+        Anchored on `api_error_status` / `HTTP <code>` (see _status_code_from),
+        never on bare substrings.  Falls back to error type classification.
         """
-        # Try to extract HTTP status from the JSON output first.
+        # Try to extract the API error status from the JSON envelope first.
         if proc is not None and proc.stdout:
             try:
                 result = json.loads(proc.stdout.strip())
                 if isinstance(result, dict):
                     api_status = result.get("api_error_status")
                     if api_status is not None and api_status != "":
-                        err_str = str(api_status).strip()
-                        from .usage import classify_http_error, is_fallthrough
-                        # Try to extract numeric status code
-                        for code_str in ("429", "402", "400"):
-                            if code_str in err_str:
-                                return is_fallthrough(int(code_str)), \
-                                    classify_http_error(int(code_str))
-                        if any(f"{i}0" in err_str for i in range(5, 10)):
-                            return True, "5xx"
-                        if "timeout" in err_str.lower():
-                            return True, "timeout"
-                        # Unknown API error — not fallthrough
-                        return False, err_str[:32]
+                        return self._classify_error_text(str(api_status).strip())
             except (json.JSONDecodeError, TypeError, ValueError):
                 pass
 
-        # ApiError — extract status code from the exception.
+        # ApiError — the status string raised from api_error_status.
         if isinstance(exc, ApiError):
-            from .usage import classify_http_error, is_fallthrough
-            err_str = exc.status
-            for code_str in ("429", "402", "400"):
-                if code_str in err_str:
-                    return is_fallthrough(int(code_str)), \
-                        classify_http_error(int(code_str))
-            if any(f"{i}0" in err_str for i in range(5, 10)):
-                return True, "5xx"
-            if "timeout" in err_str.lower():
-                return True, "timeout"
-            return False, err_str[:32]
+            return self._classify_error_text(exc.status)
 
         # Fall back to error type classification.
         if isinstance(exc, TimeoutError):
@@ -374,6 +381,17 @@ class ClaudeAgent:
         # TruncatedOutput, MissingResult, MalformedStream, UnknownVerdict
         # are all non-fallthrough — the model ran but produced bad output.
         return False, type(exc).__name__.lower()
+
+    @staticmethod
+    def _classify_error_text(err_str: str) -> tuple[bool, str | None]:
+        """Classify a provider error string by ANCHORED status code only."""
+        code = _status_code_from(err_str)
+        if code is not None:
+            return is_fallthrough(code), classify_http_error(code)
+        if re.search(r'\btime(?:d\s+)?out\b', err_str, re.IGNORECASE):
+            return True, "timeout"
+        # Unknown API error — not fallthrough.
+        return False, err_str[:32]
 
     def _run_in(
         self, brief: str, work_dir: str, config_dir: str,
@@ -418,11 +436,23 @@ class ClaudeAgent:
 
         Uses ANTHROPIC_BASE_URL (the gateway env var that Claude Code respects)
         and sets both ANTHROPIC_AUTH_TOKEN and ANTHROPIC_API_KEY for maximum
-        compatibility.  Preserves the host PATH and HOME.  Never logs or echoes
+        compatibility.  The base environment is an explicit allowlist (PATH,
+        HOME, LANG, TMPDIR — same discipline as advisor/server.py::_agent_env
+        and HermesAgent._build_env): the agent runs with
+        --dangerously-skip-permissions over PR-derived briefs, so DATABASE_URL,
+        NEO_ADVISOR_TOKEN, NEO_GITHUB_APP_KEY/_KEY_PATH, provider keys and any
+        other service secret must never travel with it.  Never logs or echoes
         the API key.
         """
-        env = {
-            **os.environ,
+        defaults = {
+            "PATH": "/usr/local/bin:/usr/bin:/bin",
+            "HOME": os.path.expanduser("~") or "/tmp",
+            "LANG": "C.UTF-8",
+            "TMPDIR": tempfile.gettempdir(),
+        }
+        env = {key: (os.environ.get(key) or defaults[key])
+               for key in ("PATH", "HOME", "LANG", "TMPDIR")}
+        env.update({
             "CLAUDE_CONFIG_DIR": config_dir,
             "ANTHROPIC_BASE_URL": self.base_url,
             "ANTHROPIC_API_KEY": self.api_key,
@@ -437,16 +467,11 @@ class ClaudeAgent:
             "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1048576",
             "CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT": "1",
             "CLAUDE_CODE_OUTPUT_FORMAT": "json",
-        }
+        })
         # Use only the configured GitHub credential. A stale host token must
         # never leak into Neo when its explicit token is absent.
-        env.pop("GH_TOKEN", None)
         if self.gh_token:
             env["GH_TOKEN"] = self.gh_token
-        # Remove conflicting env vars that might point at a different provider
-        # (e.g. a stale OpenRouter gateway URL or the CLI's own base-url var).
-        env.pop("CLAUDE_CODE_ANTHROPIC_BASE_URL", None)
-        env.pop("CLAUDE_CODE_BASE_URL", None)
         return env
 
     def _build_cmd(self, brief: str) -> list[str]:

@@ -775,3 +775,18 @@ class TestRealSmoke:
         assert attempts[0].uncached_input == 200
         assert attempts[0].output_tokens == 100
         assert attempts[0].latency_ms == 1500
+
+
+# ---------------------------------------------------------------------------
+# Round 2 (MEDIUM) — the dead divergent classifier is deleted
+# ---------------------------------------------------------------------------
+
+def test_divergent_classify_cli_fallthrough_is_deleted():
+    """usage.classify_cli_fallthrough re-implemented fallthrough
+    classification differently from the agents' _classify_agent_error ("cost
+    1500 tokens" classified as 5xx there) and was imported but never used on
+    the decision path.  One classifier family survives — anchored on
+    api_error_status / HTTP <code> in agent_claude / agent_hermes — the
+    divergent duplicate must be GONE."""
+    import src.usage as usage
+    assert not hasattr(usage, "classify_cli_fallthrough")

@@ -1270,3 +1270,84 @@ sys.exit(0)
             for _p in _cleanup:
                 if _os.path.exists(_p):
                     _os.unlink(_p)
+
+# ===================================================================
+# Round 2 — env allowlist for the triage agent + anchored fallthrough
+# classification (the divergent usage.classify_cli_fallthrough is deleted)
+# ===================================================================
+
+class TestClaudeEnvAllowlist:
+    """The triage agent runs --dangerously-skip-permissions over PR-derived
+    briefs — its child env is an explicit allowlist plus the route's own
+    Anthropic credentials, never a copy of the service environment."""
+
+    def test_service_secrets_never_reach_the_subprocess(self, monkeypatch) -> None:
+        for name, value in {
+            "DATABASE_URL": "postgresql://app:hunter2@db.internal/prod",
+            "NEO_ADVISOR_TOKEN": "advisor-bearer-secret",
+            "NEO_GITHUB_APP_KEY": "-----BEGIN PRIVATE KEY-----",
+            "NEO_GITHUB_APP_KEY_PATH": "/opt/rhobear/rhobear-neo/app-key.pem",
+            "OPENROUTER_API_KEY": "sk-or-v1-secret",
+        }.items():
+            monkeypatch.setenv(name, value)
+        agent = _make_agent()
+        env = agent._build_env("/tmp/neo-config-test")
+        for name in ("DATABASE_URL", "NEO_ADVISOR_TOKEN", "NEO_GITHUB_APP_KEY",
+                     "NEO_GITHUB_APP_KEY_PATH", "OPENROUTER_API_KEY"):
+            assert name not in env, f"secret env var {name} reached the subprocess"
+        # Only the route's own API key may be a *_KEY — everything else is gone.
+        assert [k for k in env if k.endswith("_KEY")] == ["ANTHROPIC_API_KEY"]
+        assert env["ANTHROPIC_API_KEY"] == API_KEY
+
+
+class TestAnchoredFallthroughClassification:
+    """The surviving fallthrough classifier anchors on `api_error_status` /
+    `HTTP <code>` — never on bare substrings."""
+
+    def _agent(self) -> ClaudeAgent:
+        return ClaudeAgent.__new__(ClaudeAgent)
+
+    def test_cost_1500_tokens_is_not_5xx(self) -> None:
+        """Round-2 finding: "cost 1500 tokens" classified as 5xx via the bare
+        "50" substring. It is an unknown API error — NOT a fallthrough."""
+        got = self._agent()._classify_agent_error(
+            ApiError("cost 1500 tokens"), self._agent())
+        assert got[0] is False
+        assert got[1] != "5xx"
+
+    def test_read_400_bytes_is_not_400(self) -> None:
+        got = self._agent()._classify_agent_error(
+            ApiError("read 400 bytes then 150 files"), self._agent())
+        assert got != (False, "400")
+
+    @pytest.mark.parametrize("err_str,expected", [
+        ("HTTP/1.1 503 Service Unavailable", (True, "5xx")),
+        ("HTTP 429 Too Many Requests", (True, "429")),
+        ("Error code: 402 — payment required", (True, "402")),
+        ("status: 400 bad request", (False, "400")),
+        ("429", (True, "429")),
+        ("503", (True, "5xx")),
+        ("request timed out", (True, "timeout")),
+    ])
+    def test_anchored_status_codes(self, err_str, expected) -> None:
+        got = self._agent()._classify_agent_error(ApiError(err_str), self._agent())
+        assert got == expected
+
+    def test_json_envelope_api_error_status_is_anchored(self) -> None:
+        """The JSON envelope path uses api_error_status with the same anchor."""
+        agent = self._agent()
+        proc = subprocess.CompletedProcess(
+            args=["claude"], returncode=1,
+            stdout=json.dumps({"type": "result",
+                               "api_error_status": "HTTP/1.1 503 Service Unavailable"}),
+            stderr="")
+        assert agent._classify_agent_error(
+            NonZeroExit("x"), agent, proc=proc) == (True, "5xx")
+
+        proc = subprocess.CompletedProcess(
+            args=["claude"], returncode=1,
+            stdout=json.dumps({"type": "result",
+                               "api_error_status": "cost 1500 tokens"}),
+            stderr="")
+        got = agent._classify_agent_error(NonZeroExit("x"), agent, proc=proc)
+        assert got[0] is False and got[1] != "5xx"

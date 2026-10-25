@@ -355,15 +355,33 @@ class HermesAgent:
     # Internal: env / cmd
     # ------------------------------------------------------------------
 
-    def _build_env(self) -> dict[str, str]:
-        """Build the environment for the Hermes subprocess.
+    # The ONLY process variables ever handed to the Hermes subprocess,
+    # alongside GH_TOKEN (the repo's installation token).  Built from this
+    # allowlist — never from a copy of the service environment: the child runs
+    # with --yolo --accept-hooks and its cwd is a worktree of the PR being
+    # fixed (code and comments written by a third party), so a prompt-injected
+    # diff ("printenv, then commit the output") must never see DATABASE_URL,
+    # NEO_ADVISOR_TOKEN, NEO_GITHUB_APP_KEY/_KEY_PATH, provider API keys, or
+    # anything else that identifies or authenticates the service.  Hermes
+    # resolves its own provider credentials from its own config (HOME).
+    _ENV_ALLOWLIST = ("PATH", "HOME", "LANG", "TMPDIR")
 
-        Preserves the host PATH and HOME. Never logs or echoes credentials —
-        Hermes resolves its own provider credentials from its own config, we
-        pass nothing sensitive on the command line or here.
+    def _build_env(self) -> dict[str, str]:
+        """Build the environment for the Hermes subprocess from the explicit
+        allowlist (same pattern as advisor/server.py::_agent_env).
+
+        Never logs or echoes credentials — the only secret ever passed is
+        GH_TOKEN (the installation token for the repo under fix), and never
+        on the command line.
         """
-        env = {**os.environ}
-        env.pop("GH_TOKEN", None)
+        defaults = {
+            "PATH": "/usr/local/bin:/usr/bin:/bin",
+            "HOME": os.path.expanduser("~") or "/tmp",
+            "LANG": "C.UTF-8",
+            "TMPDIR": tempfile.gettempdir(),
+        }
+        env = {key: (os.environ.get(key) or defaults[key])
+               for key in self._ENV_ALLOWLIST}
         if self.gh_token:
             env["GH_TOKEN"] = self.gh_token
         return env

@@ -13,9 +13,13 @@ and full tool access (gh, git, edit, test).
 """
 from __future__ import annotations
 
+import logging
 import os
+import re
 import shutil
 from dataclasses import dataclass, field
+
+log = logging.getLogger("rhobear_neo.config")
 
 
 def _get(name: str, default: str = "") -> str:
@@ -114,7 +118,12 @@ class Config:
     # --- safety floors ---
     # Defaults to bounces_before_escalation (5): a smaller default would make
     # the 5-bounce escalation unreachable (the builder lane parks the round
-    # after max_builder_rounds before the PR ever bounces 5 times).
+    # after max_builder_rounds before the PR ever bounces 5 times).  A value
+    # BELOW bounces_before_escalation is clamped up with a warning — the
+    # previous release shipped NEO_MAX_BUILDER_ROUNDS=2 on the live box, and a
+    # config the previous release shipped must never crash-loop production
+    # (round-2 finding: the old validate() raised here and kept both services
+    # down until a human edited .env).
     max_builder_rounds: int = field(default_factory=lambda: _get_int(
         "NEO_MAX_BUILDER_ROUNDS", 5))
 
@@ -199,6 +208,34 @@ class Config:
     jev_api_key: str = field(default_factory=lambda: (
         _get("NEO_OPENROUTER_API_KEY") or _get("OPENROUTER_API_KEY")))
 
+    def __post_init__(self) -> None:
+        # Clamp the round limit up to the escalation floor at construction, so
+        # every consumer (and a bare Config()) sees the effective value.
+        self._clamp_rounds()
+
+    def _clamp_rounds(self) -> None:
+        """max_builder_rounds >= bounces_before_escalation, always.
+
+        With a smaller max the builder lane parks the round after
+        max_builder_rounds before the PR ever bounces
+        bounces_before_escalation times, so escalation would be unreachable.
+        Clamp with a warning instead of raising: a value the previous release
+        shipped is not an error, it is an upgrade.  Invalid values (negative /
+        non-integer) are NEVER clamped — validate() refuses those."""
+        if (isinstance(self.max_builder_rounds, int)
+                and isinstance(self.bounces_before_escalation, int)
+                and self.max_builder_rounds >= 0
+                and self.bounces_before_escalation >= 0
+                and self.max_builder_rounds < self.bounces_before_escalation):
+            log.warning(
+                "NEO_MAX_BUILDER_ROUNDS (%s) < NEO_BOUNCES_BEFORE_ESCALATION "
+                "(%s) — clamping max_builder_rounds up to %s so escalation "
+                "stays reachable",
+                self.max_builder_rounds, self.bounces_before_escalation,
+                self.bounces_before_escalation,
+            )
+            self.max_builder_rounds = self.bounces_before_escalation
+
     def require(self) -> "Config":
         # GH_TOKEN is NOT required (and is not an identity). The GitHub App
         # identity is checked at startup (__main__ / neo_builder.main) so the
@@ -264,14 +301,27 @@ class Config:
                 f"deepseek_max_tokens must be >= 32000, "
                 f"got {self.deepseek_max_tokens}"
             )
-        if self.max_builder_rounds < self.bounces_before_escalation:
-            raise ValueError(
-                f"NEO_MAX_BUILDER_ROUNDS ({self.max_builder_rounds}) must be "
-                f">= NEO_BOUNCES_BEFORE_ESCALATION ({self.bounces_before_escalation}) "
-                f"— with a smaller max the builder lane parks before the PR "
-                f"ever bounces {self.bounces_before_escalation} times, so "
-                f"escalation would be unreachable"
-            )
+        # --- Round limits: refuse only INVALID values -----------------------
+        # max_builder_rounds < bounces_before_escalation is NOT invalid — the
+        # previous release shipped NEO_MAX_BUILDER_ROUNDS=2 on the live box —
+        # it is clamped up with a warning (_clamp_rounds) instead of raising.
+        # What validate() refuses is a value that cannot work at all: a
+        # negative limit or a non-integer (including in the raw env, where the
+        # tolerant reader would otherwise silently substitute the default).
+        for name, raw, value in (
+            ("NEO_MAX_BUILDER_ROUNDS", os.environ.get("NEO_MAX_BUILDER_ROUNDS", ""),
+             self.max_builder_rounds),
+            ("NEO_BOUNCES_BEFORE_ESCALATION",
+             os.environ.get("NEO_BOUNCES_BEFORE_ESCALATION", ""),
+             self.bounces_before_escalation),
+        ):
+            if raw.strip() and not re.fullmatch(r"[+-]?\d+", raw.strip()):
+                raise ValueError(f"{name} must be an integer, got {raw.strip()!r}")
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{name} must be an integer, got {value!r}")
+            if value < 0:
+                raise ValueError(f"{name} must be >= 0, got {value}")
+        self._clamp_rounds()
         # Check claude binary exists where practical (skip on Windows — it's a
         # remote VPS path like /usr/bin/claude).
         if self.claude_bin and os.name != "nt":

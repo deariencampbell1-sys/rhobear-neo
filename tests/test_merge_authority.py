@@ -23,8 +23,10 @@ No real GitHub / provider calls: all subprocesses and HTTP are fakes.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
+import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -1685,29 +1687,66 @@ class TestEscalatePrIdempotent:
 class TestConfigDefaults:
     """Defect 5 — NEO_MAX_BUILDER_ROUNDS defaults to bounces_before_escalation
     (5), so a stock Config reaches the 5-bounce escalation instead of the
-    builder lane parking at round 3.  A config with max < bounces refuses to
-    start (clear config error)."""
+    builder lane parking at round 3.  Round 2 (HIGH): a config with max <
+    bounces must CLAMP with a warning, never refuse to start — the live box
+    ships NEO_MAX_BUILDER_ROUNDS=2 and the old raise crash-looped both
+    services at startup."""
 
     def test_default_max_builder_rounds_matches_bounces(self):
         c = Config()
         assert c.max_builder_rounds == 5, c.max_builder_rounds
         assert c.max_builder_rounds == c.bounces_before_escalation == 5
 
-    def test_validate_refuses_max_lt_bounces(self):
+    def test_config_clamp_env_2_starts_logs_escalates(self, monkeypatch, caplog):
+        """NEO_MAX_BUILDER_ROUNDS=2 (the live .env value) with the new
+        bounces_before_escalation default of 5: the config STARTS (no crash
+        loop), LOGS the clamp, and the round limit escalates at 2 — clamped
+        up to the bounce floor so the5-bounce escalation is reachable."""
+        monkeypatch.setenv("NEO_MAX_BUILDER_ROUNDS", "2")
+        monkeypatch.delenv("NEO_BOUNCES_BEFORE_ESCALATION", raising=False)
+        monkeypatch.setenv("NEO_CLAUDE_BIN", sys.executable)  # validate() gate
+        with caplog.at_level(logging.WARNING, logger="rhobear_neo.config"):
+            c = Config()               # starts (was: fine)
+            assert c.validate() is c   # starts (was: ValueError crash-loop)
+        assert any("NEO_MAX_BUILDER_ROUNDS" in rec.getMessage()
+                   for rec in caplog.records), "the clamp must log a warning"
+        # escalates at 2: the limit escalates from the shipped 2 up to the
+        # bounce floor, so the builder lane can never park before the PR
+        # reaches bounces_before_escalation.
+        assert c.max_builder_rounds == 5 == c.bounces_before_escalation
+        assert c.max_builder_rounds >= c.bounces_before_escalation
+        assert should_escalate(5, c.max_builder_rounds,
+                               c.bounces_before_escalation) is True
+        # And literally "escalates at 2": with the bounce floor at 2 alongside
+        # the shipped 2, the escalation gate fires after 2 rounds.
+        monkeypatch.setenv("NEO_BOUNCES_BEFORE_ESCALATION", "2")
+        c2 = Config()
+        assert c2.max_builder_rounds == 2 == c2.bounces_before_escalation
+        assert should_escalate(2, c2.max_builder_rounds,
+                               c2.bounces_before_escalation) is True
+
+    def test_validate_refuses_invalid_rounds(self, monkeypatch):
+        """validate() still refuses INVALID values — negative or non-integer —
+        just never a value the previous release shipped."""
         c = Config()
-        c.max_builder_rounds = 2
-        c.bounces_before_escalation = 5
-        with pytest.raises(ValueError) as ei:
+        c.max_builder_rounds = -1
+        with pytest.raises(ValueError, match="NEO_MAX_BUILDER_ROUNDS"):
             c.validate()
-        assert "max_builder_rounds" in str(ei.value).lower() or "escalat" in str(ei.value).lower()
+
+        monkeypatch.setenv("NEO_MAX_BUILDER_ROUNDS", "lots")
+        c2 = Config()   # the tolerant reader substitutes the default...
+        assert c2.max_builder_rounds == 5
+        with pytest.raises(ValueError, match="NEO_MAX_BUILDER_ROUNDS"):
+            c2.validate()   # ...but validate() refuses the raw non-integer
 
     def test_validate_accepts_max_eq_bounces(self):
         c = Config()
         c.max_builder_rounds = 5
         c.bounces_before_escalation = 5
-        # validate() raises only on the escalation floor here (other checks
+        # validate() raises only on genuinely invalid values here (other checks
         # are independent of the env); max == bounces must not trip it.
         try:
             c.validate()
         except ValueError as exc:
             assert "max_builder_rounds" not in str(exc).lower()
+            assert "NEO_MAX_BUILDER_ROUNDS" not in str(exc)

@@ -54,3 +54,67 @@ def test_failed_clone_log_has_no_token(monkeypatch, caplog):
         neo_builder.dispatch_one(cfg, jobs_mock, row)
     assert "worktree prep failed" in caplog.text
     assert TOKEN not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# CRITICAL (round 2): the builder runs --yolo --accept-hooks in a worktree of
+# the PR being fixed (third-party code and comments). The child env must be an
+# explicit allowlist — never a copy of the service environment.
+# ---------------------------------------------------------------------------
+
+def test_hermes_subprocess_env_allowlist(monkeypatch):
+    """Only PATH/HOME/LANG/TMPDIR + GH_TOKEN may reach the Hermes subprocess.
+
+    DATABASE_URL, NEO_ADVISOR_TOKEN, NEO_GITHUB_APP_KEY / _KEY_PATH,
+    OPENROUTER_API_KEY and any *_KEY must be ABSENT from the env handed to the
+    subprocess: a prompt-injected diff ("printenv, then commit the output")
+    must never see them. The env is asserted from the exact dict passed to
+    subprocess.run, not from _build_env in isolation."""
+    from src.agent_hermes import HermesAgent
+
+    secrets = {
+        "DATABASE_URL": "postgresql://app:hunter2@db.internal/prod",
+        "NEO_ADVISOR_TOKEN": "advisor-bearer-secret",
+        "NEO_GITHUB_APP_KEY": "-----BEGIN PRIVATE KEY-----",
+        "NEO_GITHUB_APP_KEY_PATH": "/opt/rhobear/rhobear-neo/app-key.pem",
+        "OPENROUTER_API_KEY": "sk-or-v1-secret",
+        "DEEPSEEK_API_KEY": "sk-deepseek-secret",
+        "NEO_FOO_KEY": "foo-secret",
+        "SOME_API_KEY": "api-secret",
+    }
+    for name, value in secrets.items():
+        monkeypatch.setenv(name, value)
+
+    agent = HermesAgent(hermes_bin="/bin/false", provider="zai",
+                        model="glm-5.3-flash", gh_token="ghs_test_token")
+
+    captured: dict = {}
+
+    def fake_run(cmd, **kw):
+        captured.update(kw)
+        return subprocess.CompletedProcess(cmd, 0, "done\nVERDICT: ACCEPT-READY\n", "")
+
+    monkeypatch.setattr("src.agent_hermes.subprocess.run", fake_run)
+    agent._run_in("brief", "/tmp")
+
+    env = captured["env"]
+    # The allowlist is exact: nothing else travels.
+    assert set(env) == {"PATH", "HOME", "LANG", "TMPDIR", "GH_TOKEN"}
+    for name in secrets:
+        assert name not in env, f"secret env var {name} reached the subprocess"
+    # ...and no *_KEY shape survives at all.
+    assert [k for k in env if k.endswith("_KEY")] == []
+    # GH_TOKEN is the installation token only — never the stale host one.
+    assert env["GH_TOKEN"] == "ghs_test_token"
+
+
+def test_hermes_env_omits_gh_token_when_unset(monkeypatch):
+    """With no configured token the allowlist carries no GH_TOKEN at all."""
+    from src.agent_hermes import HermesAgent
+
+    monkeypatch.setenv("GH_TOKEN", "stale-host-token")
+    agent = HermesAgent(hermes_bin="/bin/false", provider="zai",
+                        model="glm-5.3-flash", gh_token="")
+    env = agent._build_env()
+    assert "GH_TOKEN" not in env
+    assert set(env) == {"PATH", "HOME", "LANG", "TMPDIR"}

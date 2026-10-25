@@ -480,6 +480,49 @@ _WORK_ORDER_TAG = re.compile(
     r"<\s*/?\s*neo-advisor-work-order\b", re.IGNORECASE
 )
 
+# --- Untrusted-egress redaction (advisor work order -> fixer brief) ---------
+# The advisor's summary / root_cause / steps are frontier-model output that MAY
+# echo secrets read from the host filesystem (the remaining filesystem
+# exposure is a known gap — see DEPLOY.md, W1-03 confines the advisor user to
+# the clone dir).  The fixer brief is the dangerous egress: it travels to a
+# write-capable agent that pushes commits.  Anything matching a secret SHAPE is
+# redacted before rendering.
+_SECRET_PATTERNS: tuple[tuple[re.Pattern, str], ...] = (
+    # PEM private-key blocks (whole block incl. the base64 body).
+    (re.compile(
+        r"-----BEGIN[^\n]*PRIVATE KEY-----"
+        r".*?"
+        r"-----END[^\n]*PRIVATE KEY-----",
+        re.DOTALL), "[REDACTED:PRIVATE KEY]"),
+    # A BEGIN with no END: swallow to end of text so no key material survives.
+    (re.compile(r"-----BEGIN[^\n]*PRIVATE KEY-----.*\Z", re.DOTALL),
+     "[REDACTED:PRIVATE KEY]"),
+    # GitHub tokens: ghs_/ghp_/gho_/ghu_/ghr_ … and fine-grained PATs.
+    (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{16,}\b"), "[REDACTED:GITHUB TOKEN]"),
+    (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{16,}\b"), "[REDACTED:GITHUB TOKEN]"),
+    # OpenAI / OpenRouter-style keys.
+    (re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"), "[REDACTED:API KEY]"),
+    # DSNs with credentials: scheme://user[:pass]@host… (postgresql://…@ …).
+    (re.compile(r"\b[a-z][a-z0-9+.-]*://[^\s/\"'@]*@[^\s\"']+", re.IGNORECASE),
+     "[REDACTED:DSN]"),
+    # 40-hex values in key context ("api_key: <40 hex>", "token=…").
+    (re.compile(
+        r"(?i)\b((?:api[_-]?)?key|token|secret|passwd|password|"
+        r"auth[_-]?token|access[_-]?token)\b"
+        r"(\s*[:=]\s*[\"']?|\s+(?:is|was)\s+)"
+        r"[0-9a-f]{40}\b"),
+     r"\1\2[REDACTED]"),
+)
+
+
+def _redact_secrets(text: str) -> str:
+    """Redact anything matching a secret shape from untrusted advisor output
+    (PEM private-key blocks, ghs_/ghp_/sk- tokens, credential-bearing DSNs,
+    40-hex values in key context) before it is rendered into the fixer brief."""
+    for pattern, replacement in _SECRET_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
 
 def _render_advisor_work_order(wo: dict) -> str:
     """Render an advisor work order as a fenced, neutralized data block.
@@ -488,7 +531,9 @@ def _render_advisor_work_order(wo: dict) -> str:
     the fence must not be able to put the rest of its text outside it — the
     fixer runs with --yolo and a push token, so this is a prompt-injection
     boundary.  Same trick as _fence_finding_body: insert a zero-width space
-    after `<` on any work-order tag occurrence.
+    after `<` on any work-order tag occurrence.  Secrets echoed by the
+    advisor (PEM blocks, tokens, DSNs, 40-hex keys) are redacted first:
+    this render is an untrusted-egress boundary.
     """
     wo_lines = [
         "=== ESCALATED ADVISOR WORK ORDER ===",
@@ -511,6 +556,7 @@ def _render_advisor_work_order(wo: dict) -> str:
         wo_lines.append("")
         wo_lines.append(f"Risks: {wo.get('risks')}")
     body = "\n".join(wo_lines).replace("\x00", "")
+    body = _redact_secrets(body)
     body = _WORK_ORDER_TAG.sub(
         lambda m: m.group(0).replace("<", "<​", 1), body,
     )

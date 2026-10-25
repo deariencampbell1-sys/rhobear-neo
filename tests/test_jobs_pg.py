@@ -1750,3 +1750,123 @@ class TestNoAssessmentPG:
         assert row2["state"] == "done"
         assert row2["outcome"] == "no_change"
         assert (row2.get("payload") or {}).get("outcome") == "no_assessment"
+
+
+# ---------------------------------------------------------------------------
+# Round 2 (HIGH) — the pre-B1 migration runs ONCE and a second
+# ensure_schema() is a no-op
+# ---------------------------------------------------------------------------
+
+_LEGACY_TABLE_SQL = """
+CREATE TABLE neo_jobs (
+    id             BIGSERIAL PRIMARY KEY,
+    kind           TEXT NOT NULL,
+    repo           TEXT NOT NULL,
+    pr_number      INTEGER NOT NULL,
+    head_sha       TEXT NOT NULL,
+    state          TEXT NOT NULL DEFAULT 'queued',
+    outcome        TEXT,
+    attempt        INTEGER NOT NULL DEFAULT 0,
+    max_attempts   INTEGER NOT NULL DEFAULT 3,
+    lease_expires  TIMESTAMPTZ,
+    payload        JSONB NOT NULL DEFAULT '{}',
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (repo, pr_number, head_sha)
+)
+"""
+
+_LEGACY_CONSTRAINT_LEFTOVERS = """
+SELECT count(*) FROM pg_constraint c
+  JOIN pg_class t ON t.oid = c.conrelid
+ WHERE t.relname = 'neo_jobs' AND c.contype = 'u'
+   AND array_length(c.conkey, 1) = 3
+   AND NOT EXISTS (
+       SELECT 1 FROM unnest(c.conkey) AS u(attno)
+       LEFT JOIN pg_attribute a
+              ON a.attrelid = c.conrelid AND a.attnum = u.attno
+        WHERE a.attname NOT IN ('repo', 'pr_number', 'head_sha'))
+"""
+
+
+def test_legacy_pre_b1_table_migrates_once():
+    """Build the PRE-B1 table shape (UNIQUE (repo, pr_number, head_sha),
+    pr_number NOT NULL, duplicate wake rows), run ensure_schema(), and assert:
+    the legacy constraint is gone, pr_number is nullable, the duplicates are
+    collapsed (newest wins), and a wake+builder pair for one SHA BOTH survive
+    the deletes.  Then a second ensure_schema() must be a no-op — the
+    destructive migration must never run again (poison MIGRATION + a
+    builder_round=0 sentinel that the migration's UPDATE would bump)."""
+    SHA3, SHA4 = "c" * 40, "d" * 40
+    with psycopg.connect(DSN, autocommit=True) as c:
+        c.execute("DROP TABLE IF EXISTS neo_jobs")
+        c.execute("DROP TABLE IF EXISTS neo_schema_version")
+        c.execute(_LEGACY_TABLE_SQL)
+        # Two wake rows for ONE (repo, head_sha): distinct under the OLD key
+        # (pr_number differs), duplicates under the NEW key — the real
+        # pre-B1 collision the migration collapses.
+        c.execute("INSERT INTO neo_jobs (kind, repo, pr_number, head_sha) "
+                  "VALUES ('wake', 'o/legacy', 5, %s)", (SHA1,))
+        c.execute("INSERT INTO neo_jobs (kind, repo, pr_number, head_sha) "
+                  "VALUES ('wake', 'o/legacy', 6, %s)", (SHA1,))
+        # A builder row for the SAME head SHA as those wakes — a wake+builder
+        # pair for one SHA (kind is not in the legacy key; distinct triples
+        # fit, and both rows must survive the collapse).
+        c.execute("INSERT INTO neo_jobs (kind, repo, pr_number, head_sha) "
+                  "VALUES ('builder', 'o/legacy', 7, %s)", (SHA1,))
+        c.execute("INSERT INTO neo_jobs (kind, repo, pr_number, head_sha) "
+                  "VALUES ('builder', 'o/legacy', 5, %s)", (SHA2,))
+        # Builder duplicates under the new (repo, pr, round) key.
+        c.execute("INSERT INTO neo_jobs (kind, repo, pr_number, head_sha) "
+                  "VALUES ('builder', 'o/legacy', 8, %s)", (SHA3,))
+        c.execute("INSERT INTO neo_jobs (kind, repo, pr_number, head_sha) "
+                  "VALUES ('builder', 'o/legacy', 8, %s)", (SHA4,))
+
+    Jobs(DSN).ensure_schema()   # the migration runs HERE — exactly once
+
+    with psycopg.connect(DSN, autocommit=True) as c:
+        # (1) the legacy UNIQUE (repo, pr_number, head_sha) constraint is gone
+        assert c.execute(_LEGACY_CONSTRAINT_LEFTOVERS).fetchone()[0] == 0
+
+        # (3) duplicates collapsed — newest wake for (repo, sha) wins (pr 6),
+        #     newest builder for (repo, pr 8, round 1) wins (SHA4).
+        wakes = c.execute("SELECT pr_number FROM neo_jobs WHERE kind='wake' "
+                          "ORDER BY pr_number").fetchall()
+        assert [r[0] for r in wakes] == [6], "duplicate wakes must collapse to the newest"
+        builders = c.execute("SELECT pr_number, head_sha FROM neo_jobs "
+                             "WHERE kind='builder' ORDER BY pr_number").fetchall()
+        assert [(r[0], r[1]) for r in builders] == [(5, SHA2), (7, SHA1), (8, SHA4)]
+
+        # (4) a wake+builder pair for one SHA both survive the deletes
+        pair = c.execute("SELECT kind FROM neo_jobs WHERE head_sha=%s "
+                         "ORDER BY kind", (SHA1,)).fetchall()
+        assert [r[0] for r in pair] == ["builder", "wake"]
+
+    # (2) pr_number is nullable (a `status` wake has no PR until resolve_pr)
+    with psycopg.connect(DSN, autocommit=True) as c:
+        c.execute("INSERT INTO neo_jobs (kind, repo, pr_number, head_sha, wake_color) "
+                  "VALUES ('wake', 'o/legacy', NULL, %s, true)", ("e" * 40,))
+        # ...and the legacy key is truly gone: a wake AND a builder for the
+        # exact same (repo, pr_number, head_sha) now coexist.
+        c.execute("INSERT INTO neo_jobs (kind, repo, pr_number, head_sha) "
+                  "VALUES ('wake', 'o/legacy', 5, %s)", ("f" * 40,))
+        c.execute("INSERT INTO neo_jobs (kind, repo, pr_number, head_sha) "
+                  "VALUES ('builder', 'o/legacy', 5, %s)", ("f" * 40,))
+        both = c.execute("SELECT kind FROM neo_jobs WHERE head_sha=%s "
+                         "ORDER BY kind", ("f" * 40,)).fetchall()
+        assert [r[0] for r in both] == ["builder", "wake"]
+
+    # (5) second call is a no-op: the migration must not run again.  The
+    # poison SQL raises if touched; the builder_round=0 sentinel would be
+    # bumped to 1 by MIGRATION's UPDATE if it re-ran.
+    with psycopg.connect(DSN, autocommit=True) as c:
+        c.execute("INSERT INTO neo_jobs (kind, repo, pr_number, head_sha, builder_round) "
+                  "VALUES ('builder', 'o/legacy', 9, %s, 0)", ("9" * 40,))
+        before = c.execute("SELECT count(*) FROM neo_jobs").fetchone()[0]
+    with patch("src.jobs.MIGRATION", "SELECT migration_must_not_run()"):
+        Jobs(DSN).ensure_schema()
+    with psycopg.connect(DSN, autocommit=True) as c:
+        assert c.execute("SELECT count(*) FROM neo_jobs").fetchone()[0] == before
+        assert c.execute("SELECT builder_round FROM neo_jobs "
+                         "WHERE pr_number=9").fetchone()[0] == 0
+        c.execute("DELETE FROM neo_jobs")

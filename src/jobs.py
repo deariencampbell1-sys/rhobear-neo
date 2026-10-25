@@ -28,6 +28,14 @@ table that still has the old `UNIQUE (repo, pr_number, head_sha)` constraint
 or a NOT NULL `pr_number`, upgrades it in place (CREATE TABLE IF NOT EXISTS
 alone would never change a constraint).  There is ONE schema definition,
 here; `neo_state` no longer defines `neo_jobs`.
+
+The in-place migration is DESTRUCTIVE (ALTER TABLE … DROP NOT NULL, a
+constraint-discovery DO block, two DELETE … USING self-joins), so it is
+gated on a `neo_schema_version` row: it runs exactly ONCE — the first boot
+after the upgrade — and never again.  The whole schema step is serialized
+across services with `pg_advisory_lock`, so two services booting together
+(the webhook is writing wakes meanwhile) can never run the migration
+concurrently; the loser waits and then sees the version row and skips.
 """
 from __future__ import annotations
 
@@ -104,7 +112,30 @@ CREATE INDEX IF NOT EXISTS neo_jobs_expired ON neo_jobs (lease_expires)
     WHERE state = 'running';
 """
 
-# Applied to an already-deployed table that predates the key redesign.
+# Schema version of the neo_jobs table:
+#   1 = pre-B1 legacy shape (UNIQUE (repo, pr_number, head_sha),
+#       pr_number NOT NULL, no wake_color/builder_round/worker_token/
+#       submitted_at columns) — implicit, no version row was ever written.
+#   2 = B1 key redesign (see MIGRATION below).
+SCHEMA_VERSION = 2
+
+# Version bookkeeping for the gate.  Tiny, append-only, created alongside
+# the job table; one row per migrated object.
+VERSION_TABLE = """
+CREATE TABLE IF NOT EXISTS neo_schema_version (
+    name       TEXT PRIMARY KEY,
+    version    INTEGER NOT NULL,
+    applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+"""
+
+# "neo_jobs" as a bigint — serializes ensure_schema() across services.
+_ADVISORY_LOCK_KEY = 0x6E656F5F6A6F6273
+
+# Applied ONCE to an already-deployed table that predates the key redesign.
+# Gated on the neo_schema_version row (see ensure_schema): re-running it on
+# an already-migrated table would delete rows and rewrite constraints on
+# every boot.
 MIGRATION = """
 -- pr_number becomes nullable: a `status` wake has no PR until resolve_pr.
 ALTER TABLE neo_jobs ALTER COLUMN pr_number DROP NOT NULL;
@@ -178,11 +209,35 @@ class Jobs:
     def ensure_schema(self) -> None:
         """Create the table if absent, then migrate an existing table in place
         (drop the legacy constraint, make pr_number nullable, add key columns,
-        rebuild the unique indexes). Idempotent."""
+        rebuild the unique indexes) — EXACTLY ONCE.
+
+        The migration is gated on the `neo_schema_version` row: when the row
+        already records SCHEMA_VERSION the migration is skipped entirely, so a
+        second call is a no-op (no ALTER, no constraint drop, no DELETE).  The
+        whole step runs under `pg_advisory_lock`, so two services booting
+        together serialize instead of fighting over ACCESS EXCLUSIVE on
+        neo_jobs while the webhook writes wakes."""
         with self._conn() as c:
-            c.execute(SCHEMA)      # CREATE TABLE IF NOT EXISTS (no-op if present)
-            c.execute(MIGRATION)   # in-place upgrade of an old table
-            c.execute(INDEXES)     # unique + btree indexes (need new columns)
+            c.execute("SELECT pg_advisory_lock(%s)", (_ADVISORY_LOCK_KEY,))
+            try:
+                c.execute(SCHEMA)          # CREATE TABLE IF NOT EXISTS
+                c.execute(VERSION_TABLE)   # version bookkeeping for the gate
+                row = c.execute(
+                    "SELECT version FROM neo_schema_version WHERE name = %s",
+                    ("neo_jobs",),
+                ).fetchone()
+                current = int(row[0]) if row else 0
+                if current < SCHEMA_VERSION:
+                    c.execute(MIGRATION)   # destructive — once, here, under lock
+                    c.execute(INDEXES)     # unique + btree indexes (need new columns)
+                    c.execute(
+                        "INSERT INTO neo_schema_version (name, version) VALUES (%s, %s) "
+                        "ON CONFLICT (name) DO UPDATE SET "
+                        "  version = EXCLUDED.version, applied_at = now()",
+                        ("neo_jobs", SCHEMA_VERSION),
+                    )
+            finally:
+                c.execute("SELECT pg_advisory_unlock(%s)", (_ADVISORY_LOCK_KEY,))
 
     # ------------------------------------------------------------------
     # Create (dedupe on OUTCOME)
