@@ -73,7 +73,8 @@ class NeoDispatcher:
                 return DispatchOutcome(204, f"status pending ({context})")
             # "architect/<lane>" is a lane architect accepting an exact head; it wakes the lane
             # gate only and is never review evidence (neo_worker.run_lane_gate checks its author).
-            if not self._trusted(context) and not context.startswith("architect/"):
+            if not self._trusted(context) and not context.startswith("architect/") \
+                    and context != "l0/drift":   # L0 drift check turning green wakes the lane gate too
                 return DispatchOutcome(204, f"untrusted status context={context!r}")
             # A commit status carries no PR number — resolve via the head SHA.
             self.on_verdict({

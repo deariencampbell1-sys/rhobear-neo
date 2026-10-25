@@ -122,3 +122,20 @@ def test_architect_status_wakes_neo_but_other_untrusted_contexts_do_not():
     assert d.dispatch("status", {**payload, "context": "architect/l3-kit"}).code == 200
     assert d.dispatch("status", {**payload, "context": "ci/random"}).code == 204
     assert [w["context"] for w in wakes] == ["architect/l3-kit"]
+
+
+def test_drift_gate_needs_a_green_l0_drift_on_this_head():
+    """SPRINT section 9: with require_drift, a failing or missing l0/drift holds the merge."""
+    drift_ok = {"context": "l0/drift", "state": "success", "creator": {"login": OWNER}}
+    drift_bad = {"context": "l0/drift", "state": "failure", "description": "2 hard", "creator": {"login": OWNER}}
+    ok, _ = neo_worker.lane_merge_authority(True, evidence(), "l3-kit", [drift_ok, architect()], [], OWNER,
+                                            require_drift=True)
+    assert ok
+    ok, reason = neo_worker.lane_merge_authority(True, evidence(), "l3-kit", [architect()], [], OWNER,
+                                                 require_drift=True)
+    assert not ok and "waiting for L0" in reason
+    ok, reason = neo_worker.lane_merge_authority(True, evidence(), "l3-kit", [drift_bad, architect()], [], OWNER,
+                                                 require_drift=True)
+    assert not ok and "fails" in reason
+    ok, _ = neo_worker.lane_merge_authority(True, evidence(), "l3-kit", [architect()], [], OWNER)
+    assert ok   # switch off: unchanged behaviour

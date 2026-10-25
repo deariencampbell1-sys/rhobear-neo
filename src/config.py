@@ -131,6 +131,8 @@ class Config:
     # Lane PRs (l<n>-<lane>/...) merge on Apollo's pass plus the lane architect's acceptance of the exact
     # head (lane_merge_authority), independent of the install switch above (L0, 2026-10-25).
     lane_merge: bool = field(default_factory=lambda: _get_bool("NEO_LANE_MERGE", False))
+    # Lane PRs also need L0's drift check (status l0/drift) green on the exact head (SPRINT section 9).
+    lane_require_drift: bool = field(default_factory=lambda: _get_bool("NEO_LANE_REQUIRE_DRIFT", False))
 
     # --- safety floors ---
     max_builder_rounds: int = field(default_factory=lambda: _get_int("NEO_MAX_BUILDER_ROUNDS", 2))
