@@ -732,8 +732,17 @@ def dispatch_one(cfg: Config, jobs: Jobs, row: dict) -> None:
     log.info("dispatched: %s#%s round=%s worktree=%s branch=%s",
              repo, pr, round_, worktree, head_branch)
 
-    rc, head_before = gh(token, "api", f"repos/{repo}/pulls/{pr}", "--jq", ".head.sha")
-    head_before = (head_before or "").strip()
+    head_rc, head_raw = gh(token, "api", f"repos/{repo}/pulls/{pr}",
+                           "--jq", ".head.sha")
+    head_before = (head_raw or "").strip()
+    if head_rc != 0 or not re.fullmatch(r"[0-9a-f]{40}", head_before):
+        # A failed `gh` returns its stderr text in place of the SHA; comparing
+        # that to head_after would record pushed=True with nothing pushed.
+        # Leave the job running: lease recovery re-dispatches the round
+        # (mirrors the post-run head read below).
+        log.warning("head read failed for %s#%s rc=%s before=%r — job stays "
+                    "running for lease recovery", repo, pr, head_rc, head_before)
+        return
 
     # Build the agent with the route chain.
     from .usage import available_routes as _avail, UsageStore
@@ -808,13 +817,9 @@ def dispatch_one(cfg: Config, jobs: Jobs, row: dict) -> None:
                     "running for lease recovery", repo, pr, head_rc, head_after)
         return
     # A push is the real outcome signal (more reliable than the advisory
-    # verdict); it re-arms reviewer + Neo immediately.
-    if head_before and head_after:
-        pushed = head_after != head_before
-    else:
-        # Couldn't read the PR head BEFORE the run — can't confirm a push.
-        log.warning("head read failed for %s#%s before=%r after=%r", repo, pr, head_before, head_after)
-        pushed = False
+    # verdict); it re-arms reviewer + Neo immediately.  Both heads are
+    # validated 40-hex SHAs at this point, so a comparison is meaningful.
+    pushed = head_after != head_before
     log.info("fixer round outcome %s#%s pushed=%s head=%s->%s (loop auto-armed: reviewer+neo re-fire on push)",
              repo, pr, pushed, head_before[:8], head_after[:8])
     if pushed:

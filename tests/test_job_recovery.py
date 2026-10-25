@@ -144,7 +144,8 @@ class TestJobLifecycle:
             # is not installed on (never retried).
             assert j.resolve(42, "no_installation") is True
             for bad in ("failed", "retry", ""):
-                with pytest.raises(AssertionError):
+                # A real check, not an assert (asserts vanish under python -O).
+                with pytest.raises(ValueError):
                     j.resolve(42, bad)
             assert TERMINAL_OUTCOMES == (
                 "done", "no_change", "no_installation", "superseded", "parked")
@@ -942,3 +943,50 @@ class TestHeadReadAfterRun:
         jobs.resolve.assert_called_once()
         assert jobs.resolve.call_args[0][1] == "done"
         assert jobs.resolve.call_args[1]["payload"]["outcome"] == "pushed"
+
+
+# ---------------------------------------------------------------------------
+# MEDIUM — a failed head read BEFORE the run is not a push
+# ---------------------------------------------------------------------------
+
+class TestHeadReadBeforeRun:
+    """gh failure on the pre-run head read returns stderr, not a SHA.  The
+    round must not run the agent or resolve pushed=True; the job stays running
+    for lease recovery (mirrors the post-run read handling)."""
+
+    def _dispatch(self, before_response, tmp_path):
+        from src.config import Config
+        cfg = Config()
+        cfg.max_builder_rounds = 3
+        cfg.gh_token = "t"
+        jobs = MagicMock(spec=Jobs)
+        row = {"id": 1, "repo": "o/r", "pr_number": 5, "head_sha": "a" * 40,
+               "builder_round": 1, "attempt": 1}
+
+        def fake_gh(*a, **kw):
+            return before_response
+
+        agent_run = MagicMock(return_value=({"input_tokens": 0}, "FIXED"))
+        with patch("src.neo_builder.pr_state", return_value="OPEN\tmain"), \
+             patch("src.neo_builder.prepare_worktree",
+                   return_value=("/tmp/wt", "main")), \
+             patch("src.neo_builder.head_moved", return_value=None), \
+             patch("src.neo_builder.fetch_findings",
+                   return_value=('{"findings": []}', None)), \
+             patch("src.neo_builder.gh", side_effect=fake_gh), \
+             patch("src.neo_builder.BRIEFS", tmp_path / "briefs"), \
+             patch.object(BuilderAgent, "run", agent_run):
+            dispatch_one(cfg, jobs, row)
+        return jobs, agent_run
+
+    def test_gh_failure_before_run_leaves_job_running(self, tmp_path):
+        jobs, agent_run = self._dispatch((1, "transient gh failure"), tmp_path)
+        jobs.resolve.assert_not_called()
+        jobs.retry.assert_not_called()
+        agent_run.assert_not_called()
+
+    def test_garbage_head_before_run_leaves_job_running(self, tmp_path):
+        jobs, agent_run = self._dispatch((0, "not-a-sha"), tmp_path)
+        jobs.resolve.assert_not_called()
+        jobs.retry.assert_not_called()
+        agent_run.assert_not_called()

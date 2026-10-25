@@ -34,7 +34,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from src.config import Config
-from src.merge_executor import merge, HeadMoved, MergeDenied, MergeError
+from src.merge_executor import (
+    merge, HeadMoved, MergeDenied, MergeError, MergeFailed,
+)
 from src.review_evidence import build_evidence, merge_authority, evidence_brief
 from src.escalation import (
     RoundRecord, WorkOrder, should_escalate, escalate_pr, submit_escalation,
@@ -518,6 +520,33 @@ class TestMergeExecutor:
         evidence = {"ok": True, "head_sha": SHA1, "decided_sha": SHA1}
         with patch("src.merge_executor._gh", side_effect=fake_gh):
             with pytest.raises(HeadMoved):
+                merge("acme/a", 1, SHA1, evidence, "test-token")
+
+    def test_head_read_timeout_becomes_merge_failed(self):
+        """A hung `gh pr view` raises TimeoutExpired inside _gh; merge() must
+        convert it to MergeFailed so run_neo's handlers see a MergeError
+        instead of a job that stays running until lease recovery."""
+        evidence = {"ok": True, "head_sha": SHA1, "decided_sha": SHA1}
+        with patch("src.merge_executor._gh",
+                   side_effect=subprocess.TimeoutExpired(cmd="gh", timeout=45)):
+            with pytest.raises(MergeFailed):
+                merge("acme/a", 1, SHA1, evidence, "test-token")
+
+    def test_merge_api_timeout_becomes_merge_failed(self):
+        """A hung merge API call raises TimeoutExpired inside _gh; merge()
+        must convert it to MergeFailed."""
+        def fake_gh(token, *args, **kw):
+            if args[:3] == ("pr", "view", "1"):
+                return 0, json.dumps({"headRefOid": SHA1, "state": "OPEN",
+                                      "mergeable": "MERGEABLE",
+                                      "headRefName": "topic-branch"})
+            if args[0] == "api" and args[3] == "repos/acme/a/pulls/1/merge":
+                raise subprocess.TimeoutExpired(cmd="gh", timeout=60)
+            raise AssertionError(f"unexpected call: {args}")
+
+        evidence = {"ok": True, "head_sha": SHA1, "decided_sha": SHA1}
+        with patch("src.merge_executor._gh", side_effect=fake_gh):
+            with pytest.raises(MergeFailed):
                 merge("acme/a", 1, SHA1, evidence, "test-token")
 
 

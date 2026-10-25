@@ -67,18 +67,33 @@ def resolve_pr(token: str, repo: str, sha: str, given: int | None) -> int | None
         return None
 
 
-def credits_for(usage: dict, builder: bool) -> int:
+def credits_for(usage: dict | None, builder: bool) -> int:
     """Gemini-baseline credits from the agent's reported usage.
 
     Accepts either the raw agent usage dict (with input_tokens/output_tokens/
     cache_read_input_tokens) or a summed usage dict (with uncached_input/
     cached_input/output_tokens/reasoning_tokens).  Falls back gracefully
     for both formats.
+
+    `usage=None` means the agent reported no usage data: charge 0.  Token
+    counts coalesce on None only — 0 is a real count, never missing
+    (defect 9).
     """
+    usage = usage or {}
     # Support both raw agent format and summed usage format.
-    fin = usage.get("input_tokens", 0) or usage.get("uncached_input", 0) or 0
-    fout = usage.get("output_tokens", 0) or 0
-    cread = usage.get("cache_read_input_tokens", 0) or usage.get("cached_input", 0) or 0
+    fin = usage.get("input_tokens")
+    if fin is None:
+        fin = usage.get("uncached_input")
+    if fin is None:
+        fin = 0
+    fout = usage.get("output_tokens")
+    if fout is None:
+        fout = 0
+    cread = usage.get("cache_read_input_tokens")
+    if cread is None:
+        cread = usage.get("cached_input")
+    if cread is None:
+        cread = 0
     if builder:
         cost = fin * GEMINI["pro_in"] + cread * GEMINI["pro_cache"] + fout * GEMINI["pro_out"]
     else:
@@ -592,9 +607,13 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict,
         return
 
     # --- B2: Merge executor (deterministic, not agent) --------------------
-    # The agent NEVER holds merge credentials.  On ACCEPT/ACCEPT-MERGED we
-    # call merge_executor.merge() which re-reads the head, checks evidence,
-    # and merges with expected SHA.
+    # This is the only merge path in Neo: on ACCEPT/ACCEPT-MERGED we call
+    # merge_executor.merge(), which re-reads the head, re-checks evidence, and
+    # merges with the expected SHA.  The agent is instructed never to merge and
+    # never receives a personal token, but its repo-scoped installation token
+    # (Contents: write, needed for fix-forward pushes) is technically capable
+    # of merging — branch protection (required review + required checks) is
+    # the enforced boundary, not the credential scope.  See DEPLOY.md.
     verdict_base = verdict.split()[0] if verdict else ""
     is_accept = verdict_base in ("ACCEPT", "ACCEPT-MERGED", "ACCEPT-READY")
     is_builder = verdict_base == "BOUNCE-BUILDER"

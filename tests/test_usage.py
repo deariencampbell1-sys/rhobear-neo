@@ -463,7 +463,27 @@ class TestCreditsForBackwardCompat:
         """Zero usage yields zero credits."""
         assert credits_for({"input_tokens": 0, "output_tokens": 0}, builder=False) == 0
         assert credits_for({}, builder=False) == 0
-        assert credits_for(None, builder=False) == 0 if isinstance(None, dict) else True
+
+    def test_credits_none_usage_is_zero(self):
+        """usage=None is the explicit no-usage contract: charge 0, never raise."""
+        assert credits_for(None, builder=False) == 0
+        assert credits_for(None, builder=True) == 0
+
+    def test_zero_token_count_is_real_not_missing(self):
+        """Defect 9: 0 is a real token count — never coalesce through `or` to
+        the other usage format's key."""
+        # input_tokens=0 must not fall through to uncached_input=1000.
+        assert credits_for(
+            {"input_tokens": 0, "uncached_input": 1000, "output_tokens": 0},
+            builder=False,
+        ) == 0
+        # cache_read_input_tokens=0 must not fall through to cached_input=500:
+        # Pro = 1000*2.00/1e6 + 100*12.00/1e6 = 0.0032 * 1.26 * 100000 = 403.
+        assert credits_for(
+            {"input_tokens": 1000, "output_tokens": 100,
+             "cache_read_input_tokens": 0, "cached_input": 500},
+            builder=True,
+        ) == 403
 
     def test_missing_keys_default_to_zero(self):
         """Missing keys in usage dict default to 0."""

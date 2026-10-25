@@ -28,6 +28,28 @@ NEO_GITHUB_APP_KEY_PATH=/opt/rhobear/rhobear-neo/app-key.pem   # or NEO_GITHUB_A
 The integrator verifies against the real App at deploy, after the owner rotates
 this App's keys.
 
+## Branch protection (REQUIRED)
+
+`main` MUST have branch protection configured with:
+
+- **Required pull-request review** — the reviewer's check is the gate.
+- **Required status checks** — the trusted reviewer/CI checks must be green
+  before merge.
+
+This is the enforced boundary against agent-initiated merges. The triage and
+fix-forward agents are instructed never to merge and never receive a personal
+token, but they do hold a repo-scoped installation token (Contents: write is
+required for fix-forward pushes). GitHub's "Merge a pull request" endpoint also
+requires only Contents: write, so that token is technically capable of merging.
+The agent-side guarantee is therefore procedural, not a hard credential
+boundary; do not weaken branch protection on the grounds that agents "cannot"
+merge.
+
+Neo's merge executor (`src/merge_executor.py`) is the only code path in the
+service that calls the merge API. It already re-validates the evidence and
+re-reads the PR head immediately before merging with `sha=expected_sha` — but
+branch protection is what stops a prompt-injected agent from bypassing it.
+
 ## Claude Code CLI migration (wave0-neo bounce 1, 2026-08-09) — history only
 
 The old Pi/direct-DeepSeek path and direct-HTTP OpenRouterClient are both gone.

@@ -377,7 +377,8 @@ class Jobs:
         """Terminal resolution of a RUNNING job.  Only the current claimant
         (matching worker_token) may resolve.  `failed` is NOT allowed here —
         use retry() for a retryable failure."""
-        assert outcome in TERMINAL_OUTCOMES, outcome
+        if outcome not in TERMINAL_OUTCOMES:
+            raise ValueError(outcome)
         token_cond, token_params = _token_where(worker_token)
         with self._conn() as c:
             cur = c.execute(

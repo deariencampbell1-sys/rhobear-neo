@@ -91,6 +91,30 @@ def _check_cli(engine: str) -> bool:
         return False
 
 
+_AGENT_ENV_KEYS = ("PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR")
+
+
+def _agent_env() -> dict[str, str]:
+    """A minimal environment for the frontier agent subprocess.
+
+    The brief embeds PR-derived text (diff stat, prior-round findings), so a
+    prompt-injected PR could ask the agent to read /proc/self/environ.  Pass
+    only non-secret process basics — never NEO_*, GH_TOKEN, GITHUB_*,
+    DEEPSEEK_*, ANTHROPIC_*, OPENROUTER_*, or any *_KEY/*_TOKEN variable.
+    The CLI resolves its own provider credentials from HOME/config.
+    """
+    defaults = {
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+        "HOME": os.path.expanduser("~") or "/tmp",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "TERM": "dumb",
+        "TMPDIR": tempfile.gettempdir(),
+    }
+    return {key: (os.environ.get(key) or defaults[key])
+            for key in _AGENT_ENV_KEYS}
+
+
 def _run_agent(engine: str, params: dict, brief: str, timeout: int = 1200,
                cwd: str | None = None) -> str:
     """Run a read-only frontier agent and return its raw output.
@@ -127,6 +151,7 @@ def _run_agent(engine: str, params: dict, brief: str, timeout: int = 1200,
             capture_output=True, text=True,
             timeout=timeout,
             cwd=cwd,
+            env=_agent_env(),
         )
     except subprocess.TimeoutExpired:
         raise AgentFailed(f"agent timed out after {timeout}s")

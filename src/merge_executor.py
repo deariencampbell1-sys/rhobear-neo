@@ -1,7 +1,6 @@
-"""Deterministic merge executor — the ONLY code path that merges a PR.
+"""Deterministic merge executor — the only merge path in the Neo service.
 
-The agent never holds merge credentials or runs `gh pr merge`.  When the agent
-returns ACCEPT, the worker calls `merge()` here, which:
+When the agent returns ACCEPT, the worker calls `merge()` here, which:
 
   1. Re-reads the PR head immediately before merging.
   2. Refuses if the head moved (expected_sha mismatch).
@@ -10,13 +9,24 @@ returns ACCEPT, the worker calls `merge()` here, which:
   4. Uses the installation token (B1g's github_app).
   5. Records `merged` with the SHA.
 
-This is the ONLY code path that can merge a PR.  No agent prompt, no other
-function, no other subprocess call may invoke `gh pr merge`.
+`merge()` is the ONLY code path in the Neo service that calls the merge API.
+No agent prompt, no other function, no other subprocess call in Neo may invoke
+`gh pr merge`.
+
+The triage/fix-forward agent is instructed never to merge and never receives a
+personal token, but it does hold a repo-scoped installation token (it needs
+Contents: write to push fix-forward commits).  GitHub's "Merge a pull request"
+endpoint requires only Contents: write, so that token is technically capable
+of merging.  The agent-side guarantee is therefore procedural, not a hard
+credential boundary.  The enforced boundary against agent-initiated merges is
+branch protection on the protected branch: required pull-request review (the
+reviewer's check) + required status checks.  See DEPLOY.md.
 """
 from __future__ import annotations
 
 import json
 import logging
+import subprocess
 
 log = logging.getLogger("rhobear_neo.merge")
 
@@ -39,12 +49,8 @@ class MergeFailed(MergeError):
 
 def _gh(token: str, *args: str, timeout: int = 30) -> tuple[int, str]:
     """Run `gh` as the repo's installation token (never a personal token)."""
-    import subprocess
     import os
     env = {**os.environ, "GH_TOKEN": token}
-    # Remove any stale personal token from the process env.
-    env.pop("GH_TOKEN", None)
-    env["GH_TOKEN"] = token
     p = subprocess.run(
         ["gh", *args], capture_output=True, text=True, env=env, timeout=timeout
     )
@@ -75,16 +81,25 @@ def merge(
 
     Returns `{"merged": True, "sha": <head_sha>}` on success.
 
-    Raises MergeError subclasses on failure.  This is the ONLY code path that
-    merges; no agent prompt runs `gh pr merge`.
+    Raises MergeError subclasses on failure.  This is the only code path in
+    the Neo service that merges; no agent prompt runs `gh pr merge`.  (The
+    agent's repo-scoped installation token is technically capable of merging
+    because GitHub requires Contents: write for merge — branch protection is
+    the enforced boundary.  See DEPLOY.md.)
     """
     # --- Step 1: Re-read the PR head ---------------------------------------
-    rc, raw = _gh(
-        token,
-        "pr", "view", str(pr), "-R", repo,
-        "--json", "headRefOid,state,mergeable,headRefName,isCrossRepository",
-        timeout=45,
-    )
+    try:
+        rc, raw = _gh(
+            token,
+            "pr", "view", str(pr), "-R", repo,
+            "--json", "headRefOid,state,mergeable,headRefName,isCrossRepository",
+            timeout=45,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # A hung `gh` must become a MergeError, not escape run_neo's handlers
+        # (the wake job would otherwise stay running and lease recovery would
+        # re-run triage).
+        raise MergeFailed(f"timed out reading PR {repo}#{pr} head") from exc
     if rc != 0:
         raise MergeFailed(f"cannot read PR {repo}#{pr}: {raw[:200]}")
 
@@ -126,7 +141,10 @@ def merge(
         "-f", "merge_method=squash",
         "-f", f"sha={expected_sha}",
     ]
-    rc, out = _gh(token, *merge_args, timeout=60)
+    try:
+        rc, out = _gh(token, *merge_args, timeout=60)
+    except subprocess.TimeoutExpired as exc:
+        raise MergeFailed(f"merge API call timed out for {repo}#{pr}") from exc
 
     if rc != 0:
         error_msg = out[:300] if out else "unknown error"

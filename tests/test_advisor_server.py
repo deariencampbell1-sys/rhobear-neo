@@ -8,12 +8,13 @@ from __future__ import annotations
 
 import io
 import json
+import subprocess
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from advisor.server import AdvisorRequestHandler, MAX_BODY_BYTES
+from advisor.server import AdvisorRequestHandler, MAX_BODY_BYTES, _run_agent
 
 TOKEN = "advisor-token"
 SHA = "a" * 40
@@ -176,3 +177,42 @@ def test_body_at_limit_is_read_and_parsed():
                  service=service)
     h.do_POST()
     assert h.replies == [(202, {"advice_id": "advice-limit"})]
+
+
+# ---------------------------------------------------------------------------
+# HIGH — the frontier agent must not inherit service secrets
+# ---------------------------------------------------------------------------
+
+_ALLOWED_AGENT_ENV = {"PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR"}
+_FORBIDDEN_AGENT_ENV = (
+    "NEO_ADVISOR_TOKEN", "NEO_GITHUB_APP_KEY", "GH_TOKEN", "GITHUB_TOKEN",
+    "DEEPSEEK_API_KEY", "ANTHROPIC_API_KEY", "OPENROUTER_API_KEY",
+)
+
+
+def test_run_agent_env_is_scrubbed(monkeypatch):
+    """The child env is an explicit allowlist: a prompt-injected brief cannot
+    make the agent read service secrets out of /proc/self/environ."""
+    for name in _FORBIDDEN_AGENT_ENV:
+        monkeypatch.setenv(name, "secret-value")
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout='{"summary": "s", "root_cause": "r", "steps": []}',
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    raw = _run_agent("claude", {"model": "opus"}, "PR-derived brief")
+
+    assert raw.startswith('{"summary"')
+    assert calls, "the agent subprocess must run"
+    env = calls[0][1]["env"]
+    assert env["PATH"]
+    assert env["HOME"]
+    assert set(env) == _ALLOWED_AGENT_ENV
+    for forbidden in _FORBIDDEN_AGENT_ENV:
+        assert forbidden not in env
