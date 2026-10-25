@@ -1,19 +1,7 @@
-"""Shared fixtures."""
-import pytest
+"""Shared fixtures.
 
-
-@pytest.fixture(autouse=True)
-def _worktree_at_round_sha(request, monkeypatch):
-    """Tests patch prepare_worktree to a fake path; treat that worktree as being
-    at the round's SHA. Tests of the stale-head path patch head_moved themselves."""
-    if "real_head_moved" in request.keywords:
-        return
-    try:
-        import src.neo_builder as nb
-    except Exception:  # noqa: BLE001
-        return
-    monkeypatch.setattr(nb, "head_moved", lambda worktree, sha: None)
-
-
-def pytest_configure(config):
-    config.addinivalue_line("markers", "real_head_moved: use the real neo_builder.head_moved")
+There is deliberately no autouse stub for ``neo_builder.head_moved``: tests
+that patch ``prepare_worktree`` to a fake path must opt in explicitly (by
+patching ``head_moved`` themselves) so a stale-head regression cannot hide
+behind a global monkeypatch.
+"""

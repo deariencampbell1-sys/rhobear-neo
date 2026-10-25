@@ -254,6 +254,7 @@ class TestDefect1RoundCap:
         with patch("src.neo_builder.BRIEFS", tmp_path / "briefs"), \
              patch("src.neo_builder.pr_state", return_value="OPEN\tmain"), \
              patch("src.neo_builder.prepare_worktree", return_value=("/tmp/wt", "main")), \
+             patch("src.neo_builder.head_moved", return_value=None), \
              patch("src.neo_builder.fetch_findings", return_value=("{\"findings\": []}", None)), \
              patch("src.neo_builder.gh", return_value=(0, "a" * 40)), \
              patch.object(BuilderAgent, "run",
@@ -386,7 +387,7 @@ class TestDefect4DroppedWakes:
         source = open(main_mod.__file__).read()
         assert "jobs.recover_expired(\"wake\")" in source
         assert "jobs.stale_queued(\"wake\"" in source
-        assert "executor.submit(_run_wake, wake)" in source
+        assert "_submit_wake(executor, jobs, wake, _run_wake)" in source
 
     def test_webhook_status_wake_has_no_pr(self):
         """The status webhook deliberately carries no pr_number; on_verdict
@@ -552,6 +553,7 @@ class TestGLM6LeaseRenewal:
                "builder_round": 1, "attempt": 1}
         with patch("src.neo_builder.pr_state", return_value="OPEN\tmain"), \
              patch("src.neo_builder.prepare_worktree", return_value=("/tmp/wt", "main")), \
+             patch("src.neo_builder.head_moved", return_value=None), \
              patch("src.neo_builder.fetch_findings", return_value=("{\"findings\": []}", None)), \
              patch("src.neo_builder.gh", return_value=(0, "a" * 40)), \
              patch("src.neo_builder.BRIEFS", tmp_path / "briefs"), \
@@ -740,3 +742,203 @@ class TestImports:
         from src.neo_worker import run_neo, _review_evidence, merge_authority, \
             evidence_brief, _jev_for_pr, credits_for, resolve_pr, _gh, _wake_lease
         assert callable(run_neo) and callable(merge_authority)
+
+
+# ---------------------------------------------------------------------------
+# MEDIUM-5 — required-checks gate fails closed on unknown rollup
+# ---------------------------------------------------------------------------
+
+class TestRequiredChecksFailClosed:
+    """ACCEPT + rollup_green=None (no rollup data) must be denied by
+    merge_authority and must never reach the merge executor."""
+
+    def _run(self, rollup_green):
+        from src.neo_worker import run_neo
+        from src.config import Config
+        from src.jev_review import JevAssessment
+
+        cfg = Config()
+        cfg.max_builder_rounds = 2
+        cfg.auto_merge_default = False
+        cfg.deepseek_timeout = 30
+        state = MagicMock()
+        state.builder_rounds.return_value = 0
+        state.install.return_value = {"auto_merge": True, "plan": None,
+                                      "credits_balance": 100}
+        state.already_acted.return_value = False
+        state.already_escalated.return_value = False
+        jobs = MagicMock(spec=Jobs)
+        jobs.claim.return_value = True
+        jobs.get.return_value = {"attempt": 1}
+        wake = {"repo": "o/r", "sha": "a" * 40, "green": True,
+                "context": "rhobear-reviews", "pr_number": 5, "job_id": 42}
+        evidence = {
+            "ok": True, "reason": "", "head_sha": "a" * 40,
+            "decided_sha": "a" * 40, "review_sha": "a" * 40,
+            "review_bound_ok": True, "trusted_states": ["success"],
+            "trusted_green": True, "trusted_producer_ok": True,
+            "review_sha_match": True, "failing_checks": 0,
+            "rollup_green": rollup_green,
+            "unresolved_critical_high": 0, "coverage_complete": True,
+        }
+        with patch("src.neo_worker.resolve_pr", return_value=5), \
+             patch("src.neo_worker._review_evidence", return_value=evidence), \
+             patch("src.neo_worker._jev_for_pr",
+                   return_value=JevAssessment(False, reason="no key")), \
+             patch("src.neo_worker._run_agent",
+                   return_value=({"input_tokens": 1}, "ACCEPT", 0, None)), \
+             patch("src.neo_worker.ClaudeAgent"), \
+             patch("src.merge_executor.merge",
+                   return_value={"merged": True, "sha": "a" * 40}) as merge:
+            run_neo(cfg, state, jobs, wake)
+        phases = [c.args[3] for c in state.record.call_args_list
+                  if len(c.args) >= 4]
+        return phases, merge
+
+    def test_unknown_rollup_is_denied_and_never_merged(self):
+        phases, merge = self._run(None)
+        merge.assert_not_called()
+        assert "ready" in phases
+        assert "merged" not in phases
+
+    def test_green_rollup_still_merges(self):
+        phases, merge = self._run(True)
+        merge.assert_called_once()
+        assert "merged" in phases
+
+
+# ---------------------------------------------------------------------------
+# MEDIUM-9 — submit before stamping submitted_at
+# ---------------------------------------------------------------------------
+
+class TestSubmitWakeOrder:
+    def test_submit_happens_before_stamp(self):
+        from src.__main__ import _submit_wake
+        events = []
+
+        class Exec:
+            def submit(self, fn, wake):
+                events.append("submit")
+                return MagicMock()
+
+        class JobsFake:
+            def mark_submitted(self, job_id):
+                events.append(("stamp", job_id))
+
+            def clear_submitted(self, job_id):
+                events.append(("clear", job_id))
+
+        ok = _submit_wake(Exec(), JobsFake(),
+                          {"job_id": 7, "repo": "o/r"}, lambda w: None)
+        assert ok is True
+        assert events == ["submit", ("stamp", 7)]
+
+    def test_shutdown_clears_stamp_instead_of_marking(self):
+        from src.__main__ import _submit_wake
+        events = []
+
+        class ShutdownExecutor:
+            def submit(self, fn, wake):
+                events.append("submit")
+                raise RuntimeError("cannot schedule new futures after shutdown")
+
+        class JobsFake:
+            def mark_submitted(self, job_id):
+                events.append(("stamp", job_id))
+
+            def clear_submitted(self, job_id):
+                events.append(("clear", job_id))
+
+        ok = _submit_wake(ShutdownExecutor(), JobsFake(),
+                          {"job_id": 7, "repo": "o/r"}, lambda w: None)
+        assert ok is False
+        assert events == ["submit", ("clear", 7)]
+
+
+# ---------------------------------------------------------------------------
+# MEDIUM-6 — worktree locks live under WORKTREES, never /tmp
+# ---------------------------------------------------------------------------
+
+class TestWorktreeLock:
+    def test_lock_under_worktrees_and_appended_not_truncated(self, tmp_path,
+                                                            monkeypatch):
+        from src import neo_builder as nb
+        import subprocess as sp
+
+        worktrees = tmp_path / "wts"
+        monkeypatch.setattr(nb, "WORKTREES", worktrees)
+        lock_dir = worktrees / ".locks"
+        lock_dir.mkdir(parents=True)
+        lock_path = lock_dir / "acme-app-7.lock"
+        lock_path.write_text("held\n")
+
+        def fake_run(cmd, *a, **kw):
+            return sp.CompletedProcess(cmd, 0, "", "")
+
+        monkeypatch.setattr(nb.subprocess, "run", fake_run)
+        monkeypatch.setattr(nb, "pr_state", lambda *a, **kw: "OPEN\tmain")
+
+        dest, branch = nb.prepare_worktree("tok", "acme/app", 7)
+
+        assert dest == str(worktrees / "acme-app-7")
+        assert branch == "main"
+        assert lock_path.exists()
+        assert lock_path.is_relative_to(worktrees)
+        assert "/tmp/rhobear-wt-locks" not in str(lock_path)
+        # "a" (not "w"): an existing lock file is never truncated.
+        assert lock_path.read_text() == "held\n"
+        assert lock_dir.stat().st_mode & 0o777 == 0o700
+
+
+# ---------------------------------------------------------------------------
+# MEDIUM-10 — a failed head read after the run is not a push
+# ---------------------------------------------------------------------------
+
+class TestHeadReadAfterRun:
+    def _dispatch(self, after_response, tmp_path):
+        from src.config import Config
+        cfg = Config()
+        cfg.max_builder_rounds = 3
+        cfg.gh_token = "t"
+        jobs = MagicMock(spec=Jobs)
+        row = {"id": 1, "repo": "o/r", "pr_number": 5, "head_sha": "a" * 40,
+               "builder_round": 1, "attempt": 1}
+        responses = [(0, "a" * 40), after_response]
+
+        def fake_gh(*a, **kw):
+            return responses.pop(0)
+
+        with patch("src.neo_builder.pr_state", return_value="OPEN\tmain"), \
+             patch("src.neo_builder.prepare_worktree",
+                   return_value=("/tmp/wt", "main")), \
+             patch("src.neo_builder.head_moved", return_value=None), \
+             patch("src.neo_builder.fetch_findings",
+                   return_value=('{"findings": []}', None)), \
+             patch("src.neo_builder.gh", side_effect=fake_gh), \
+             patch("src.neo_builder.BRIEFS", tmp_path / "briefs"), \
+             patch.object(BuilderAgent, "run",
+                          return_value=({"input_tokens": 0}, "FIXED")):
+            dispatch_one(cfg, jobs, row)
+        return jobs
+
+    def test_gh_failure_after_run_leaves_job_running(self, tmp_path):
+        jobs = self._dispatch((1, "transient gh failure"), tmp_path)
+        jobs.resolve.assert_not_called()
+        jobs.retry.assert_not_called()
+
+    def test_garbage_head_after_run_leaves_job_running(self, tmp_path):
+        jobs = self._dispatch((0, "not-a-sha"), tmp_path)
+        jobs.resolve.assert_not_called()
+        jobs.retry.assert_not_called()
+
+    def test_unchanged_head_still_resolves_fixed_no_push(self, tmp_path):
+        jobs = self._dispatch((0, "a" * 40), tmp_path)
+        jobs.resolve.assert_called_once()
+        assert jobs.resolve.call_args[0][1] == "done"
+        assert jobs.resolve.call_args[1]["payload"]["outcome"] == "fixed-no-push"
+
+    def test_real_push_still_resolves_done_pushed(self, tmp_path):
+        jobs = self._dispatch((0, "b" * 40), tmp_path)
+        jobs.resolve.assert_called_once()
+        assert jobs.resolve.call_args[0][1] == "done"
+        assert jobs.resolve.call_args[1]["payload"]["outcome"] == "pushed"

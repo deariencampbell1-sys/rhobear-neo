@@ -29,9 +29,11 @@ advisor NEVER pushes, comments, or merges.
 """
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import os
+import re
 import subprocess
 import tempfile
 import threading
@@ -178,6 +180,23 @@ def _parse_work_order(raw: str) -> dict:
             raise AgentFailed(f"cannot parse work order: {exc}")
 
     raise AgentFailed("cannot parse work order after repair attempt")
+
+
+def _valid_advise_request(repo, pr, head_sha, read_token) -> bool:
+    """Validate the request fields that become git argv / URL components.
+
+    Fail closed: a 40-char lowercase hex head SHA (git would otherwise parse
+    a `--`-prefixed value as an option after the remote), an ``owner/name``
+    repo, a positive JSON int PR (bools are ints in Python — reject them),
+    and a non-empty string read token.
+    """
+    return (
+        isinstance(repo, str) and _REPO_RE.fullmatch(repo) is not None
+        and isinstance(pr, int) and not isinstance(pr, bool) and pr > 0
+        and isinstance(head_sha, str)
+        and _HEAD_SHA_RE.fullmatch(head_sha) is not None
+        and isinstance(read_token, str) and bool(read_token.strip())
+    )
 
 
 def _clone_head(tmpdir: str, repo: str, head_sha: str, read_token: str,
@@ -473,6 +492,11 @@ class AdvisorService:
             self._queue = [aid for aid in self._queue if aid in self._records]
 
 
+_HEAD_SHA_RE = re.compile(r"[0-9a-f]{40}")
+_REPO_RE = re.compile(r"[\w.-]+/[\w.-]+")
+MAX_BODY_BYTES = 1 << 20  # 1 MiB
+
+
 class AdvisorRequestHandler(BaseHTTPRequestHandler):
     """HTTP handler for the advisor service (ThreadingHTTPServer)."""
 
@@ -488,8 +512,11 @@ class AdvisorRequestHandler(BaseHTTPRequestHandler):
     def _authorized(self) -> bool:
         auth = self.headers.get("Authorization", "")
         expected_token = getattr(self.server, "advisor_token", "")
-        return bool(expected_token) and auth.startswith("Bearer ") \
-            and auth[7:] == expected_token
+        if not expected_token or not auth.startswith("Bearer "):
+            return False
+        # Constant-time compare: a byte-by-byte context leak on the bearer
+        # would let an attacker recover the advisor token.
+        return hmac.compare_digest(auth[7:], expected_token)
 
     def do_POST(self):
         if self.path != "/v1/advise":
@@ -498,7 +525,12 @@ class AdvisorRequestHandler(BaseHTTPRequestHandler):
             return self._reply(401, {"error": "unauthorized"})
 
         # --- Parse body -------------------------------------------------
-        length = int(self.headers.get("Content-Length", 0) or 0)
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+        except (TypeError, ValueError):
+            return self._reply(400, {"error": "bad content-length"})
+        if length < 0 or length > MAX_BODY_BYTES:
+            return self._reply(400, {"error": "request body too large"})
         body = self.rfile.read(length) if length else b""
         try:
             payload = json.loads(body or b"{}")
@@ -507,12 +539,14 @@ class AdvisorRequestHandler(BaseHTTPRequestHandler):
         if not isinstance(payload, dict):
             return self._reply(400, {"error": "bad json"})
 
-        repo = payload.get("repo", "")
-        pr = payload.get("pr", 0)
-        head_sha = payload.get("head_sha", "")
-        read_token = payload.get("read_token", "")
-        if not repo or not pr or not head_sha or not read_token:
-            return self._reply(400, {"error": "missing required fields"})
+        repo = payload.get("repo")
+        pr = payload.get("pr")
+        head_sha = payload.get("head_sha")
+        read_token = payload.get("read_token")
+        # These values reach a `git fetch` argv and a GitHub URL downstream:
+        # validate shape here, before the service ever sees them.
+        if not _valid_advise_request(repo, pr, head_sha, read_token):
+            return self._reply(400, {"error": "invalid required fields"})
 
         # --- Queue / start (never waits on the agent) -------------------
         service = getattr(self.server, "advisor_service", None)

@@ -70,9 +70,9 @@ BUILDER_LEASE_SECS = int(os.environ.get("NEO_BUILDER_LEASE_SECS", "3600"))
 # Fan-out width. The lane used to claim one row per poll and then sleep
 # POLL_SECS *even after a productive batch*, so the ceiling was one PR per
 # (fix + 120s) no matter how much compute was idle. prepare_worktree() does a
-# fresh clone into a per-PR dest and every _mark() opens its own connection,
-# so dispatch_one is already thread-safe -- nothing was serialising it but the
-# LIMIT 1 and the unconditional sleep.
+# fresh clone into a per-PR dest and every dispatched round opens its own
+# connection, so dispatch_one is already thread-safe -- nothing was serialising
+# it but the LIMIT 1 and the unconditional sleep.
 CONCURRENCY = int(os.environ.get("NEO_BUILDER_CONCURRENCY", "4"))
 
 
@@ -299,23 +299,6 @@ class BuilderAgent(HermesAgent):
         return {"input_tokens": 0, "output_tokens": 0, "raw_tail": tail}, ""
 
 
-def _db():
-    import psycopg
-    url = os.environ.get("DATABASE_URL", "")
-    if not url:
-        raise RuntimeError("DATABASE_URL not set")
-    return psycopg.connect(url)
-
-
-def _mark(conn, row_id: int, payload: dict) -> None:
-    with conn.cursor() as cur:
-        cur.execute(
-            "UPDATE neo_actions SET detail = detail || %s WHERE id = %s",
-            (json.dumps(payload), row_id),
-        )
-    conn.commit()
-
-
 def gh(token: str, *args: str, timeout: int = 30) -> tuple[int, str]:
     """Run `gh` as the repo's installation token (never a personal token)."""
     env = {**os.environ, "GH_TOKEN": token}
@@ -347,11 +330,19 @@ def prepare_worktree(token: str, repo: str, pr: int) -> tuple[str, str]:
     dest = WORKTREES / f"{repo.replace('/', '-')}-{pr}"
     url = f"https://github.com/{repo}.git"
     env = {**os.environ, "GH_TOKEN": token}
-    lock_dir = Path("/tmp/rhobear-wt-locks")
-    lock_dir.mkdir(parents=True, exist_ok=True)
+    # Locks live under the service-owned worktree root, never in world-writable
+    # /tmp (where another user could pre-create/symlink them).  0700, best
+    # effort on chmod for an existing dir.  Append mode: opening must never
+    # truncate a lock another process holds.
+    lock_dir = WORKTREES / ".locks"
+    lock_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        os.chmod(lock_dir, 0o700)
+    except OSError:
+        pass
     lock_path = lock_dir / f"{repo.replace('/', '-')}-{pr}.lock"
     import fcntl
-    with open(lock_path, "w") as lock:
+    with open(lock_path, "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if dest.exists():
             subprocess.run(["rm", "-rf", str(dest)], check=True)
@@ -485,6 +476,47 @@ def _fence_finding_body(body: str, max_chars: int = 4000) -> str:
 
 
 _FENCE_TAG = re.compile(r"<\s*/?\s*neo-assessment\b", re.IGNORECASE)
+_WORK_ORDER_TAG = re.compile(
+    r"<\s*/?\s*neo-advisor-work-order\b", re.IGNORECASE
+)
+
+
+def _render_advisor_work_order(wo: dict) -> str:
+    """Render an advisor work order as a fenced, neutralized data block.
+
+    The advisor's fields are model output (untrusted).  A field that closes
+    the fence must not be able to put the rest of its text outside it — the
+    fixer runs with --yolo and a push token, so this is a prompt-injection
+    boundary.  Same trick as _fence_finding_body: insert a zero-width space
+    after `<` on any work-order tag occurrence.
+    """
+    wo_lines = [
+        "=== ESCALATED ADVISOR WORK ORDER ===",
+        f"Route: {wo.get('route', '')}",
+        f"Summary: {wo.get('summary', '')}",
+        f"Root cause: {wo.get('root_cause', '')}",
+        "",
+        "Steps:",
+    ]
+    for i, step in enumerate(wo.get('steps', []), 1):
+        wo_lines.append(f"  {i}. {step.get('file', '')} — {step.get('change', '')}")
+        if step.get('why'):
+            wo_lines.append(f"     Why: {step.get('why')}")
+    if wo.get('tests'):
+        wo_lines.append("")
+        wo_lines.append("Tests to add:")
+        for t in wo['tests']:
+            wo_lines.append(f"  - {t}")
+    if wo.get('risks'):
+        wo_lines.append("")
+        wo_lines.append(f"Risks: {wo.get('risks')}")
+    body = "\n".join(wo_lines).replace("\x00", "")
+    body = _WORK_ORDER_TAG.sub(
+        lambda m: m.group(0).replace("<", "<​", 1), body,
+    )
+    return ("<neo-advisor-work-order>\n"
+            + body
+            + "\n</neo-advisor-work-order>")
 
 
 def _findings_to_brief_list(findings: list) -> str:
@@ -684,30 +716,8 @@ def dispatch_one(cfg: Config, jobs: Jobs, row: dict) -> None:
     brief = build_brief(repo, pr, sha, str(round_), head_branch, findings_block)
     # If this is an escalated round, incorporate the work order into the brief.
     if is_escalated and payload.get("work_order"):
-        wo = payload["work_order"]
-        wo_lines = [
-            "=== ESCALATED ADVISOR WORK ORDER ===",
-            f"Route: {wo.get('route', '')}",
-            f"Summary: {wo.get('summary', '')}",
-            f"Root cause: {wo.get('root_cause', '')}",
-            "",
-            "Steps:",
-        ]
-        for i, step in enumerate(wo.get('steps', []), 1):
-            wo_lines.append(f"  {i}. {step.get('file', '')} — {step.get('change', '')}")
-            if step.get('why'):
-                wo_lines.append(f"     Why: {step.get('why')}")
-        if wo.get('tests'):
-            wo_lines.append("")
-            wo_lines.append("Tests to add:")
-            for t in wo['tests']:
-                wo_lines.append(f"  - {t}")
-        if wo.get('risks'):
-            wo_lines.append("")
-            wo_lines.append(f"Risks: {wo.get('risks')}")
-        wo_lines.append("")
-        wo_lines.append("=== END WORK ORDER ===")
-        wo_brief = "\n".join(wo_lines)
+        # Fenced + neutralized: the advisor's text is data, not instructions.
+        wo_brief = _render_advisor_work_order(payload["work_order"])
         # Prepend the work order to the existing findings brief.
         brief = wo_brief + "\n\n" + brief
     brief_dir = BRIEFS / f"{repo.replace('/', '-')}-{pr}"
@@ -787,13 +797,22 @@ def dispatch_one(cfg: Config, jobs: Jobs, row: dict) -> None:
                        reason=f"builder agent crashed ({type(exc).__name__})")
             return
 
-    head_after = gh(token, "api", f"repos/{repo}/pulls/{pr}", "--jq", ".head.sha")[1].strip()
+    head_rc, head_raw = gh(token, "api", f"repos/{repo}/pulls/{pr}",
+                           "--jq", ".head.sha")
+    head_after = (head_raw or "").strip()
+    if head_rc != 0 or not re.fullmatch(r"[0-9a-f]{40}", head_after):
+        # A transient gh failure must not be recorded as a push (its error
+        # text differs from head_before).  Leave the job running: lease
+        # recovery re-dispatches the round.
+        log.warning("head read failed for %s#%s rc=%s after=%r — job stays "
+                    "running for lease recovery", repo, pr, head_rc, head_after)
+        return
     # A push is the real outcome signal (more reliable than the advisory
     # verdict); it re-arms reviewer + Neo immediately.
     if head_before and head_after:
         pushed = head_after != head_before
     else:
-        # Couldn't read the PR head (transient gh failure) — can't confirm.
+        # Couldn't read the PR head BEFORE the run — can't confirm a push.
         log.warning("head read failed for %s#%s before=%r after=%r", repo, pr, head_before, head_after)
         pushed = False
     log.info("fixer round outcome %s#%s pushed=%s head=%s->%s (loop auto-armed: reviewer+neo re-fire on push)",

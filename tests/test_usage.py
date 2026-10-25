@@ -39,7 +39,7 @@ from src.neo_worker import credits_for
 # ---------------------------------------------------------------------------
 
 DSN = os.environ.get("NEO_TEST_DSN", "")
-pytestmark = pytest.mark.skipif(not DSN, reason="NEO_TEST_DSN not set")
+requires_pg = pytest.mark.skipif(not DSN, reason="NEO_TEST_DSN not set")
 
 
 def _wipe() -> None:
@@ -281,6 +281,7 @@ class TestUsageAttempt:
 # Real Postgres: usage persistence
 # ===================================================================
 
+@requires_pg
 class TestUsageStorePG:
     """Per-attempt usage recorded for success and failure, idempotent per
     attempt, unknown usage stays None."""
@@ -574,6 +575,7 @@ class TestKnownProviders:
 # End-to-end: usage store wired through run_neo
 # ===================================================================
 
+@requires_pg
 class TestE2EUsageRecording:
     """Per-attempt usage recorded for success and failure through run_neo."""
 
@@ -727,6 +729,7 @@ def _evidence(sha: str) -> dict:
 # The allowed baseline failure must still fail
 # ===================================================================
 
+@requires_pg
 class TestRealSmoke:
     """Smoke test that must pass (the only allowed failure is
     TestRealSmoke::test_smoke_run_with_temp_config from test_agent_claude.py)."""

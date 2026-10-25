@@ -45,8 +45,6 @@ def test_failed_clone_log_has_no_token(monkeypatch, caplog):
 
     monkeypatch.setattr(neo_builder, "prepare_worktree", boom)
     monkeypatch.setattr(neo_builder, "pr_state", lambda *a: "OPEN\tfeature")
-    monkeypatch.setattr(neo_builder, "_mark", lambda *a, **k: None)
-    monkeypatch.setattr(neo_builder, "_db", lambda: None)
     from unittest.mock import MagicMock as MockMagic
     jobs_mock = MockMagic()
     cfg = SimpleNamespace(gh_token=TOKEN, max_builder_rounds=3)

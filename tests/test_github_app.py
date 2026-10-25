@@ -609,6 +609,7 @@ class TestWorkerWiring:
              patch("src.neo_builder.pr_state", return_value="OPEN\tmain"), \
              patch("src.neo_builder.prepare_worktree",
                    return_value=("/tmp/wt", "main")), \
+             patch("src.neo_builder.head_moved", return_value=None), \
              patch("src.neo_builder.fetch_findings", return_value=("{\"findings\": []}", None)), \
              patch("src.neo_builder.gh", side_effect=fake_gh), \
              patch.object(neo_builder.BuilderAgent, "run",
@@ -656,8 +657,10 @@ class TestWorkerWiring:
                     "statusCheckRollup": [],
                 }
                 return 0, json.dumps(data)
-            if args[:3] == ("api", f"repos/acme/a/commits/{SHA1}/check-runs",):
-                data = {"check_runs": [{
+            if (len(args) >= 2 and args[0] == "api"
+                    and args[1].startswith(f"repos/acme/a/commits/{SHA1}/check-runs")):
+                assert "per_page=100" in args[1]
+                data = {"total_count": 1, "check_runs": [{
                     "name": "rhobear-reviews", "head_sha": SHA1,
                     "app": {"id": 12345, "slug": "rhobear-reviews"},
                     "conclusion": "success",
@@ -687,6 +690,57 @@ class TestWorkerWiring:
         assert ev["rollup_green"] is None
         assert ev["failing_checks"] == 0
 
+    def test_review_evidence_pages_past_first_100_check_runs(self, rsa_key):
+        """MEDIUM-4: a trusted run only on page 2 (total_count 150) still wins."""
+        from src.neo_worker import _review_evidence
+
+        cfg = _cfg_with_app(rsa_key, FakeGitHubHTTP(installations={}))
+        cfg.trusted_reviewer_app_id = "12345"
+        cfg.trusted_review_contexts = ("rhobear-reviews",)
+        seen_pages = []
+
+        def untrusted(i):
+            return {"name": f"other-{i}", "head_sha": SHA1,
+                    "app": {"id": 99999}, "conclusion": "success",
+                    "output": {"summary": "{}"}}
+
+        def fake_gh(token, *args, **kw):
+            if args[:3] == ("pr", "view", str(5)):
+                return 0, json.dumps({"headRefOid": SHA1, "reviews": [],
+                                      "statusCheckRollup": []})
+            if (args[0] == "api" and "check-runs" in args[1]):
+                assert "app_id=12345" in args[1]
+                assert "per_page=100" in args[1]
+                if "&page=1&" in args[1]:
+                    seen_pages.append(1)
+                    return 0, json.dumps({
+                        "total_count": 150,
+                        "check_runs": [untrusted(i) for i in range(100)],
+                    })
+                assert "&page=2&" in args[1]
+                seen_pages.append(2)
+                runs = [untrusted(i) for i in range(49)]
+                runs.append({
+                    "name": "rhobear-reviews", "head_sha": SHA1,
+                    "app": {"id": 12345, "slug": "rhobear-reviews"},
+                    "conclusion": "success",
+                    "output": {"summary":
+                               '{"unresolved_critical_high": 0, "coverage": "complete"}'},
+                })
+                return 0, json.dumps({"total_count": 150, "check_runs": runs})
+            if (args[0] == "api" and args[1].endswith("/status")):
+                return 0, json.dumps({"state": "success", "statuses": [
+                    {"context": "rhobear-reviews", "state": "success"}]})
+            raise AssertionError(f"unexpected _gh call: {args}")
+
+        with patch("src.neo_worker._gh", side_effect=fake_gh):
+            ev = _review_evidence("tok", cfg, "acme/a", 5, SHA1)
+        assert seen_pages == [1, 2]
+        assert ev["ok"] is True
+        assert ev["trusted_producer_ok"] is True
+        assert ev["unresolved_critical_high"] == 0
+        assert ev["coverage_complete"] is True
+
     def test_review_evidence_no_trusted_contexts(self, rsa_key):
         """_review_evidence returns ok=False when no trusted contexts are configured."""
         from src.neo_worker import _review_evidence
@@ -698,8 +752,9 @@ class TestWorkerWiring:
             if args[:3] == ("pr", "view", str(5)):
                 data = {"headRefOid": SHA1, "reviews": [], "statusCheckRollup": []}
                 return 0, json.dumps(data)
-            if args[:3] == ("api", f"repos/acme/a/commits/{SHA1}/check-runs",):
-                data = {"check_runs": []}
+            if (len(args) >= 2 and args[0] == "api"
+                    and args[1].startswith(f"repos/acme/a/commits/{SHA1}/check-runs")):
+                data = {"total_count": 0, "check_runs": []}
                 return 0, json.dumps(data)
             if args[:3] == ("api", f"repos/acme/a/commits/{SHA1}/status",):
                 data = {"state": "success", "statuses": []}

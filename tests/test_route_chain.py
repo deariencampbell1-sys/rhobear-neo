@@ -31,7 +31,7 @@ from src.agent_hermes import HermesAgent, AgentError as HermesAgentError
 # ---------------------------------------------------------------------------
 
 DSN = os.environ.get("NEO_TEST_DSN", "")
-pytestmark = pytest.mark.skipif(not DSN, reason="NEO_TEST_DSN not set")
+requires_pg = pytest.mark.skipif(not DSN, reason="NEO_TEST_DSN not set")
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +130,7 @@ def cfg():
 # Route 1 returns 429 → route 2 runs and is recorded
 # ===================================================================
 
+@requires_pg
 class TestFallthrough429:
     """Route 1 returns 429 → route 2 runs and is recorded."""
 
@@ -228,6 +229,7 @@ class TestFallthrough429:
 # 402 fallthrough
 # ===================================================================
 
+@requires_pg
 class TestFallthrough402:
     """402 (payment required) fall through."""
 
@@ -266,6 +268,7 @@ class TestFallthrough402:
 # 5xx fallthrough
 # ===================================================================
 
+@requires_pg
 class TestFallthrough5xx:
     """5xx errors fall through."""
 
@@ -302,6 +305,7 @@ class TestFallthrough5xx:
 # 400 does NOT fall through
 # ===================================================================
 
+@requires_pg
 class TestNoFallthrough400:
     """400 (bad request) does NOT fall through — stops the chain."""
 
@@ -362,6 +366,7 @@ class TestNoFallthrough400:
 # All routes busy → failure recorded for each
 # ===================================================================
 
+@requires_pg
 class TestAllRoutesExhausted:
     """All routes return fallthrough errors — all recorded, no winner."""
 
@@ -397,6 +402,7 @@ class TestAllRoutesExhausted:
 # Zero-token usage stays 0
 # ===================================================================
 
+@requires_pg
 class TestZeroTokenUsage:
     """Zero-token usage stays 0 (not None)."""
 
@@ -436,6 +442,7 @@ class TestZeroTokenUsage:
 # Claude agent skips route with no Anthropic endpoint
 # ===================================================================
 
+@requires_pg
 class TestClaudeSkipsNoEndpoint:
     """Claude agent skips a route with no Anthropic-wire endpoint."""
 
@@ -471,6 +478,7 @@ class TestClaudeSkipsNoEndpoint:
 # Hermes skips route it can't serve
 # ===================================================================
 
+@requires_pg
 class TestHermesSkipsNoProvider:
     """Hermes agent skips a route it can't serve."""
 
@@ -517,6 +525,11 @@ class TestCreditsUnchanged:
         assert c1 == 69  # known value
         assert c2 == 403  # known value
 
+
+@requires_pg
+class TestCreditsUnchangedRouteChain:
+    """Backward-compat credits through the PG-backed route chain."""
+
     def test_credits_unchanged_with_route_chain(self, cfg, store):
         """Same usage via route chain produces same credits as before."""
         from src.neo_worker import credits_for
@@ -529,6 +542,7 @@ class TestCreditsUnchanged:
 # Missing key skips the route
 # ===================================================================
 
+@requires_pg
 class TestMissingKeySkips:
     """Missing API key skips the route (logged once, never a crash)."""
 
@@ -663,6 +677,28 @@ class TestStatusLineFormats:
         from src.agent_hermes import HermesAgent, NonZeroExit
         agent = HermesAgent.__new__(HermesAgent)
         got = agent._classify_agent_error(NonZeroExit("x"), agent, proc=_fake_proc(stderr=stderr, returncode=1))
+        assert got == expected
+
+    @pytest.mark.parametrize("stderr,expected", [
+        ("hermes timed out after 30s", (True, "timeout")),
+        ("HTTP 429 Too Many Requests", (True, "429")),
+        ("HTTP/1.1 402 Payment Required", (True, "402")),
+        ("HTTP/1.1 503 Service Unavailable", (True, "5xx")),
+        ("HTTP/1.1 400 Bad Request", (False, "400")),
+        ("upstream said: bad request", (False, "400")),
+    ])
+    def test_error_classes(self, stderr, expected):
+        """HIGH-1: stderr classification needs `import re` in agent_hermes.
+
+        This is the live-repro path: NonZeroExit plus a CompletedProcess
+        carrying the HTTP error text.
+        """
+        from src.agent_hermes import HermesAgent, NonZeroExit
+        agent = HermesAgent.__new__(HermesAgent)
+        got = agent._classify_agent_error(
+            NonZeroExit("x"), agent,
+            proc=_fake_proc(stderr=stderr, returncode=1),
+        )
         assert got == expected
 
 

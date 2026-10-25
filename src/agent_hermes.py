@@ -28,15 +28,14 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 import tempfile
 import time
 
 from .config import Config
 from .neo_protocol import extract_verdict_line
-from .usage import (
-    Route, UsageAttempt, classify_cli_fallthrough,
-)
+from .usage import Route, UsageAttempt
 
 log = logging.getLogger("rhobear_neo.agent")
 

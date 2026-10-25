@@ -42,6 +42,37 @@ log = logging.getLogger("rhobear_neo")
 RECOVERY_SECS = int(os.environ.get("NEO_WAKE_RECOVERY_SECS", "30"))
 
 
+def _submit_wake(executor, jobs: Jobs, wake: dict, runner) -> bool:
+    """Hand a persisted wake to the executor, then stamp the hand-off.
+
+    Order matters: ``stale_queued()`` selects ``submitted_at IS NULL``.  If
+    the executor rejects the task (RuntimeError while shutting down) the row
+    must stay unstamped, or the recovery sweep would never see it again until
+    a restart.  Returns True when the task was accepted.
+    """
+    try:
+        executor.submit(runner, wake)
+    except RuntimeError:
+        # create_wake() already stamped submitted_at; clear it so the row is
+        # visible to stale_queued() and the recovery sweep re-submits it.
+        job_id = wake.get("job_id")
+        if job_id is not None:
+            try:
+                jobs.clear_submitted(job_id)
+            except Exception:  # noqa: BLE001
+                log.exception("clear_submitted failed for job %s", job_id)
+        log.warning("neo executor shutting down — wake stays queued for %s",
+                    wake.get("repo"))
+        return False
+    job_id = wake.get("job_id")
+    if job_id is not None:
+        try:
+            jobs.mark_submitted(job_id)
+        except Exception:  # noqa: BLE001
+            log.exception("mark_submitted failed for job %s", job_id)
+    return True
+
+
 def main() -> None:
     cfg = _config.load().require().validate()
 
@@ -78,22 +109,10 @@ def main() -> None:
     )
 
     def _submit(wake: dict) -> None:
-        # Stamp the hand-off so the recovery loop's stale_queued sweep
-        # (submitted_at IS NULL) never re-submits a wake that is already
-        # waiting in the executor (recovery-amplification defect).
-        job_id = wake.get("job_id")
-        if job_id is not None:
-            try:
-                jobs.mark_submitted(job_id)
-            except Exception:  # noqa: BLE001
-                log.exception("mark_submitted failed for job %s", job_id)
-        try:
-            executor.submit(_run_wake, wake)
-        except RuntimeError:
-            # Executor shutting down — the job is already persisted; the
-            # recovery loop (or a future wake) re-submits it.
-            log.warning("neo executor shutting down — wake stays queued for %s",
-                        wake.get("repo"))
+        # Submit BEFORE stamping submitted_at: a RuntimeError here (executor
+        # shutting down) must leave the row unstamped so stale_queued()
+        # (submitted_at IS NULL) re-submits it on the next recovery pass.
+        _submit_wake(executor, jobs, wake, _run_wake)
 
     def on_verdict(wake: dict) -> None:
         # Persist the wake as a durable job BEFORE the executor picks it up.

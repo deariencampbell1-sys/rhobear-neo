@@ -391,6 +391,7 @@ class TestLeaseRenewal:
         with patch("src.neo_builder.pr_state", return_value="OPEN\tmain"), \
              patch("src.neo_builder.prepare_worktree",
                    return_value=("/tmp/wt", "main")), \
+             patch("src.neo_builder.head_moved", return_value=None), \
              patch("src.neo_builder.fetch_findings", return_value=(_ASSESSMENT, None)), \
              patch("src.neo_builder.gh", return_value=(0, SHA2)), \
              patch("src.neo_builder.BRIEFS", tmp_path / "briefs"), \
@@ -735,6 +736,7 @@ class TestBuilderVerdictBranches:
         assert row is not None and row["id"] == row_id
         with patch("src.neo_builder.pr_state", return_value="OPEN\tmain"), \
              patch("src.neo_builder.prepare_worktree", return_value=("/tmp/wt", "main")), \
+             patch("src.neo_builder.head_moved", return_value=None), \
              patch("src.neo_builder.fetch_findings", return_value=(_ASSESSMENT, None)), \
              patch("src.neo_builder.gh", return_value=(0, SHA2)), \
              patch("src.neo_builder.BRIEFS", Path("/tmp/briefs")), \
@@ -817,6 +819,47 @@ class TestRecoveryAmplification:
         assert db.stale_queued("wake", older_than_secs=30) == []  # submitted
         assert db.reset_queued_submissions("wake") == 1
         assert [r["id"] for r in db.stale_queued("wake", older_than_secs=30)] == [job_id]
+
+
+# ---------------------------------------------------------------------------
+# MEDIUM-9 — failed executor hand-off leaves the wake visible to stale_queued
+# ---------------------------------------------------------------------------
+
+class TestSubmitWakeOrderPG:
+    def test_executor_shutdown_unstamps_and_stale_queued_sees_row(self, db):
+        from src.__main__ import _submit_wake
+
+        job_id = db.create_wake("o/r", SHA1, True,
+                                payload={"repo": "o/r", "sha": SHA1, "green": True})
+        assert db.get(job_id)["submitted_at"] is not None
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute("UPDATE neo_jobs SET created_at = now() - interval '3 minutes' "
+                      "WHERE id = %s", (job_id,))
+
+        class ShutdownExecutor:
+            def submit(self, *a, **kw):
+                raise RuntimeError("cannot schedule new futures after shutdown")
+
+        wake = {"repo": "o/r", "sha": SHA1, "green": True, "job_id": job_id}
+        assert _submit_wake(ShutdownExecutor(), db, wake, lambda w: None) is False
+        assert db.get(job_id)["submitted_at"] is None
+        assert [r["id"] for r in db.stale_queued("wake",
+                                                 older_than_secs=30)] == [job_id]
+
+        # The normal path submits exactly once and stamps the row.
+        class OkExecutor:
+            def __init__(self):
+                self.submitted = 0
+
+            def submit(self, fn, w):
+                self.submitted += 1
+                return MagicMock()
+
+        ok = OkExecutor()
+        assert _submit_wake(ok, db, wake, lambda w: None) is True
+        assert ok.submitted == 1
+        assert db.get(job_id)["submitted_at"] is not None
+        assert db.stale_queued("wake", older_than_secs=30) == []
 
 
 # ---------------------------------------------------------------------------
@@ -1696,6 +1739,7 @@ class TestNoAssessmentPG:
         assert row is not None and row["id"] == row_id
         with patch("src.neo_builder.pr_state", return_value="OPEN\tmain"), \
              patch("src.neo_builder.prepare_worktree", return_value=("/tmp/wt", "main")), \
+             patch("src.neo_builder.head_moved", return_value=None), \
              patch("src.neo_builder.fetch_findings",
                    return_value=(None, "no_assessment: no trusted check run for this head SHA")), \
              patch("src.neo_builder.BRIEFS", tmp_path / "briefs"), \

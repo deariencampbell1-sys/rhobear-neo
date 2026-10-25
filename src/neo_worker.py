@@ -157,13 +157,38 @@ def _review_evidence(token: str, cfg: Config, repo: str, pr: int, sha: str) -> d
 
     # Trusted producer: check runs for EXACTLY this sha.  Only the run from
     # the configured Reviews App on this exact head authorizes a merge.
+    # Filter by the trusted app id and page through the whole result: the
+    # default response is only the first 30 runs (unfiltered), so the trusted
+    # run of a busy commit can fall off page 1 and silently deny the merge.
     try:
-        rc, raw_checks = _gh(token, "api",
-                             f"repos/{repo}/commits/{sha}/check-runs", timeout=30)
-        if rc == 0:
-            data["check_runs"] = (json.loads(raw_checks).get("check_runs") or [])
-        else:
-            data["check_runs"] = []
+        from . import review_evidence as rev_ev
+        app_id = rev_ev._trusted_app_id(cfg)
+        check_runs: list = []
+        per_page = 100
+        page = 1
+        while page <= 10:
+            url = (f"repos/{repo}/commits/{sha}/check-runs"
+                   f"?per_page={per_page}&page={page}")
+            if app_id:
+                url += f"&app_id={app_id}"
+            rc, raw_checks = _gh(token, "api", url, timeout=30)
+            if rc != 0:
+                # An incomplete list could hide the trusted run — fail closed.
+                check_runs = []
+                break
+            parsed_page = json.loads(raw_checks)
+            batch = parsed_page.get("check_runs") or []
+            check_runs.extend(batch)
+            total = parsed_page.get("total_count")
+            if not batch:
+                break
+            if isinstance(total, int):
+                if len(check_runs) >= total:
+                    break
+            elif len(batch) < per_page:
+                break
+            page += 1
+        data["check_runs"] = check_runs
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"check-runs read failed ({type(exc).__name__})",
                 "decided_sha": sha}
@@ -210,6 +235,30 @@ def _review_evidence(token: str, cfg: Config, repo: str, pr: int, sha: str) -> d
     ev["failing_checks"] = ev.get("required_checks_failing", len(failing))
     ev["rollup_green"] = all_success
     return ev
+
+
+#: Verdict → recorded phase for a completed (non-ACCEPT, non-builder-command)
+#: run.  Production uses this exact mapping; tests must not rebuild it.
+BUILDER_VERDICT_PHASES = {
+    "FIXED": "ready",
+    "NO-CHANGE": "ready",
+    # Not "parked": credits/advisor parks share that phase and are
+    # transient — the recovery gate must not treat them as acted.
+    "BLOCKED": "builder_blocked",
+    "FIX-FORWARD": "fix_forward",
+    "ESCALATE": "escalated",
+}
+
+
+def resolve_auto_merge(install_auto_merge, cfg: Config) -> bool:
+    """P0 hotfix: nullable inheritance for auto-merge.
+
+    An explicit install value wins; only ``None`` inherits the global
+    default.  (The old ``or`` made an explicit False inherit True.)
+    """
+    if install_auto_merge is None:
+        return bool(cfg.auto_merge_default)
+    return bool(install_auto_merge)
 
 
 def merge_authority(install_auto_merge: bool, evidence: dict,
@@ -468,11 +517,7 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict,
         log.info("%s#%s: install out of credits — gated (parked)", repo, pr)
         return
     # P0 hotfix: nullable inheritance for auto-merge.
-    inst_auto_merge = inst.get("auto_merge")
-    if inst_auto_merge is None:
-        install_auto_merge = bool(cfg.auto_merge_default)
-    else:
-        install_auto_merge = bool(inst_auto_merge)
+    install_auto_merge = resolve_auto_merge(inst.get("auto_merge"), cfg)
 
     # --- exact-SHA evidence (Phase A) --------------------------------------
     evidence = _review_evidence(token, cfg, repo, pr, sha)
@@ -571,9 +616,9 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict,
                 "trusted_producer_ok", evidence.get("trusted_green", False)),
             "review_sha_match": evidence.get(
                 "review_sha_match", evidence.get("review_bound_ok", False)),
-            "required_checks_pass": (
-                evidence.get("rollup_green") is not False
-            ),
+            # Fail closed: unknown rollup (None — no rollup data) is NOT a
+            # pass.  Only an explicit green rollup authorizes a merge.
+            "required_checks_pass": evidence.get("rollup_green") is True,
             "required_checks_failing": evidence.get("failing_checks", 0),
             # From the trusted check run's output — not hard-coded.  Missing
             # (None) is denied by merge_authority.
@@ -674,15 +719,7 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict,
         # Builder contract: FIXED → wait for new head's review;
         # NO-CHANGE → counts as a bounce (ready); BLOCKED → park with reason.
         # Unknown verdicts → BLOCKED: unparseable, never silently dropped.
-        phase = {
-            "FIXED": "ready",
-            "NO-CHANGE": "ready",
-            # Not "parked": credits/advisor parks share that phase and are
-            # transient — the recovery gate must not treat them as acted.
-            "BLOCKED": "builder_blocked",
-            "FIX-FORWARD": "fix_forward",
-            "ESCALATE": "escalated",
-        }.get(verdict_base, "blocked")
+        phase = BUILDER_VERDICT_PHASES.get(verdict_base, "blocked")
 
     # --- B4: record which route actually produced the verdict -------------
     # The route chain already recorded per-attempt usage inside run_with_chain.

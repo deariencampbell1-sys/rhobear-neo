@@ -32,24 +32,18 @@ The table below documents how each was resolved in this baseline commit.
 |---|---|---|
 | `deploy/rhobear-neo-builder.service` | `services.txt` (production snapshot) | Systemd unit for the Builder lane. Secrets stay in `EnvironmentFile`. |
 
-## Known issues (deferred to B3)
+## Resolved in B3
 
-### Builder/Hermes outcome-name mismatch (Audit §9)
+### Builder/Hermes outcome-name mismatch (Audit §9) — FIXED
 
-The Builder lane's Hermes agent returns verdicts (`FIXED`, `NO-CHANGE`, `BLOCKED`)
-that do not match the Neo protocol's canonical verdict set. The `neo_builder.py`
-`BuilderAgent` subclass treats verdict parsing as advisory (the push/no-push
-head-diff is the real signal), but the mismatch means:
+The Builder lane now ships its own contract verdicts (`FIXED`, `NO-CHANGE`,
+`BLOCKED`) through `BUILDER_CANONICAL_VERDICTS` / `BuilderAgent.CANONICAL_VERDICTS`
+in `agent_hermes.py`; the Neo protocol's canonical set is unchanged.  Verdict
+parsing remains advisory — the push/no-push head diff is the primary outcome
+signal — and a completed run with a missing or unparseable verdict resolves
+`no_change` with the raw tail recorded (never a retry).
 
-- `FIXED` is not in the Hermes `CANONICAL_VERDICTS` set (only `agent_claude.py`
-  accepts it).
-- The Builder's own `_parse_output` rejects `FIXED` as non-canonical, falling
-  through to the `except Exception` handler that logs the warning and returns
-  empty usage/verdict.
-
-This will be fixed in B3 by aligning the Builder's canonical verdict set with
-the outcomes it actually produces, or by switching to push-detection as the
-primary success signal and making the verdict purely informational.
+## Known issues (deferred)
 
 ### Other deferred items
 

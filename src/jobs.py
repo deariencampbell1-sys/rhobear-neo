@@ -584,6 +584,21 @@ class Jobs:
             )
             return cur.rowcount > 0
 
+    def clear_submitted(self, job_id: int) -> bool:
+        """Un-stamp a wake whose executor hand-off failed.
+
+        ``create_wake`` stamps submitted_at eagerly, so a RuntimeError from
+        executor.submit must clear it — otherwise stale_queued() (submitted_at
+        IS NULL) would never re-submit the stranded wake until a restart.
+        """
+        with self._conn() as c:
+            cur = c.execute(
+                "UPDATE neo_jobs SET submitted_at = NULL, updated_at = now() "
+                "WHERE id = %s AND kind = 'wake'",
+                (job_id,),
+            )
+            return cur.rowcount > 0
+
     def reset_queued_submissions(self, kind: str = "wake") -> int:
         """Clear the submitted stamp on all queued jobs of a kind.
 

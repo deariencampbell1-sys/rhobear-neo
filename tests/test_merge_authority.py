@@ -1331,13 +1331,12 @@ class TestAgentContainsGhPrMerge:
 
     def test_gh_pr_merge_in_output_is_harmless(self):
         """The merge executor is the only path that calls gh pr merge.
-        The agent's output may contain the text 'gh pr merge' but that
-        text is never executed by the agent's harness.  The worker only
-        reads the VERDICT line."""
-        # This is a safety-by-design test: the agent's output containing
-        # 'gh pr merge' as text is harmless because the worker only
-        # parses the VERDICT line and calls the merge executor.
-        assert True  # The design prevents execution
+        A merge command in the agent's prose is not a verdict — production
+        verdict extraction returns None, so nothing is executed."""
+        from src.neo_protocol import extract_verdict_line
+        text = ("Done.\ngh pr merge 42 --squash --admin\n"
+                "Also: `gh pr merge --auto`\n")
+        assert extract_verdict_line(text) is None
 
 
 class TestEscalatedRoundBrief:

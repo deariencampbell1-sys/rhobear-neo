@@ -235,21 +235,22 @@ class TestMainModule:
         # full startup requires env vars set in production.
         assert callable(main_mod.main)
 
-    def test_on_verdict_backpressure(self):
-        """Simulate backpressure path — semaphore full drops wake."""
+    def test_submit_wake_does_not_stamp_on_executor_shutdown(self):
+        """The old semaphore 'drop wake' path is gone; backpressure is now
+        the durable queue.  A still-useful invariant: a wake rejected by the
+        executor is not stamped submitted (stale_queued re-submits it)."""
         import src.__main__ as main_mod
-        import threading
 
-        # Monkey-patch to test the backpressure logic
-        dropped = []
+        class ShutdownExecutor:
+            def submit(self, *a, **kw):
+                raise RuntimeError("cannot schedule new futures after shutdown")
 
-        def fake_on_verdict(wake):
-            # Access the module-level semaphore to test backpressure
-            pass
-
-        # Just verify the module structure is sound
-        assert hasattr(main_mod, "main")
-        assert hasattr(main_mod, "log")
+        jobs = MagicMock()
+        wake = {"job_id": 7, "repo": "o/r"}
+        assert main_mod._submit_wake(ShutdownExecutor(), jobs, wake, lambda w: None) is False
+        jobs.mark_submitted.assert_not_called()
+        # create_wake pre-stamped it; the failed hand-off must clear the stamp.
+        jobs.clear_submitted.assert_called_once_with(7)
 
 
 # ---------------------------------------------------------------------------
@@ -268,11 +269,15 @@ class TestAutoMergeTruthTable:
       inst.auto_merge=False, global=False  → False (explicit false wins)
     """
 
-    def _resolve(self, inst_auto_merge, global_default):
-        """Replicate the P0 hotfix logic from neo_worker.py."""
-        if inst_auto_merge is None:
-            return bool(global_default)
-        return bool(inst_auto_merge)
+    @staticmethod
+    def _resolve(inst_auto_merge, global_default):
+        """Resolve via the production helper — never a copy of its logic."""
+        from types import SimpleNamespace
+        from src.neo_worker import resolve_auto_merge
+        return resolve_auto_merge(
+            inst_auto_merge,
+            SimpleNamespace(auto_merge_default=global_default),
+        )
 
     def test_none_inherits_true(self):
         assert self._resolve(None, True) is True

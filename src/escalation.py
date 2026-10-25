@@ -21,12 +21,14 @@ Flow (asynchronous — Neo never waits on the advisor):
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 from .config import Config
 
@@ -157,6 +159,45 @@ def _read_token(cfg, repo: str, installation_id: int | None = None) -> str:
     )
 
 
+_TAILNET = ipaddress.ip_network("100.64.0.0/10")
+
+
+def _validate_advisor_url(url: str) -> None:
+    """Refuse to send the GitHub read token to a plaintext/arbitrary URL.
+
+    The advisor receives a read-scoped installation token in the POST body.
+    Only HTTPS (any host — the tailnet listener has a cert), or plain HTTP to
+    loopback/tailnet (127.0.0.1, localhost, 100.64.0.0/10), is allowed.
+    The error message never includes the token (there is none in the URL).
+    """
+    try:
+        parts = urlsplit(url)
+        host = (parts.hostname or "").lower()
+    except ValueError as exc:
+        raise AdvisorUnavailable("advisor URL is invalid") from exc
+    if parts.scheme == "https":
+        if not host:
+            raise AdvisorUnavailable("advisor URL has no host")
+        return
+    if parts.scheme != "http":
+        raise AdvisorUnavailable(
+            "advisor URL must use https (or http to loopback/tailnet)"
+        )
+    if host in ("127.0.0.1", "localhost"):
+        return
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        raise AdvisorUnavailable(
+            "advisor URL must use https unless the host is loopback/tailnet"
+        )
+    if addr.version == 4 and addr in _TAILNET:
+        return
+    raise AdvisorUnavailable(
+        "advisor URL must use https unless the host is loopback/tailnet"
+    )
+
+
 def _headers(cfg: Config, token: str) -> dict:
     return {
         "Content-Type": "application/json",
@@ -182,6 +223,7 @@ def _post_advise(
     token = cfg.advisor_token
     if not url or not token:
         raise AdvisorUnavailable("NEO_ADVISOR_URL or NEO_ADVISOR_TOKEN not configured")
+    _validate_advisor_url(url)
 
     body = json.dumps({
         "repo": repo,
@@ -239,6 +281,7 @@ def poll_advice(cfg: Config, advice_id: str) -> AdviceStatus:
     token = cfg.advisor_token
     if not url or not token:
         raise AdvisorUnavailable("NEO_ADVISOR_URL or NEO_ADVISOR_TOKEN not configured")
+    _validate_advisor_url(url)
 
     req = urllib.request.Request(
         url.rstrip("/") + "/v1/advise/" + advice_id,
