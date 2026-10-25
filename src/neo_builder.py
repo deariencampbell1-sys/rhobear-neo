@@ -33,8 +33,9 @@ from .config import Config
 log = logging.getLogger("rhobear_neo.builder")
 
 WORKTREES = Path("/opt/rhobear/neo-builder-worktrees")
-# Reads the token from the environment when git needs it; nothing secret is stored.
-GIT_CREDENTIAL_HELPER = '!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f'
+# Asks the gh-app wrapper (first on PATH) for a fresh Zeus App token each time git needs
+# one, so a 90-minute fixer run never pushes with an expired token. Nothing is stored.
+GIT_CREDENTIAL_HELPER = '!f() { echo username=x-access-token; echo "password=$(gh auth token)"; }; f'
 BRIEFS = Path("/opt/rhobear/neo-builder-briefs")
 POLL_SECS = int(os.environ.get("NEO_BUILDER_POLL_SECS", "120"))
 # Fan-out width. The lane used to claim one row per poll and then sleep

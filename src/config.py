@@ -22,6 +22,28 @@ def _get(name: str, default: str = "") -> str:
     return (os.environ.get(name) or default).strip()
 
 
+APP_TOKEN_MINTER = "/opt/rhobear/gh-app/gh_app_token.py"
+
+
+def mint_app_token(app_id: str, key: str, owner: str) -> str:
+    """Installation token for a GitHub App; the minter caches it until 5 min before expiry.
+
+    Empty when one cannot be minted, so callers fail closed. There is no personal-token
+    fallback (owner, 2026-10-25: Apollo and Zeus never run on the owner's GitHub token).
+    """
+    if not (app_id and key and owner):
+        return ""
+    import subprocess
+    cache = _get("RHOBEAR_GH_APP_CACHE", "/run/rhobear-neo-gh")
+    try:
+        p = subprocess.run(["/usr/bin/python3", APP_TOKEN_MINTER, "--app-id", app_id, "--key", key,
+                            "--owner", owner, "--cache-dir", cache],
+                           capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return p.stdout.strip() if p.returncode == 0 else ""
+
+
 def _get_int(name: str, default: int) -> int:
     try:
         return int(os.environ.get(name, "").strip() or default)
@@ -113,8 +135,15 @@ class Config:
     # --- state (shared VPS Postgres; Neo uses its own tables) ---
     database_url: str = field(default_factory=lambda: _get("DATABASE_URL"))
 
-    # --- github auth (App token preferred; gh-cli token fallback) ---
-    gh_token: str = field(default_factory=lambda: _get("GH_TOKEN"))
+    # --- github auth: the Zeus GitHub App only, never a personal token ---
+    gh_app_id: str = field(default_factory=lambda: _get("RHOBEAR_GH_APP_ID") or _get("NEO_GITHUB_APP_ID"))
+    gh_app_key: str = field(default_factory=lambda: _get("RHOBEAR_GH_APP_KEY") or _get("NEO_GITHUB_APP_KEY"))
+    gh_app_owner: str = field(default_factory=lambda: _get("RHOBEAR_GH_APP_OWNER", "deariencampbell1-sys"))
+
+    @property
+    def gh_token(self) -> str:
+        """A fresh installation token for the Zeus App (minted per use, cached under an hour)."""
+        return mint_app_token(self.gh_app_id, self.gh_app_key, self.gh_app_owner)
 
     # Optional Jev review-of-the-reviewer call. This is a separate OpenRouter
     # credential from the Claude-wire DeepSeek route above.
@@ -126,7 +155,7 @@ class Config:
             "RHOBEAR_NEO_WEBHOOK_SECRET": self.webhook_secret,
             "DEEPSEEK_API_KEY/NEO_DEEPSEEK_API_KEY": self.deepseek_key,
             "DATABASE_URL": self.database_url,
-            "GH_TOKEN": self.gh_token,
+            "Zeus GitHub App token (RHOBEAR_GH_APP_ID/KEY/OWNER)": self.gh_token,
         }.items() if not v]
         if missing:
             raise RuntimeError(f"rhobear-neo missing required env: {', '.join(missing)}")
