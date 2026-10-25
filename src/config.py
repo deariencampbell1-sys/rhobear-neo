@@ -138,7 +138,7 @@ class Config:
 
     # --- github auth: Neo acts as the customer's GitHub App --------------
     # A paying customer's private repo is reached via the App installation on
-    # that repo (installation token), never via a personal gho_ token. GH_TOKEN
+    # that repo (installation token), never via a personal OAuth token. GH_TOKEN
     # is deliberately NOT an identity any more; if it is still set in the env
     # it is logged once at startup and ignored (see __main__).
     github_app_id: str = field(default_factory=lambda: _get("NEO_GITHUB_APP_ID"))
