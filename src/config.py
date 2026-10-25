@@ -128,6 +128,9 @@ class Config:
     # Off  -> drive to green, fix-forward, dispatch builder, label neo:ready, STOP.
     # On   -> also run the squash-merge itself.
     auto_merge_default: bool = field(default_factory=lambda: _get_bool("NEO_AUTO_MERGE", False))
+    # Lane PRs (l<n>-<lane>/...) merge on Apollo's pass plus the lane architect's acceptance of the exact
+    # head (lane_merge_authority), independent of the install switch above (L0, 2026-10-25).
+    lane_merge: bool = field(default_factory=lambda: _get_bool("NEO_LANE_MERGE", False))
 
     # --- safety floors ---
     max_builder_rounds: int = field(default_factory=lambda: _get_int("NEO_MAX_BUILDER_ROUNDS", 2))

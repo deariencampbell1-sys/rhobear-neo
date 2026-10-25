@@ -181,11 +181,11 @@ def lane_of(branch: str) -> str:
     return m.group(1).lower() if m else ""
 
 
-def lane_merge_authority(install_auto_merge: bool, evidence: dict, lane: str,
+def lane_merge_authority(lane_merge: bool, evidence: dict, lane: str,
                          statuses: list[dict], reviews: list[dict], owner: str) -> tuple[bool, str]:
-    """Merge authority for a lane PR. Fails closed."""
-    if not install_auto_merge:
-        return False, "auto-merge disabled for this install"
+    """Merge authority for a lane PR. Fails closed. Follows NEO_LANE_MERGE, not the install switch."""
+    if not lane_merge:
+        return False, "lane merges disabled (NEO_LANE_MERGE is off)"
     if not evidence.get("ok"):
         return False, f"review evidence unavailable ({evidence.get('reason')})"
     head = evidence.get("head_sha") or ""
@@ -214,14 +214,13 @@ def run_lane_gate(cfg: Config, state: NeoState, repo: str, pr: int, sha: str,
         log.info("%s#%s@%s already merged by Neo — skip", repo, pr, sha[:8])
         return
     org = repo.split("/", 1)[0]
-    install_auto_merge = bool(state.install(org, org).get("auto_merge") or cfg.auto_merge_default)
     evidence = _review_evidence(cfg, repo, pr, sha)
     rc, raw = _gh(cfg, "api", f"repos/{repo}/commits/{sha}/statuses?per_page=100", timeout=30)
     try:
         statuses = json.loads(raw) if rc == 0 else []
     except (TypeError, ValueError):
         statuses = []
-    ok, reason = lane_merge_authority(install_auto_merge, evidence, lane,
+    ok, reason = lane_merge_authority(bool(getattr(cfg, "lane_merge", False)), evidence, lane,
                                       statuses if isinstance(statuses, list) else [], reviews, org)
     log.info("%s#%s@%s lane=%s merge authority=%s (%s)", repo, pr, sha[:8], lane, ok, reason)
     if ok:
