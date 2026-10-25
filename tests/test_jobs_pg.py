@@ -726,7 +726,7 @@ class TestInflightRelease:
 # ---------------------------------------------------------------------------
 
 class TestBuilderVerdictBranches:
-    def _dispatch(self, db, run_result):
+    def _dispatch(self, db, run_result, tmp_path):
         """Claim a real builder round and dispatch it with a faked agent run."""
         from src.neo_builder import dispatch_one
         cfg = _cfg()
@@ -739,36 +739,36 @@ class TestBuilderVerdictBranches:
              patch("src.neo_builder.head_moved", return_value=None), \
              patch("src.neo_builder.fetch_findings", return_value=(_ASSESSMENT, None)), \
              patch("src.neo_builder.gh", return_value=(0, SHA2)), \
-             patch("src.neo_builder.BRIEFS", Path("/tmp/briefs")), \
+             patch("src.neo_builder.BRIEFS", tmp_path / "briefs"), \
              patch("src.neo_builder.BuilderAgent.run", return_value=run_result):
             dispatch_one(cfg, db, row)
         return row_id
 
-    def test_no_change_resolves_no_change(self, db):
-        row_id = self._dispatch(db, ({"input_tokens": 0}, "NO-CHANGE"))
+    def test_no_change_resolves_no_change(self, db, tmp_path):
+        row_id = self._dispatch(db, ({"input_tokens": 0}, "NO-CHANGE"), tmp_path)
         r = db.get(row_id)
         assert r["state"] == "done" and r["outcome"] == "no_change", r
 
-    def test_fixed_no_push_records_done(self, db):
-        row_id = self._dispatch(db, ({"input_tokens": 0}, "FIXED"))
+    def test_fixed_no_push_records_done(self, db, tmp_path):
+        row_id = self._dispatch(db, ({"input_tokens": 0}, "FIXED"), tmp_path)
         r = db.get(row_id)
         assert r["state"] == "done" and r["outcome"] == "done", r
         assert r["payload"]["outcome"] == "fixed-no-push", r
 
-    def test_completed_unparseable_verdict_is_no_change_not_retry(self, db):
+    def test_completed_unparseable_verdict_is_no_change_not_retry(self, db, tmp_path):
         """Block 3: a COMPLETED run (exit 0) whose verdict line is unparseable
         resolves no_change with the raw tail recorded — it is NOT retried 3x
         then mis-parked (the old dead-code behavior)."""
         row_id = self._dispatch(
             db, ({"input_tokens": 0, "output_tokens": 0,
-                  "raw_tail": "VERDICT: ACCEPT-READY"}, ""))
+                  "raw_tail": "VERDICT: ACCEPT-READY"}, ""), tmp_path)
         r = db.get(row_id)
         assert r["state"] == "done" and r["outcome"] == "no_change", r
         assert r["payload"].get("verdict") == "", r
         assert "ACCEPT-READY" in r["payload"].get("raw_tail", ""), r
 
-    def test_blocked_is_no_change_with_verdict_recorded(self, db):
-        row_id = self._dispatch(db, ({"input_tokens": 0}, "BLOCKED"))
+    def test_blocked_is_no_change_with_verdict_recorded(self, db, tmp_path):
+        row_id = self._dispatch(db, ({"input_tokens": 0}, "BLOCKED"), tmp_path)
         r = db.get(row_id)
         assert r["state"] == "done" and r["outcome"] == "no_change", r
         assert r["payload"].get("verdict") == "BLOCKED", r

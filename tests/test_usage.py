@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from typing import Any
 from unittest.mock import patch, MagicMock
 
@@ -499,6 +500,7 @@ class TestConfigRoutesValidation:
 
     def test_default_routes_valid(self):
         cfg = Config()
+        cfg.claude_bin = sys.executable  # hermetic: no production binary needed
         cfg.deepseek_base_url = "https://api.deepseek.com/anthropic"
         cfg.deepseek_model = "deepseek-v4-flash"
         cfg.deepseek_reasoning_effort = "max"
@@ -509,6 +511,7 @@ class TestConfigRoutesValidation:
 
     def test_custom_routes_valid(self):
         cfg = Config()
+        cfg.claude_bin = sys.executable  # hermetic: no production binary needed
         cfg.neo_routes = "deepinfra:model-a,zai:model-b"
         cfg.deepseek_base_url = "https://api.deepseek.com/anthropic"
         cfg.deepseek_model = "deepseek-v4-flash"
@@ -522,6 +525,7 @@ class TestConfigRoutesValidation:
 
     def test_unknown_provider_raises_on_validate(self):
         cfg = Config()
+        cfg.claude_bin = sys.executable  # hermetic: no production binary needed
         cfg.neo_routes = "unknown_provider:model"
         cfg.deepseek_base_url = "https://api.deepseek.com/anthropic"
         cfg.deepseek_model = "deepseek-v4-flash"
@@ -532,6 +536,7 @@ class TestConfigRoutesValidation:
 
     def test_malformed_route_raises_on_validate(self):
         cfg = Config()
+        cfg.claude_bin = sys.executable  # hermetic: no production binary needed
         cfg.neo_routes = "just-a-string"
         cfg.deepseek_base_url = "https://api.deepseek.com/anthropic"
         cfg.deepseek_model = "deepseek-v4-flash"
@@ -542,6 +547,7 @@ class TestConfigRoutesValidation:
 
     def test_empty_routes_uses_default(self):
         cfg = Config()
+        cfg.claude_bin = sys.executable  # hermetic: no production binary needed
         cfg.neo_routes = ""
         cfg.deepseek_base_url = "https://api.deepseek.com/anthropic"
         cfg.deepseek_model = "deepseek-v4-flash"
@@ -554,6 +560,7 @@ class TestConfigRoutesValidation:
     def test_require_validate_chain(self):
         """require().validate() chain works with default routes."""
         cfg = Config()
+        cfg.claude_bin = sys.executable  # hermetic: no production binary needed
         cfg.webhook_secret = "whs_test"
         cfg.deepseek_key = "sk-test"
         cfg.database_url = "postgres://localhost/test"

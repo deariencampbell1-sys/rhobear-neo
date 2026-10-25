@@ -283,29 +283,32 @@ class HermesAgent:
         # Check stderr for HTTP status codes.
         # Uses anchored patterns to avoid false positives from bare substrings
         # (e.g. "150 files", "Retry-After: 400", "read 400 bytes").
+        # Anchors: "HTTP 429", "HTTP: 429", "HTTP/1.1 429 …", "status: 429",
+        # "status 429", "Error code: 402 …" (provider SDK error lines).
         # Check timeout FIRST so "timed out after reading 400 bytes" is
         # classified as timeout, not as 400.
         if proc is not None and proc.stderr:
             stderr = proc.stderr
             stderr_lower = stderr.lower()
+            status_anchor = (r'(?:\bHTTP(?:/\d(?:\.\d)?)?\s*:?\s*'
+                             r'|\bstatus\s*:?\s*|\berror\s+code\s*:?\s*)')
 
             # Timeout check first (anchored)
             if re.search(r'\btime(?:d\s+)?out\b', stderr_lower):
                 return True, "timeout"
 
-            # 429 / 402 (anchored near HTTP/status: "HTTP 429", "HTTP: 429",
-            # "HTTP/1.1 429 …", "status: 429", "status 429")
-            if re.search(r'(?:\bHTTP(?:/\d(?:\.\d)?)?\s*:?\s*|\bstatus\s*:?\s*)429\b', stderr, re.IGNORECASE):
+            # 429 / 402 (anchored near HTTP/status/error-code)
+            if re.search(status_anchor + r'429\b', stderr, re.IGNORECASE):
                 return True, "429"
-            if re.search(r'(?:\bHTTP(?:/\d(?:\.\d)?)?\s*:?\s*|\bstatus\s*:?\s*)402\b', stderr, re.IGNORECASE):
+            if re.search(status_anchor + r'402\b', stderr, re.IGNORECASE):
                 return True, "402"
 
-            # 5xx (anchored near HTTP/status)
-            if re.search(r'(?:\bHTTP(?:/\d(?:\.\d)?)?\s*:?\s*|\bstatus\s*:?\s*)5\d{2}\b', stderr, re.IGNORECASE):
+            # 5xx (anchored near HTTP/status/error-code)
+            if re.search(status_anchor + r'5\d{2}\b', stderr, re.IGNORECASE):
                 return True, "5xx"
 
-            # 400 (anchored near HTTP/status) — does NOT fall through
-            if re.search(r'(?:\bHTTP(?:/\d(?:\.\d)?)?\s*:?\s*|\bstatus\s*:?\s*)400\b', stderr, re.IGNORECASE):
+            # 400 (anchored near HTTP/status/error-code) — does NOT fall through
+            if re.search(status_anchor + r'400\b', stderr, re.IGNORECASE):
                 return False, "400"
             if re.search(r'\bbad request\b', stderr_lower):
                 return False, "400"

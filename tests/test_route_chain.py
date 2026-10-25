@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -73,7 +74,7 @@ def _cfg() -> Config:
     cfg.deepseek_max_tokens = 32000
     cfg.deepseek_timeout = 30
     cfg.neo_routes = "deepinfra:glm-5.3-flash,zai:glm-5.3-flash,deepseek:deepseek-v4-flash"
-    cfg.claude_bin = "/usr/bin/claude"
+    cfg.claude_bin = sys.executable  # hermetic: no production binary needed
     cfg.gh_token = "test-token"
     cfg.webhook_secret = "whs_test"
     cfg.database_url = DSN
@@ -581,6 +582,7 @@ class TestStartupValidation:
 
     def test_unknown_provider_refused(self):
         cfg = Config()
+        cfg.claude_bin = sys.executable  # hermetic: no production binary needed
         cfg.neo_routes = "unknown_provider:some-model"
         cfg.deepseek_base_url = "https://api.deepseek.com/anthropic"
         cfg.deepseek_model = "deepseek-v4-flash"
@@ -591,6 +593,7 @@ class TestStartupValidation:
 
     def test_malformed_route_refused(self):
         cfg = Config()
+        cfg.claude_bin = sys.executable  # hermetic: no production binary needed
         cfg.neo_routes = "just-a-string"
         cfg.deepseek_base_url = "https://api.deepseek.com/anthropic"
         cfg.deepseek_model = "deepseek-v4-flash"
@@ -601,6 +604,7 @@ class TestStartupValidation:
 
     def test_valid_routes_accepted(self):
         cfg = Config()
+        cfg.claude_bin = sys.executable  # hermetic: no production binary needed
         cfg.neo_routes = "deepinfra:glm-5.3-flash,zai:glm-5.3-flash"
         cfg.deepseek_base_url = "https://api.deepseek.com/anthropic"
         cfg.deepseek_model = "deepseek-v4-flash"
@@ -683,6 +687,7 @@ class TestStatusLineFormats:
         ("hermes timed out after 30s", (True, "timeout")),
         ("HTTP 429 Too Many Requests", (True, "429")),
         ("HTTP/1.1 402 Payment Required", (True, "402")),
+        ("Error code: 402", (True, "402")),
         ("HTTP/1.1 503 Service Unavailable", (True, "5xx")),
         ("HTTP/1.1 400 Bad Request", (False, "400")),
         ("upstream said: bad request", (False, "400")),
