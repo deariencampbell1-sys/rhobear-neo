@@ -1225,6 +1225,38 @@ class TestAdvisorClone:
         assert "git" in err.lower()
         assert "supersecret-token" not in err  # never the token in the error
 
+    def test_askpass_script_keeps_token_out_of_shell_code(self, tmp_path):
+        """A token with shell metacharacters is data, never executable code.
+
+        The generated askpass script must not embed the token; it reads the
+        token from NEO_ADVISOR_GIT_TOKEN in the child environment instead.
+        """
+        from advisor.server import _clone_head
+        bare, _, sha_head = _make_bare_repo(tmp_path)
+        marker = tmp_path / "pwned"
+        token = f'$(touch {marker}); "`touch {marker}`\n'
+        workdir = tmp_path / "advisor"
+        workdir.mkdir()
+
+        clone_dir = _clone_head(str(workdir), "o/r", sha_head, token,
+                                origin_url=bare)
+        assert os.path.isdir(clone_dir)  # normal clone still succeeds
+
+        askpass_path = workdir / "git-askpass.sh"
+        script = askpass_path.read_text()
+        assert token not in script
+        assert not marker.exists()
+
+        # Run the askpass helper the way git would: token only in the env.
+        proc = subprocess.run(
+            [str(askpass_path)],
+            env={**os.environ, "NEO_ADVISOR_GIT_TOKEN": token},
+            capture_output=True, text=True,
+        )
+        assert proc.returncode == 0
+        assert proc.stdout == token + "\n"
+        assert not marker.exists()
+
 
 class TestRouteFallback:
     """Route fallback when claude is missing."""
@@ -1281,6 +1313,17 @@ class TestMalformedJsonRepair:
         result = _parse_work_order(raw)
         assert result["summary"] == "test"
         assert len(result["steps"]) == 1
+
+    @pytest.mark.parametrize("steps", ["abc", ["abc"]])
+    def test_parse_work_order_rejects_malformed_steps(self, steps):
+        """Steps that are not a list of objects are rejected, not passed on."""
+        from advisor.server import _parse_work_order, AgentFailed
+        raw = json.dumps(
+            {"summary": "test", "root_cause": "rc", "steps": steps}
+        )
+        with pytest.raises(AgentFailed,
+                           match="steps must be a list of objects"):
+            _parse_work_order(raw)
 
 
 class TestAgentContainsGhPrMerge:

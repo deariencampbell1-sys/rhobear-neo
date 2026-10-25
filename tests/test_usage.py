@@ -44,10 +44,12 @@ pytestmark = pytest.mark.skipif(not DSN, reason="NEO_TEST_DSN not set")
 
 def _wipe() -> None:
     with psycopg.connect(DSN, autocommit=True) as c:
-        c.execute("DELETE FROM neo_usage")
-        c.execute("DELETE FROM neo_jobs")
-        c.execute("DELETE FROM neo_actions")
-        c.execute("DELETE FROM neo_installs")
+        for table in ("neo_usage", "neo_jobs", "neo_actions", "neo_installs"):
+            exists = c.execute(
+                "SELECT to_regclass(%s)", (table,)
+            ).fetchone()[0]
+            if exists is not None:
+                c.execute(f"DELETE FROM {table}")
 
 
 @pytest.fixture()

@@ -161,7 +161,10 @@ def _parse_work_order(raw: str) -> dict:
             assert isinstance(data, dict), "not a dict"
             assert "summary" in data, "missing summary"
             assert "root_cause" in data, "missing root_cause"
-            assert "steps" in data, "missing steps"
+            steps = data.get("steps")
+            if not isinstance(steps, list) or not all(
+                    isinstance(s, dict) for s in steps):
+                raise AgentFailed("work order steps must be a list of objects")
             return data
         except (json.JSONDecodeError, AssertionError, TypeError) as exc:
             if attempt == 0:
@@ -195,15 +198,17 @@ def _clone_head(tmpdir: str, repo: str, head_sha: str, read_token: str,
     repo_url = origin_url or f"https://github.com/{repo}.git"
     clone_dir = os.path.join(tmpdir, "repo")
 
-    # Credential helper: GIT_ASKPASS echoes the read_token.  The token never
-    # appears in the URL or .git/config.
+    # Credential helper: GIT_ASKPASS prints the read_token from the child
+    # environment.  The token never appears in the URL, .git/config, or the
+    # generated script.
     askpass_path = os.path.join(tmpdir, "git-askpass.sh")
     with open(askpass_path, "w") as f:
         f.write("#!/bin/sh\n")
-        f.write(f'echo "{read_token}"\n')
+        f.write("printf '%s\\n' \"$NEO_ADVISOR_GIT_TOKEN\"\n")
     os.chmod(askpass_path, 0o700)
     env = {**os.environ, "GIT_ASKPASS": askpass_path,
-           "GIT_TERMINAL_PROMPT": "0"}
+           "GIT_TERMINAL_PROMPT": "0",
+           "NEO_ADVISOR_GIT_TOKEN": read_token}
 
     steps = [
         ["git", "init", clone_dir],
