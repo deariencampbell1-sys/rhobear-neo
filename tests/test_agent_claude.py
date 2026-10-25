@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import tempfile
 from typing import Any
 from unittest.mock import patch
@@ -38,6 +39,7 @@ from src.agent_claude import (
     MissingResult,
     UnknownVerdict,
     MalformedStream,
+    ApiError,
     CANONICAL_VERDICTS,
 )
 from src.config import Config
@@ -49,7 +51,7 @@ from src.config import Config
 BASE = "https://api.deepseek.com/anthropic"
 API_KEY = "sk-test-placeholder"
 MODEL = "deepseek-v4-flash"          # exact direct ID — no prefix, no [1m] suffix
-GH_TOKEN = "ghp_test_token_placeholder"
+GH_TOKEN = "test_token_placeholder"
 CLAUDE_BIN = "/usr/bin/claude"
 
 
@@ -193,7 +195,7 @@ class TestCommandAssembly:
         cfg.claude_bin = CLAUDE_BIN
         cfg.gh_token = GH_TOKEN
 
-        agent = ClaudeAgent.from_config(cfg)
+        agent = ClaudeAgent.from_config(cfg, gh_token=GH_TOKEN)
         assert agent.claude_bin == CLAUDE_BIN
         assert agent.api_key == API_KEY
         assert agent.base_url == BASE
@@ -527,37 +529,46 @@ class TestTempCwdLifecycle:
 # ===================================================================
 
 class TestWorkerWrapper:
-    """_run_agent in neo_worker catches errors, passes through success."""
+    """_run_agent in neo_worker catches errors, passes through success.
+
+    _run_agent now returns 4 values: (usage, verdict, route_idx, route).
+    """
 
     def test_wrapper_catches_errors(self) -> None:
         from src.neo_worker import _run_agent
 
         agent = _make_agent()
         with patch.object(agent, "run", side_effect=TimeoutError("timed out")):
-            usage, verdict = _run_agent(agent, "test brief")
+            usage, verdict, ridx, route = _run_agent(agent, "test brief")
 
         assert usage == {}
         assert verdict == ""
+        assert ridx is None
+        assert route is None
 
     def test_wrapper_passes_success(self) -> None:
         from src.neo_worker import _run_agent
 
         agent = _make_agent()
         with patch.object(agent, "run", return_value=({"input_tokens": 150}, "ACCEPT-READY")):
-            usage, verdict = _run_agent(agent, "test brief")
+            usage, verdict, ridx, route = _run_agent(agent, "test brief")
 
         assert verdict == "ACCEPT-READY"
         assert usage["input_tokens"] == 150
+        assert ridx is None
+        assert route is None
 
     def test_wrapper_catches_generic_agent_error(self) -> None:
         from src.neo_worker import _run_agent
 
         agent = _make_agent()
         with patch.object(agent, "run", side_effect=UnknownVerdict("no VERDICT")):
-            usage, verdict = _run_agent(agent, "test brief")
+            usage, verdict, ridx, route = _run_agent(agent, "test brief")
 
         assert usage == {}
         assert verdict == ""
+        assert ridx is None
+        assert route is None
 
 
 # ===================================================================
@@ -573,7 +584,7 @@ class TestConfigMapping:
         cfg.deepseek_key = "sk-test-key"
         cfg.gh_token = GH_TOKEN
         cfg.claude_bin = CLAUDE_BIN
-        agent = ClaudeAgent.from_config(cfg)
+        agent = ClaudeAgent.from_config(cfg, gh_token=GH_TOKEN)
         assert agent.api_key == "sk-test-key"
 
     def test_deepseek_model_mapped(self) -> None:
@@ -583,7 +594,7 @@ class TestConfigMapping:
         cfg.deepseek_model = "deepseek-v4-flash"
         cfg.gh_token = GH_TOKEN
         cfg.claude_bin = CLAUDE_BIN
-        agent = ClaudeAgent.from_config(cfg)
+        agent = ClaudeAgent.from_config(cfg, gh_token=GH_TOKEN)
         assert agent.model == "deepseek-v4-flash"
         assert agent.model == cfg.deepseek_model
 
@@ -606,7 +617,7 @@ class TestConfigValidation:
         cfg.webhook_secret = "whs_test"
         cfg.deepseek_key = "sk-test"
         cfg.database_url = "postgres://localhost/test"
-        cfg.gh_token = "ghp_test"
+        cfg.gh_token = "test-token"
         cfg.require()
 
 
@@ -644,7 +655,7 @@ class TestStaleOpenRouterEnv:
             cfg = Config()
             cfg.webhook_secret = "whs_test"
             cfg.database_url = "postgres://localhost/test"
-            cfg.gh_token = "ghp_test"
+            cfg.gh_token = "test-token"
             with pytest.raises(RuntimeError, match="DEEPSEEK_API_KEY"):
                 cfg.require()
 
@@ -654,10 +665,14 @@ class TestStaleOpenRouterEnv:
 # ===================================================================
 
 class TestCanonicalSet:
-    """The CANONICAL_VERDICTS constant contains exactly the 5 expected values."""
+    """The CANONICAL_VERDICTS constant contains exactly the 6 expected values (production adds FIXED)."""
 
     def test_exact_set(self) -> None:
+        # Production adds FIXED as a builder alias for ACCEPT-READY.
+        # B2 adds ACCEPT (agent no longer merges, returns ACCEPT).
         assert CANONICAL_VERDICTS == {
+            "FIXED",
+            "ACCEPT",
             "ACCEPT-MERGED",
             "ACCEPT-READY",
             "FIX-FORWARD",
@@ -881,7 +896,7 @@ class TestResultEnvelope:
         assert v == "ACCEPT-READY"
 
     def test_api_error_status_present_fails(self) -> None:
-        """Non-null api_error_status should raise MalformedStream."""
+        """Non-null api_error_status should raise ApiError."""
         output = json.dumps({
             "type": "result", "subtype": "success", "is_error": False,
             "result": "Analysis.\nVERDICT: ACCEPT-READY",
@@ -891,7 +906,7 @@ class TestResultEnvelope:
         })
         proc = _fake_proc(stdout=output)
         agent = _make_agent()
-        with pytest.raises(MalformedStream, match="api_error_status"):
+        with pytest.raises(ApiError, match="api_error"):
             agent._parse_output(proc)
 
     def test_api_error_status_null_ok(self) -> None:
@@ -935,6 +950,7 @@ class TestConfigValidate:
         """Trailing slash on the base URL should be tolerated."""
         cfg = Config()
         cfg.deepseek_base_url = "https://api.deepseek.com/anthropic/"
+        cfg.claude_bin = sys.executable  # hermetic: no production binary needed
         cfg.validate()  # should not raise
 
     def test_validate_rejects_stale_prefixed_model(self) -> None:
@@ -978,6 +994,7 @@ class TestConfigValidate:
         cfg.deepseek_model = "deepseek-v4-flash"
         cfg.deepseek_reasoning_effort = "max"
         cfg.deepseek_max_tokens = 32000
+        cfg.claude_bin = sys.executable  # hermetic: no production binary needed
         cfg.validate()  # should not raise
 
     def test_validate_missing_claude_bin_posix(self) -> None:
@@ -1054,7 +1071,7 @@ class TestStartupValidation:
         cfg.webhook_secret = "whs_test"
         cfg.deepseek_key = "sk-test"
         cfg.database_url = "postgres://localhost/test"
-        cfg.gh_token = "ghp_test"
+        cfg.gh_token = "test-token"
         cfg.deepseek_base_url = "https://api.deepseek.com/anthropic"
         cfg.deepseek_model = "deepseek-v4-flash"
         cfg.deepseek_reasoning_effort = "max"
@@ -1090,6 +1107,7 @@ class TestStartupValidation:
     def test_startup_validate_after_require_ok(self) -> None:
         """A valid config passes require().validate() chain."""
         cfg = self._make_invalid_cfg()  # all defaults are valid
+        cfg.claude_bin = sys.executable  # hermetic: no production binary needed
         cfg.require().validate()  # should not raise
 
     def test_main_uses_validate_chain(self) -> None:
@@ -1212,32 +1230,124 @@ data = {
 print(json.dumps(data))
 sys.exit(0)
 '''
-        with _tf.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as _f:
-            _f.write(_script)
-            _py_path = _f.name
-
-        # Temp batch file that calls the Python script (ignores all CLI args).
-        _bat_content = '@echo off\npython "' + _py_path + '"\nexit /b 0\n'
-        with _tf.NamedTemporaryFile(mode='w', suffix='.bat', delete=False) as _f:
-            _f.write(_bat_content)
-            _bat_path = _f.name
+        _cleanup = []
+        if _os.name == "nt":
+            # Windows: temp batch file that calls the Python script.
+            with _tf.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as _f:
+                _f.write(_script)
+                _py_path = _f.name
+            _cleanup.append(_py_path)
+            _bat_content = '@echo off\npython "' + _py_path + '"\nexit /b 0\n'
+            with _tf.NamedTemporaryFile(mode='w', suffix='.bat', delete=False) as _f:
+                _f.write(_bat_content)
+                _claude_bin = _f.name
+        else:
+            # POSIX (W1-02: made hermetic on the build box): the script itself
+            # is the CLI stub — shebang + exec bit. A .bat has no interpreter
+            # here and temp files are not executable by default.
+            with _tf.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as _f:
+                _f.write("#!" + sys.executable + "\n" + _script)
+                _claude_bin = _f.name
+            _os.chmod(_claude_bin, 0o755)
+        _cleanup.append(_claude_bin)
 
         try:
             agent = ClaudeAgent(
-                claude_bin=_bat_path,
+                claude_bin=_claude_bin,
                 api_key="sk-smoke",
                 base_url="https://api.deepseek.com/anthropic",
                 model="deepseek-v4-flash",
                 effort="max",
                 max_tokens=32000,
                 timeout=30,
-                gh_token="ghp_smoke",
+                gh_token="test-token-smoke",
             )
             usage, verdict = agent.run("test brief")
             assert verdict == "ACCEPT-READY"
             assert usage["input_tokens"] == 100
             assert usage["output_tokens"] == 50
         finally:
-            for _p in (_py_path, _bat_path):
+            for _p in _cleanup:
                 if _os.path.exists(_p):
                     _os.unlink(_p)
+
+# ===================================================================
+# Round 2 — env allowlist for the triage agent + anchored fallthrough
+# classification (the divergent usage.classify_cli_fallthrough is deleted)
+# ===================================================================
+
+class TestClaudeEnvAllowlist:
+    """The triage agent runs --dangerously-skip-permissions over PR-derived
+    briefs — its child env is an explicit allowlist plus the route's own
+    Anthropic credentials, never a copy of the service environment."""
+
+    def test_service_secrets_never_reach_the_subprocess(self, monkeypatch) -> None:
+        for name, value in {
+            "DATABASE_URL": "postgresql://app:hunter2@db.internal/prod",
+            "NEO_ADVISOR_TOKEN": "advisor-bearer-secret",
+            "NEO_GITHUB_APP_KEY": "-----BEGIN PRIVATE KEY-----",
+            "NEO_GITHUB_APP_KEY_PATH": "/opt/rhobear/rhobear-neo/app-key.pem",
+            "OPENROUTER_API_KEY": "sk-or-v1-secret",
+        }.items():
+            monkeypatch.setenv(name, value)
+        agent = _make_agent()
+        env = agent._build_env("/tmp/neo-config-test")
+        for name in ("DATABASE_URL", "NEO_ADVISOR_TOKEN", "NEO_GITHUB_APP_KEY",
+                     "NEO_GITHUB_APP_KEY_PATH", "OPENROUTER_API_KEY"):
+            assert name not in env, f"secret env var {name} reached the subprocess"
+        # Only the route's own API key may be a *_KEY — everything else is gone.
+        assert [k for k in env if k.endswith("_KEY")] == ["ANTHROPIC_API_KEY"]
+        assert env["ANTHROPIC_API_KEY"] == API_KEY
+
+
+class TestAnchoredFallthroughClassification:
+    """The surviving fallthrough classifier anchors on `api_error_status` /
+    `HTTP <code>` — never on bare substrings."""
+
+    def _agent(self) -> ClaudeAgent:
+        return ClaudeAgent.__new__(ClaudeAgent)
+
+    def test_cost_1500_tokens_is_not_5xx(self) -> None:
+        """Round-2 finding: "cost 1500 tokens" classified as 5xx via the bare
+        "50" substring. It is an unknown API error — NOT a fallthrough."""
+        got = self._agent()._classify_agent_error(
+            ApiError("cost 1500 tokens"), self._agent())
+        assert got[0] is False
+        assert got[1] != "5xx"
+
+    def test_read_400_bytes_is_not_400(self) -> None:
+        got = self._agent()._classify_agent_error(
+            ApiError("read 400 bytes then 150 files"), self._agent())
+        assert got != (False, "400")
+
+    @pytest.mark.parametrize("err_str,expected", [
+        ("HTTP/1.1 503 Service Unavailable", (True, "5xx")),
+        ("HTTP 429 Too Many Requests", (True, "429")),
+        ("Error code: 402 — payment required", (True, "402")),
+        ("status: 400 bad request", (False, "400")),
+        ("429", (True, "429")),
+        ("503", (True, "5xx")),
+        ("request timed out", (True, "timeout")),
+    ])
+    def test_anchored_status_codes(self, err_str, expected) -> None:
+        got = self._agent()._classify_agent_error(ApiError(err_str), self._agent())
+        assert got == expected
+
+    def test_json_envelope_api_error_status_is_anchored(self) -> None:
+        """The JSON envelope path uses api_error_status with the same anchor."""
+        agent = self._agent()
+        proc = subprocess.CompletedProcess(
+            args=["claude"], returncode=1,
+            stdout=json.dumps({"type": "result",
+                               "api_error_status": "HTTP/1.1 503 Service Unavailable"}),
+            stderr="")
+        assert agent._classify_agent_error(
+            NonZeroExit("x"), agent, proc=proc) == (True, "5xx")
+
+        proc = subprocess.CompletedProcess(
+            args=["claude"], returncode=1,
+            stdout=json.dumps({"type": "result",
+                               "api_error_status": "cost 1500 tokens"}),
+            stderr="")
+        got = agent._classify_agent_error(NonZeroExit("x"), agent, proc=proc)
+        assert got[0] is False and got[1] != "5xx"

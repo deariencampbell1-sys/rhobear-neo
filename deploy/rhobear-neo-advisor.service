@@ -1,0 +1,48 @@
+# /etc/systemd/system/rhobear-neo-advisor.service
+#
+# W1-10-r1 (HIGH-2.2): the hardened advisor unit.  W1-03 installs it.
+#
+# The advisor reads attacker-controlled PR content and runs a frontier agent;
+# its work order reaches the `--yolo` fixer.  It therefore runs as its own
+# dedicated unprivileged user confined to ITS OWN clone dir
+# (/opt/rhobear/rhobear-neo-advisor) — never as the service user, and never
+# with access to the main deploy dir where /opt/rhobear/rhobear-neo/.env and
+# app-key.pem live.  Installing this unit (and moving the advisor tree under
+# its own user) is the W1-03 deploy work; this file is the spec for it.
+#
+# NOTE for W1-03: the frontier CLI resolves its provider credentials from the
+# service user's HOME config; ProtectHome=true hides /home, so place that
+# config inside this tree (readable, read-only) at install time.
+[Unit]
+Description=rhobear-neo advisor - read-only frontier advisor for escalation work orders
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rhobear-advisor
+WorkingDirectory=/opt/rhobear/rhobear-neo-advisor
+EnvironmentFile=/opt/rhobear/rhobear-neo-advisor/.env
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/opt/rhobear/rhobear-neo-advisor/.venv/bin
+ExecStart=/opt/rhobear/rhobear-neo-advisor/.venv/bin/python -m advisor.server
+Restart=always
+RestartSec=15
+
+# Hardening (W1-10-r1, HIGH-2.2).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# ReadWritePaths = only the advisor's own clone dir.  Per-request repo clones
+# live in tempfile dirs under /tmp (covered by PrivateTmp).  Nothing under
+# /opt/rhobear/rhobear-neo (the main deploy dir with .env and app-key.pem) is
+# writable or reachable by this user.
+ReadWritePaths=/opt/rhobear/rhobear-neo-advisor
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
