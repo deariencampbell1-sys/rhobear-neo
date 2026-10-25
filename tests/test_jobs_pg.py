@@ -1093,8 +1093,11 @@ class TestE2EEscalationPG:
         assert r6_payload["phase"] == "escalated"
         assert r6_payload["context"] == "neo:escalated"
         assert r6_payload["work_order"]["summary"] == "Fix auth bug"
-        assert "ESCALATED ADVISOR WORK ORDER" in r6_payload["brief"]
-        assert "Fix auth bug" in r6_payload["brief"]
+        # The pre-rendered brief is derived data and is no longer stored
+        # (W1-10-r1 HIGH-1: storing it doubled the at-rest exposure); the
+        # builder renders it from the redacted work_order at dispatch time.
+        assert "brief" not in r6_payload
+        assert "Fix auth bug" in r6_payload["work_order"]["summary"]
 
         # --- dispatched, not parked: the escalated round is claimable --------
         claimed = jobs.claim_queued("builder")

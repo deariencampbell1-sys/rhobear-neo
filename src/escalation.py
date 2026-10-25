@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 from .config import Config
+from .redact import redact_data
 
 log = logging.getLogger("rhobear_neo.escalation")
 
@@ -387,7 +388,21 @@ def escalate_pr(
         reason = "advisor returned empty work order (no steps)"
         return _park_pr(state, jobs, repo, pr, head_sha, reason)
 
-    brief = work_order.to_builder_brief(repo, pr, head_sha)
+    # HIGH 1 (W1-10-r1): the advisor's fields are attacker-controlled output
+    # that MAY echo host secrets.  Redact BEFORE anything is persisted — the
+    # raw work order plus a pre-rendered brief used to be written to
+    # neo_jobs.payload, leaving every echoed secret at rest in the database
+    # and its backups (a clean egress render does not help at rest).  The
+    # rendered brief is derived data and is no longer stored at all: the
+    # builder renders it from the redacted work_order at dispatch time.
+    redacted = redact_data({
+        "route": work_order.route,
+        "summary": work_order.summary,
+        "root_cause": work_order.root_cause,
+        "steps": work_order.steps,
+        "tests": work_order.tests,
+        "risks": work_order.risks,
+    })
     new_round = count_builder_rounds(state, repo, pr) + 1
 
     existing_round = (state.advisor_escalation_for(repo, pr, advice_id)
@@ -399,9 +414,9 @@ def escalate_pr(
                          "reason": "escalated to frontier advisor",
                          "advice_id": str(advice_id or ""),
                          "work_order": {
-                             "route": work_order.route,
-                             "summary": work_order.summary,
-                             "root_cause": work_order.root_cause,
+                             "route": redacted["route"],
+                             "summary": redacted["summary"],
+                             "root_cause": redacted["root_cause"],
                              "steps_count": len(work_order.steps),
                          },
                          "advisor_round": new_round,
@@ -420,15 +435,9 @@ def escalate_pr(
             "round": new_round,
             "context": "neo:escalated",
             "escalated": True,
-            "work_order": {
-                "route": work_order.route,
-                "summary": work_order.summary,
-                "root_cause": work_order.root_cause,
-                "steps": work_order.steps,
-                "tests": work_order.tests,
-                "risks": work_order.risks,
-            },
-            "brief": brief,
+            # Redacted at rest (HIGH 1): never the raw advisor output, and
+            # never the derived brief (it would double the exposure).
+            "work_order": redacted,
             "installation_id": installation_id,
         })
 
@@ -438,14 +447,7 @@ def escalate_pr(
     return {
         "action": "escalated",
         "reason": "escalated to frontier advisor",
-        "work_order": {
-            "route": work_order.route,
-            "summary": work_order.summary,
-            "root_cause": work_order.root_cause,
-            "steps": work_order.steps,
-            "tests": work_order.tests,
-            "risks": work_order.risks,
-        },
+        "work_order": redacted,
         "round": new_round,
     }
 

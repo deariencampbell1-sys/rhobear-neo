@@ -12,5 +12,27 @@ ExecStart=/opt/rhobear/rhobear-neo/.venv/bin/python -m src.neo_builder
 Restart=always
 RestartSec=15
 
+# Hardening (W1-10-r1, MEDIUM-1): the fixer runs `--yolo --accept-hooks` in a
+# worktree of third-party PR content and holds a push token, so a
+# prompt-injected diff must not be able to reach the rest of the box.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# ReadWritePaths = exactly what src/neo_builder.py writes (derived from the
+# code, not guessed):
+#   /opt/rhobear/neo-builder-worktrees  WORKTREES - the per repo+PR git
+#                                         clones the fixer works in, plus the
+#                                         .locks/ fcntl lock dir inside it
+#                                         (prepare_worktree)
+#   /opt/rhobear/neo-builder-briefs     BRIEFS - the rendered brief.md for
+#                                         each dispatched round (dispatch_one)
+# Everything else is read-only; /tmp is PrivateTmp.  Secrets (.env,
+# app-key.pem) live under /opt/rhobear/rhobear-neo and are never writable
+# from this unit.
+ReadWritePaths=/opt/rhobear/neo-builder-worktrees /opt/rhobear/neo-builder-briefs
+
 [Install]
 WantedBy=multi-user.target

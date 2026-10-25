@@ -46,6 +46,21 @@ log = logging.getLogger("rhobear_neo.advisor.server")
 # Advice records are kept for 24 h, then pruned.
 RECORD_TTL_SECS = 24 * 60 * 60
 
+# The advisor path is OFF unless explicitly enabled.  The advisor reads
+# attacker-controlled PR content and (until W1-03 installs the hardened
+# rhobear-neo-advisor unit as a dedicated unprivileged user confined to its
+# clone dir) runs as the service user with the deploy dir in reach — while
+# its output reaches a --yolo fixer holding a push token.  Enabling it
+# before that unit is installed is a live secret-exfiltration path.
+# Fail closed: NEO_ADVISOR_ENABLED=1 is the only way in (HIGH 2.1).
+ADVISOR_ENABLE_VAR = "NEO_ADVISOR_ENABLED"
+
+
+def advisor_enabled() -> bool:
+    """True only when NEO_ADVISOR_ENABLED=1 is explicitly set in the
+    environment.  Unset/empty/anything else: the advise path stays closed."""
+    return os.environ.get(ADVISOR_ENABLE_VAR, "") == "1"
+
 
 class AdvisorError(Exception):
     """Base for advisor failures."""
@@ -548,6 +563,13 @@ class AdvisorRequestHandler(BaseHTTPRequestHandler):
             return self._reply(404, {"error": "not found"})
         if not self._authorized():
             return self._reply(401, {"error": "unauthorized"})
+        if getattr(self.server, "advisor_enabled", True) is not True:
+            # Fail closed (HIGH 2.1): without NEO_ADVISOR_ENABLED=1 the
+            # advise path is never called — the request is refused with the
+            # variable an operator has to set.
+            return self._reply(503, {
+                "error": f"advisor disabled — set {ADVISOR_ENABLE_VAR}=1 to enable",
+            })
 
         # --- Parse body -------------------------------------------------
         try:
@@ -589,6 +611,10 @@ class AdvisorRequestHandler(BaseHTTPRequestHandler):
             return self._reply(404, {"error": "not found"})
         if not self._authorized():
             return self._reply(401, {"error": "unauthorized"})
+        if getattr(self.server, "advisor_enabled", True) is not True:
+            return self._reply(503, {
+                "error": f"advisor disabled — set {ADVISOR_ENABLE_VAR}=1 to enable",
+            })
         advice_id = self.path[len(prefix):].strip("/")
         service = getattr(self.server, "advisor_service", None)
         if service is None:
@@ -607,18 +633,26 @@ def serve(
     advisor_queue_max: int = 3,
     advisor_timeout: int = 1200,
     origin_url: str | None = None,
+    enabled: bool = True,
 ) -> None:
-    """Start the advisor HTTP server (ThreadingHTTPServer + AdvisorService)."""
+    """Start the advisor HTTP server (ThreadingHTTPServer + AdvisorService).
+
+    `enabled=False` serves with the advise path CLOSED (main()'s fail-closed
+    default): the service still answers, but no request can reach the
+    advisor machinery."""
     server = ThreadingHTTPServer((bind_host, bind_port), AdvisorRequestHandler)
     server.advisor_token = advisor_token
-    server.advisor_service = AdvisorService(
-        routes=advisor_routes,
-        timeout=advisor_timeout,
-        queue_max=advisor_queue_max,
-        origin_url=origin_url,
+    server.advisor_enabled = enabled
+    server.advisor_service = (
+        AdvisorService(
+            routes=advisor_routes,
+            timeout=advisor_timeout,
+            queue_max=advisor_queue_max,
+            origin_url=origin_url,
+        ) if enabled else None
     )
-    log.info("advisor listening on %s:%d (routes=%s queue_max=%d)",
-             bind_host, bind_port, advisor_routes, advisor_queue_max)
+    log.info("advisor listening on %s:%d (routes=%s queue_max=%d enabled=%s)",
+             bind_host, bind_port, advisor_routes, advisor_queue_max, enabled)
     server.serve_forever()
 
 
@@ -643,8 +677,27 @@ def main() -> None:
     advisor_queue_max = int(os.environ.get("ADVISOR_QUEUE_MAX", "3"))
     advisor_timeout = int(os.environ.get("ADVISOR_TIMEOUT", "1200"))
 
+    if not advisor_enabled():
+        # Fail closed (HIGH 2.1): one clear line naming the variable, then
+        # CONTINUE SERVING with the advise path closed.  The advisor path is
+        # never entered implicitly.
+        log.warning(
+            "advisor escalation is DISABLED — the advise path stays closed; "
+            "set %s=1 to enable it (only after the hardened "
+            "rhobear-neo-advisor unit is installed)", ADVISOR_ENABLE_VAR)
+        serve(
+            bind_host=bind_host,
+            bind_port=bind_port,
+            advisor_token=advisor_token,
+            advisor_routes=advisor_routes,
+            advisor_queue_max=advisor_queue_max,
+            advisor_timeout=advisor_timeout,
+            enabled=False,
+        )
+        return
+
     if not advisor_token:
-        log.error("ADVISOR_TOKEN not set — refusing to start")
+        log.error("NEO_ADVISOR_TOKEN not set — refusing to start")
         sys.exit(1)
 
     serve(
@@ -654,6 +707,7 @@ def main() -> None:
         advisor_routes=advisor_routes,
         advisor_queue_max=advisor_queue_max,
         advisor_timeout=advisor_timeout,
+        enabled=True,
     )
 
 
