@@ -28,12 +28,12 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 import subprocess
 import tempfile
 import time
 
 from .config import Config
+from .neo_protocol import extract_verdict_line
 from .usage import (
     Route, UsageAttempt, classify_cli_fallthrough,
 )
@@ -47,12 +47,6 @@ CANONICAL_VERDICTS = frozenset({
     "BOUNCE-BUILDER",
     "ESCALATE",
 })
-
-_VERDICT_RE = re.compile(
-    r'^\s*(?:[*]{1,2}|>`?\s*|-\s+)?VERDICT:\s*(.*?)(?:\s*[*`]+)?\s*$',
-    re.IGNORECASE,
-)
-
 
 class AgentError(Exception):
     """Base for all Hermes agent failures — fail-closed root."""
@@ -438,8 +432,8 @@ class HermesAgent:
 
     @staticmethod
     def _extract_verdict(text: str) -> str | None:
-        for line in text.splitlines():
-            m = _VERDICT_RE.match(line)
-            if m:
-                return m.group(1).strip().upper()
-        return None
+        """Verdict word from the answer tail — shape-tolerant extraction
+        (case-insensitive `VERDICT: <word>` in the last 40 lines, also inside a
+        fenced block or after markdown bold) lives in neo_protocol; this lane
+        only decides which verdict words it accepts."""
+        return extract_verdict_line(text)

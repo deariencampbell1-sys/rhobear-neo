@@ -15,6 +15,8 @@ The old ACCEPT-MERGED verdict is still parsed for backward compatibility.
 """
 from __future__ import annotations
 
+import re
+
 
 def build_brief(*, repo: str, pr: int, head_sha: str, reviewer_context: str,
                 reviewer_green: bool, auto_merge: bool, builder_round: int,
@@ -92,3 +94,131 @@ REASONS:
 - <one line>
 ACTIONS: <what you did — commits/labels/builder dispatched>
 """
+
+
+# ---------------------------------------------------------------------------
+# Verdict parsing — Zeus's own answers
+# ---------------------------------------------------------------------------
+#
+# Zeus's own verdicts are exactly ACCEPT, FIX-FORWARD and BOUNCE (owner, Q9:
+# "Zeus answers: ACCEPT, FIX-FORWARD or BOUNCE").  Apollo's words (ACCEPT /
+# REQUEST_CHANGES / COMMENT) are read from its review state on GitHub and are
+# NEVER parsed from text.
+ZEUS_VERDICTS = ("ACCEPT", "FIX-FORWARD", "BOUNCE")
+
+# The internal protocol canon still speaks a few alias words (the OUTPUT
+# contract above, the builder fixer contract, and pre-Q9 answers).  They map
+# onto the three Q9 words for everything a person sees: the owner's vocabulary
+# is exactly three words (see the `verdicts` / `merge-ask` flows — "BOUNCE
+# means a person decides", which covers the ESCALATE owner-proxy handoff).
+_ZEUS_ALIASES = {
+    "ACCEPT": "ACCEPT",
+    "ACCEPT-MERGED": "ACCEPT",
+    "ACCEPT-READY": "ACCEPT",
+    "FIXED": "ACCEPT",           # builder alias for ACCEPT-READY
+    "FIX-FORWARD": "FIX-FORWARD",
+    "BOUNCE": "BOUNCE",
+    "BOUNCE-BUILDER": "BOUNCE",
+    "ESCALATE": "BOUNCE",
+}
+
+# Words the builder fixer contract may answer (extracted raw for the builder
+# lane); not Zeus's own verdicts — parse_verdict never returns these.
+_BUILDER_WORDS = frozenset({"FIXED", "NO-CHANGE", "BLOCKED"})
+
+_KNOWN_VERDICT_WORDS = frozenset(_ZEUS_ALIASES) | _BUILDER_WORDS
+
+# The verdict is the closing line of an answer; scan only the tail so an
+# example or a quoted earlier answer deeper in the text can never win.
+_VERDICT_WINDOW = 40
+
+
+def _strip_markup(line: str) -> str:
+    """Remove markdown emphasis/decoration so `**VERDICT:** BOUNCE` and
+    `> - **VERDICT: BOUNCE**` all reduce to `VERDICT: BOUNCE`."""
+    cleaned = line
+    for ch in ("*", "`", "_", "~"):
+        cleaned = cleaned.replace(ch, "")
+    cleaned = cleaned.strip()
+    cleaned = re.sub(r"^(?:#{1,6}\s*|>\s*|[-+]\s+|\d+[.)]\s+)+", "", cleaned)
+    return cleaned.strip()
+
+
+_MARKER_WITH_VALUE_RE = re.compile(r"^VERDICT:\s*([A-Za-z][A-Za-z-]*)", re.IGNORECASE)
+_MARKER_ONLY_RE = re.compile(r"^VERDICT:\s*$", re.IGNORECASE)
+_BARE_WORD_RE = re.compile(r"^([A-Za-z][A-Za-z-]*)\s*[.!]?$", re.IGNORECASE)
+
+
+def _line_verdict_value(line: str) -> str | None:
+    """The verdict word on one line, or None.  Accepts `VERDICT: <word>`
+    after any markdown bold/heading/bullet decoration, and the bolded-label
+    shape where the colon sits inside the bold (`**VERDICT:** BOUNCE`).
+    Trailing prose after the word (`**VERDICT: BOUNCE.** Both are small.`)
+    keeps only the word.  Prose that merely mentions the marker
+    ("Do not output VERDICT: ...") never matches: the marker must start the
+    line after decoration is stripped."""
+    cleaned = _strip_markup(line)
+    if not cleaned:
+        return None
+    m = _MARKER_WITH_VALUE_RE.match(cleaned)
+    if m:
+        return m.group(1).upper()
+    return None
+
+
+def _is_bare_marker(line: str) -> bool:
+    """True for a bolded/plain `VERDICT:` label with its word on the next
+    line ("after markdown bold")."""
+    return bool(_MARKER_ONLY_RE.match(_strip_markup(line)))
+
+
+def _bare_verdict_word(line: str) -> str | None:
+    cleaned = _strip_markup(line)
+    m = _BARE_WORD_RE.match(cleaned)
+    if m and m.group(1).upper() in _KNOWN_VERDICT_WORDS:
+        return m.group(1).upper()
+    return None
+
+
+def _verdict_values(text: str, window: int = _VERDICT_WINDOW) -> list[str]:
+    """Verdict words in the last `window` lines, most recent first."""
+    lines = text.splitlines()[-window:]
+    found: list[str] = []
+    for idx, line in enumerate(lines):
+        value = _line_verdict_value(line)
+        if value is None and _is_bare_marker(line) and idx + 1 < len(lines):
+            value = _bare_verdict_word(lines[idx + 1])
+        if value:
+            found.append(value)
+    found.reverse()
+    return found
+
+
+def extract_verdict_line(text: str, *, window: int = _VERDICT_WINDOW) -> str | None:
+    """The raw verdict word from the tail of an agent answer (any canon word:
+    the protocol OUTPUT contract, the builder fixer contract, or a Q9 word).
+
+    Scans the last `window` lines (default 40), most recent first.  Tolerates
+    fenced blocks and markdown bold.  Returns the uppercased word or None.
+    """
+    values = _verdict_values(text, window)
+    return values[0] if values else None
+
+
+def parse_verdict(text: str, *, window: int = _VERDICT_WINDOW) -> str | None:
+    """Zeus's own verdict from its answer text: exactly ACCEPT, FIX-FORWARD
+    or BOUNCE (owner, Q9).
+
+    Accepts `VERDICT: <word>` case-insensitively on a line anywhere in the
+    last 40 lines, also inside a fenced block or after markdown bold.  The
+    internal canon aliases (ACCEPT-MERGED, ACCEPT-READY, FIXED, BOUNCE-BUILDER,
+    ESCALATE) map onto the three Q9 words; the most recent verdict in the
+    window wins.  Returns one of ZEUS_VERDICTS (uppercased) or None — never a
+    guess: Apollo's words ACCEPT / REQUEST_CHANGES / COMMENT are read from its
+    review state, not parsed from text.
+    """
+    for value in _verdict_values(text, window):
+        zeus_word = _ZEUS_ALIASES.get(value)
+        if zeus_word:
+            return zeus_word
+    return None
