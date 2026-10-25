@@ -25,7 +25,7 @@ import subprocess
 
 from .config import Config
 from .jobs import Jobs
-from .neo_state import NeoState
+from .neo_state import NeoState, verdict_color
 from .agent_claude import ClaudeAgent, AgentError
 from .github_app import AppNotConfigured, GitHubAppError, NoInstallation, repo_token
 from . import neo_protocol
@@ -84,6 +84,21 @@ def credits_for(usage: dict, builder: bool) -> int:
     else:
         cost = fin * GEMINI["flash_in"] + fout * GEMINI["flash_out"]
     return int(cost * MARGIN * CREDITS_PER_USD)
+
+
+# --- metering: the owner workspace never meters ----------------------------
+# install_id = 'deariencampbell1-sys' (the owner workspace) and any install
+# whose `plan` is empty skip BOTH the credit gate and the debit. Customers
+# with a plan are gated on balance <= 0 (and told so on the PR) and debited.
+OWNER_INSTALL_ID = "deariencampbell1-sys"
+
+
+def meters_credits(inst: dict) -> bool:
+    """True only for a paying customer install: a non-empty plan AND not the
+    owner workspace. The owner workspace never meters (owner, W1-02)."""
+    if str(inst.get("install_id") or "") == OWNER_INSTALL_ID:
+        return False
+    return bool(inst.get("plan"))
 
 
 def _compute_diff_stat(token: str, repo: str, pr: int) -> str:
@@ -320,7 +335,7 @@ def _wake_lease(cfg: Config) -> int:
 def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict,
            usage_store: UsageStore | None = None) -> None:
     repo, sha = wake["repo"], wake["sha"]
-    green = bool(wake.get("green"))
+    green = verdict_color(wake.get("green"))
 
     # --- durable wake job -------------------------------------------------
     # on_verdict() already persisted the job (keyed by repo + head sha +
@@ -329,7 +344,7 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict,
     # terminal or expired job is re-armed, an active one is left alone.
     job_id = wake.get("job_id")
     if not job_id:
-        job_id = jobs.create_wake(repo, sha, green,
+        job_id = jobs.create_wake(repo, sha, bool(green),
                                   pr_number=wake.get("pr_number"), payload=wake)
         if job_id is None:
             log.info("deduped wake %s@%s — an active job already owns it", repo, sha[:8])
@@ -432,7 +447,7 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict,
                        "escalating", "builder_blocked", "blocked"):
         if state.already_acted(repo, pr, sha, done_phase, green=green):
             state.record(repo, pr, sha, "triage",
-                         detail={"green": wake.get("green"), "recovered": done_phase})
+                         detail={"green": bool(green), "recovered": done_phase})
             jobs.resolve(job_id, "done", worker_token=wtoken,
                          payload={"reason": f"{done_phase} already recorded; triage marker restored"})
             log.info("%s#%s@%s %s already recorded — triage marker restored, no re-run",
@@ -444,7 +459,7 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict,
     # --- entitlement (per-install credit balance) ---------------------------
     org = repo.split("/", 1)[0]
     inst = state.install(org, org)          # dogfood: install keyed by org
-    if inst.get("plan") and inst.get("credits_balance", 0) <= 0:
+    if meters_credits(inst) and inst.get("credits_balance", 0) <= 0:
         state.record(repo, pr, sha, "parked", verdict="PARKED",
                      detail={"reason": "out of credits — owner must top up"})
         _gh(token, "pr", "comment", str(pr), "-R", repo,
@@ -494,7 +509,7 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict,
     # is only meaningful once a run actually completes.
     brief = neo_protocol.build_brief(
         repo=repo, pr=pr, head_sha=sha,
-        reviewer_context=wake.get("context", "?"), reviewer_green=bool(wake.get("green")),
+        reviewer_context=wake.get("context", "?"), reviewer_green=bool(green),
         auto_merge=auto_merge, builder_round=rounds,
         max_builder_rounds=cfg.max_builder_rounds, builder_model=cfg.deepseek_model,
         jev_context=jev.brief() + "\n" + evidence_brief(evidence, auto_merge, authority_reason),
@@ -732,18 +747,18 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict,
                                 builder_round=new_round, credits=credits,
                                 advice_id=advice_id,
                                 installation_id=wake.get("installation_id"),
-                                extra={"green": wake.get("green"),
+                                extra={"green": bool(green),
                                        "wake_job": job_id,
                                        **route_detail})
     else:
         state.record(repo, pr, sha, phase, verdict=verdict,
                      builder_round=new_round, credits=credits,
-                     detail={"green": wake.get("green"), "wake_job": job_id,
+                     detail={"green": bool(green), "wake_job": job_id,
                              **route_detail})
     # The triage marker goes LAST: it vouches that the phase row and any builder job above
     # exist. A crash before this line leaves the phase row, which the gate above detects.
     state.record(repo, pr, sha, "triage", detail={"context": wake.get("context"),
-                                                   "green": wake.get("green"),
+                                                   "green": bool(green),
                                                    "jev": jev.brief(),
                                                    "jev_attention": jev.requires_full_review,
                                                    "head_sha": evidence.get("head_sha"),
@@ -759,7 +774,7 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict,
     jobs.resolve(job_id, "done", worker_token=wtoken,
                  payload={"verdict": verdict, "phase": phase,
                           "credits": credits})
-    if inst.get("plan"):
+    if meters_credits(inst):
         state.debit(org, credits)
     log.info("%s#%s@%s verdict=%s phase=%s credits=%d (auto_merge=%s round=%d)",
              repo, pr, sha[:8], verdict or "?", phase, credits, auto_merge, rounds)

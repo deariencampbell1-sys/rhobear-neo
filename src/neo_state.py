@@ -51,6 +51,31 @@ def _started_at(detail: dict, created_at) -> float:
     return created_at.timestamp()
 
 
+_TRUE_STRINGS = frozenset({"true", "1", "yes", "y", "on", "success", "green"})
+_FALSE_STRINGS = frozenset({"false", "0", "no", "n", "off", "failure", "failed", "red"})
+
+
+def verdict_color(raw: object) -> bool | None:
+    """Normalize a wake payload's verdict color to True / False / None.
+
+    None means "unknown" — the key was absent, null, or unparseable — and is
+    NOT collapsed into red: `bool(raw)` is wrong twice over, turning a missing
+    key into a red verdict and the string "false" into True (a non-empty string
+    is truthy), silently inverting red verdicts
+    (fix/verdict-flip-redelivery / fix-pr-5)."""
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, int):                 # JSON 0/1
+        return bool(raw) if raw in (0, 1) else None
+    if isinstance(raw, str):
+        v = raw.strip().lower()
+        if v in _TRUE_STRINGS:
+            return True
+        if v in _FALSE_STRINGS:
+            return False
+    return None
+
+
 @dataclass
 class NeoState:
     """Thread-safe Postgres state store. Every method opens a fresh
