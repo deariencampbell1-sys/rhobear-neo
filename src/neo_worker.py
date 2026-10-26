@@ -211,7 +211,10 @@ def _green_fields(cfg: Config, repo: str, sha: str, reviews: list, statuses: lis
         if _review_oid(r) != sha:                 # bound to this head only
             continue
         author = _review_author(r)
-        if author and not tr.source_matches(apollo, author):
+        # Defect 5: an empty/missing author never matches any source — the old
+        # `if author and not ...` fell OPEN for a falsy author and chose a
+        # nameless review as Apollo's ACCEPT.
+        if not author or not tr.source_matches(apollo, author):
             continue                              # any other account is ignored
         chosen = r
     if chosen is None:
