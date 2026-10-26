@@ -1646,3 +1646,101 @@ def test_consumer_header_rejects_bad_install_id() -> None:
     assert good.consumer == "reviews:zeus/987654321"
     assert good._build_env(str(tmp_env_dir))["X_RHOBEAR_CONSUMER"] == \
         "reviews:zeus/987654321"
+
+
+def test_roulegate_guard_parses_the_url() -> None:
+    """[Apollo r2, HIGH] The loopback guard must PARSE the URL: scheme,
+    host, no userinfo, RouteGate's port — a prefix check lets
+    `http://127.0.0.1:8645@evil.example/...` (userinfo) and non-RouteGate
+    loopback ports straight through."""
+    cfg = Config()
+    cfg.deepseek_base_url = BASE
+    cfg.deepseek_model = MODEL
+    cfg.deepseek_reasoning_effort = "max"
+    cfg.deepseek_max_tokens = 32000
+    cfg.claude_bin = CLAUDE_BIN
+
+    for evil in (
+        "http://127.0.0.1:8645@evil.example/v1/messages",   # userinfo bypass
+        "http://127.0.0.1:1/v1/messages",                   # not RouteGate's port
+        "https://127.0.0.1:8645/v1/messages",               # not the gate's scheme
+        "http://[::1]:8645/v1/messages",                    # not the gate's host
+        "http://127.0.0.1:8645/v1/messages/../exfil",       # traversal out of /v1
+    ):
+        cfg.routegate_anthropic_url = evil
+        with pytest.raises(AgentError, match="loopback") as excinfo:
+            ClaudeAgent.from_config(cfg, gh_token=GH_TOKEN)
+        assert evil in str(excinfo.value), evil
+
+
+def test_roulegate_failure_is_metered_and_ends_the_run() -> None:
+    """[Apollo r2, HIGH] The gated failure path: a 402 at the gate is ONE
+    fallthrough row (route name `peak`, consumer, target) and the run ends —
+    no second attempt outside RouteGate."""
+    cfg = Config()
+    cfg.deepseek_base_url = BASE
+    cfg.deepseek_model = MODEL
+    cfg.deepseek_reasoning_effort = "max"
+    cfg.deepseek_max_tokens = 32000
+    cfg.claude_bin = CLAUDE_BIN
+    cfg.routegate_anthropic_url = "http://127.0.0.1:8645/v1/messages"
+    cfg.routegate_model = "peak"
+
+    agent = _make_agent()
+    store = _FakeUsageStore()
+    calls: list[Any] = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(
+            args=["claude"], returncode=0, stderr="",
+            stdout=json.dumps({"type": "result", "is_error": True,
+                               "subtype": "error_during_execution",
+                               "api_error_status": "402"}),
+        )
+
+    with patch("src.agent_claude.subprocess.run", side_effect=fake_run):
+        result = agent.run_with_chain(
+            _zeus_brief(), [], cfg, GH_TOKEN,
+            usage_store=store, job_id=3)
+
+    assert result == ({}, "", None, None)      # gate owns failover: run ends
+    assert len(calls) == 1                     # exactly one attempt, ever
+    row, = store.rows
+    assert row.outcome == "fallthrough"
+    assert row.error_class == "402"
+    assert row.route_name == "peak"
+    assert row.provider == "routegate"
+    assert row.consumer.startswith("reviews:zeus")
+    assert row.pr_number == 44 and row.head_sha == "ab" * 20
+
+
+def test_roulegate_non_fallthrough_reraises_after_metering() -> None:
+    """[Apollo r2, HIGH] A non-fallthrough failure at the gate is recorded
+    (outcome `error`) and then re-raised — never silently swallowed."""
+    cfg = Config()
+    cfg.deepseek_base_url = BASE
+    cfg.deepseek_model = MODEL
+    cfg.deepseek_reasoning_effort = "max"
+    cfg.deepseek_max_tokens = 32000
+    cfg.claude_bin = CLAUDE_BIN
+    cfg.routegate_anthropic_url = "http://127.0.0.1:8645/v1/messages"
+    cfg.routegate_model = "peak"
+
+    agent = _make_agent()
+    store = _FakeUsageStore()
+
+    def fake_run(cmd, **kw):
+        return subprocess.CompletedProcess(
+            args=["claude"], returncode=0, stderr="", stdout="not json at all")
+
+    with patch("src.agent_claude.subprocess.run", side_effect=fake_run):
+        with pytest.raises(AgentError):
+            agent.run_with_chain(
+                _zeus_brief(), [], cfg, GH_TOKEN,
+                usage_store=store, job_id=4)
+
+    row, = store.rows
+    assert row.outcome == "error"
+    assert row.route_name == "peak"
+    assert row.consumer.startswith("reviews:zeus")

@@ -1057,3 +1057,107 @@ def test_one_classifier_family_import_smoke():
     from src.usage import classify_error_text, status_code_from
     assert callable(classify_error_text)
     assert status_code_from("HTTP/1.1 503 down") == 503
+
+
+# ---------------------------------------------------------------------------
+# W1-06 — Apollo round 2: wire header == stored row; job lookup can never
+# kill metering.
+# ---------------------------------------------------------------------------
+
+_GUESS_BRIEF = (
+    "TARGET: PR #44 in deariencampbell1-sys/rhobear-neo at head ababababab.\n"
+    "gh api repos/deariencampbell1-sys/rhobear-neo/commits/"
+    + "ab" * 20 + "/status\n"
+    "git fetch origin && git checkout " + "ab" * 20 + "\n"
+    "You have already spent 1/2 builder rounds on this PR.\n"
+)
+
+
+@requires_pg
+def test_header_and_row_consumer_match(store: UsageStore) -> None:
+    """[Apollo r2, MEDIUM] The consumer ON THE WIRE and the consumer IN THE
+    ROW must be the same value: install-qualified from the owning job's
+    payload, captured from the env the gated subprocess really runs with."""
+    from src.agent_claude import ClaudeAgent
+
+    assert DSN
+    with psycopg.connect(DSN, autocommit=True) as c:
+        job_id = c.execute(
+            "INSERT INTO neo_jobs (kind, repo, head_sha, payload) "
+            "VALUES ('wake', 'x/y', %s, %s) RETURNING id",
+            ("ab" * 20, json.dumps({"installation_id": "777"})),
+        ).fetchone()[0]
+
+    agent = ClaudeAgent(
+        claude_bin=sys.executable, api_key="k",
+        base_url="https://api.deepseek.com/anthropic", model="m",
+        timeout=30.0, gh_token="t")
+    cfg = Config()
+    cfg.claude_bin = sys.executable
+    cfg.deepseek_base_url = "https://api.deepseek.com/anthropic"
+    cfg.deepseek_model = "deepseek-v4-flash"
+    cfg.deepseek_reasoning_effort = "max"
+    cfg.deepseek_max_tokens = 32000
+    cfg.routegate_anthropic_url = "http://127.0.0.1:8645/v1/messages"
+    cfg.routegate_model = "peak"
+
+    captured: dict[str, str] = {}
+
+    def fake_run(cmd, **kw):
+        captured.update({k: v for k, v in (kw.get("env") or {}).items()
+                         if "CONSUMER" in k or "CUSTOM_HEADERS" in k})
+        return subprocess.CompletedProcess(
+            args=["claude"], returncode=0, stderr="",
+            stdout=json.dumps({"type": "result",
+                               "result": "VERDICT: ACCEPT",
+                               "is_error": False, "subtype": "success", "num_turns": 1,
+                               "usage": {"input_tokens": 1, "output_tokens": 1,
+                                         "cache_read_input_tokens": 0,
+                                         "cache_creation_input_tokens": 0}}),
+        )
+
+    try:
+        from src.agent_claude import Route as AgentRoute
+
+        routes = [(4, AgentRoute(provider="deepseek",
+                                 model="deepseek-v4-flash"))]
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "k"}), \
+                patch("src.agent_claude.subprocess.run", side_effect=fake_run):
+            agent.run_with_chain(_GUESS_BRIEF, routes, cfg, "t",
+                                 usage_store=store, job_id=job_id)
+
+        wire = captured["X_RHOBEAR_CONSUMER"]
+        assert wire == "reviews:zeus/777", wire
+        attempts = store.get_attempts(job_id)
+        assert len(attempts) == 1
+        assert attempts[0].consumer == wire, (
+            f"wire {wire!r} != row {attempts[0].consumer!r}")
+    finally:
+        store.clear(job_id)
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute("DELETE FROM neo_jobs WHERE id = %s", (job_id,))
+
+
+@requires_pg
+def test_record_attempt_survives_missing_jobs_table(store: UsageStore) -> None:
+    """[Apollo r2, MEDIUM] The job lookup is best effort: with `neo_jobs`
+    unreadable the attempt row must still land — `_conn()` is autocommit
+    (no failed statement can poison the INSERT that follows)."""
+    assert DSN
+    with psycopg.connect(DSN, autocommit=True) as c:
+        c.execute("ALTER TABLE neo_jobs RENAME TO neo_jobs_tmp_w106")
+    try:
+        ok = store.record_attempt(UsageAttempt(
+            job_id=555001, attempt_number=1, route_idx=0,
+            provider="deepseek", model="m", outcome="success",
+            uncached_input=1, output_tokens=1, latency_ms=9,
+        ))
+        assert ok is True
+        row, = store.get_attempts(555001)
+        assert row.consumer == "reviews:zeus", (
+            "no job row to qualify it: bare lane default, never invented")
+        assert row.pr_number is None and row.head_sha is None
+    finally:
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute("ALTER TABLE neo_jobs_tmp_w106 RENAME TO neo_jobs")
+        store.clear(555001)
