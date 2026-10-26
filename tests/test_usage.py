@@ -1199,7 +1199,8 @@ def test_bad_install_id_never_reaches_the_wire(store: UsageStore) -> None:
 
 
 @requires_pg
-def test_job_target_failure_warns_once(store: UsageStore, caplog: Any) -> None:
+def test_job_target_failure_warns_once(
+        store: UsageStore, caplog: Any, monkeypatch: Any) -> None:
     """[Apollo r3, MEDIUM] Permanent attribution loss must be OBSERVABLE:
     the first lookup failure logs WARNING (once, never the poisoned value),
     later ones stay quiet (rate-limited) — not DEBUG-silence forever."""
@@ -1207,7 +1208,7 @@ def test_job_target_failure_warns_once(store: UsageStore, caplog: Any) -> None:
 
     import src.usage as usage_mod
 
-    usage_mod._JOB_TARGET_WARNED = False   # deterministic: the flag is global
+    monkeypatch.setattr(usage_mod, "_JOB_TARGET_WARNED", False)  # restored
 
     class BoomConn:
         def execute(self, *args, **kwargs):
@@ -1247,3 +1248,28 @@ def test_job_lookup_failure_cannot_poison_metering(
             "RETURNING id")
         assert cur.fetchone() is not None, "metering must survive the failure"
     store.clear(555002)
+
+
+@requires_pg
+def test_route_name_and_cost_round_trip_postgres(store: UsageStore) -> None:
+    """[Apollo r4, MEDIUM] The new TEXT/DOUBLE columns must round-trip REAL
+    values through Postgres — not just the NULLs the rest of the suite
+    happens to write."""
+    assert DSN
+    ok = store.record_attempt(UsageAttempt(
+        job_id=555003, attempt_number=1, route_idx=0,
+        provider="routegate", model="peak", route_name="peak",
+        cost_usd=0.0042, outcome="success",
+        uncached_input=11, cached_input=4, output_tokens=5,
+        consumer="reviews:zeus/987654321", pr_number=44,
+        head_sha="ab" * 20, builder_round=1,
+    ))
+    assert ok is True
+    try:
+        row, = store.get_attempts(555003)
+        assert row.route_name == "peak"
+        assert row.cost_usd == 0.0042
+        assert row.consumer == "reviews:zeus/987654321"
+        assert row.head_sha == "ab" * 20
+    finally:
+        store.clear(555003)

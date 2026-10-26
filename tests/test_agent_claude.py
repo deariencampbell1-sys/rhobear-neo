@@ -1608,9 +1608,12 @@ def test_validate_rejects_foreign_routegate_url() -> None:
     assert foreign.routegate_base_url == ROUTEGATE_BASE_URL   # defaulted
 
     offbox = Config()
+    offbox.claude_bin = sys.executable
     offbox.routegate_anthropic_url = "https://elsewhere.example/v1/messages"
-    with pytest.raises(ValueError, match="routegate_anthropic_url"):
-        offbox.validate()
+    offbox.validate()                                # must not crash-loop
+    assert offbox.routegate_anthropic_url == "", (
+        "a malformed anthropic URL must be DISCARDED (gate off, direct "
+        "chain stands), never carried and never fatal")
 
 
 def test_validate_replaces_unknown_routegate_model() -> None:
@@ -1698,6 +1701,7 @@ def test_roulegate_guard_parses_the_url() -> None:
         "https://127.0.0.1:8645/v1/messages",               # not the gate's scheme
         "http://[::1]:8645/v1/messages",                    # not the gate's host
         "http://127.0.0.1:8645/v1/messages/../exfil",       # traversal out of /v1
+        "http://127.0.0.1:8645/v1/%2e%2e/admin",            # percent-encoded hop
     ):
         cfg.routegate_anthropic_url = evil
         with pytest.raises(AgentError, match="loopback") as excinfo:
@@ -1778,7 +1782,7 @@ def test_roulegate_non_fallthrough_reraises_after_metering() -> None:
     assert row.consumer.startswith("reviews:zeus")
 
 
-def test_sink_scrubs_consumer_header_injection() -> None:
+def test_sink_scrubs_consumer_header_injection(tmp_path: Any) -> None:
     """[Apollo r3, HIGH] Validation at the SOURCE is not enough: the consumer
     is validated again at the SINK (__init__), so a poisoned value (from a
     forged job payload via UsageStore.job_consumer, or any caller) can never
@@ -1808,7 +1812,7 @@ def test_sink_scrubs_consumer_header_injection() -> None:
     assert good.consumer == "reviews:zeus/987654321"
 
 
-def test_direct_path_carries_no_consumer_header() -> None:
+def test_direct_path_carries_no_consumer_header(tmp_path: Any) -> None:
     """[Apollo r3, LOW] Internal attribution (lane + install id) rides to
     RouteGate only — the direct provider path must not receive it."""
     cfg = Config()
@@ -1835,7 +1839,7 @@ def test_direct_path_carries_no_consumer_header() -> None:
     assert genv["X_RHOBEAR_CONSUMER"] == "reviews:zeus/987654321"
 
 
-def test_existing_custom_header_is_appended() -> None:
+def test_existing_custom_header_is_appended(tmp_path: Any) -> None:
     """[Apollo r3, LOW] An operator-supplied ANTHROPIC_CUSTOM_HEADERS is
     extended, never silently replaced."""
     cfg = Config()
@@ -1856,7 +1860,7 @@ def test_existing_custom_header_is_appended() -> None:
     assert "X-RHOBEAR-Consumer: reviews:zeus" in value
 
 
-def test_gh_token_absent_from_child_env_when_missing() -> None:
+def test_gh_token_absent_from_child_env_when_missing(tmp_path: Any) -> None:
     """[Apollo r3, MEDIUM] A missing gh_token must NOT let the operator's
     personal GH_TOKEN become the child identity: the env is an allowlist,
     and with no explicit token GH_TOKEN is simply absent."""
@@ -1897,3 +1901,109 @@ def test_null_cache_read_is_unknown() -> None:
     usage, _verdict = agent._parse_output(proc)
     assert usage["input_tokens"] == 11
     assert "cached_input" not in usage, "null cache read must stay unknown"
+
+
+def test_validate_accepts_the_real_gate_url() -> None:
+    """[Apollo r4, HIGH] The ACCEPT branch of the fail-closed allow-list is
+    the production flip-switch this whole PR exists for: the exact
+    ROUTEGATE_ANTHROPIC_URL (and its trailing-slash form) must pass
+    validate() and yield a gated agent — otherwise CI is green while both
+    services crash-loop on the env flip."""
+    from src.config import ROUTEGATE_ANTHROPIC_URL
+
+    for url in (ROUTEGATE_ANTHROPIC_URL, ROUTEGATE_ANTHROPIC_URL + "/"):
+        cfg = Config()
+        cfg.deepseek_base_url = BASE
+        cfg.deepseek_model = MODEL
+        cfg.deepseek_reasoning_effort = "max"
+        cfg.deepseek_max_tokens = 32000
+        cfg.claude_bin = sys.executable
+        cfg.routegate_anthropic_url = url
+        cfg.validate()                                # must not raise
+
+        agent = ClaudeAgent.from_config(cfg, gh_token=GH_TOKEN)
+        assert agent.gated, url
+        assert agent.base_url.rstrip("/") == ROUTEGATE_ANTHROPIC_URL, url
+        assert agent.model == "peak"
+
+
+def test_missing_gh_token_is_recorded_on_the_attempt_row() -> None:
+    """[Apollo r4, MEDIUM] A missing identity must be visible in METERING,
+    not only in a boot log: every attempt row carries `had_gh_token`."""
+    cfg = Config()
+    cfg.deepseek_base_url = BASE
+    cfg.deepseek_model = MODEL
+    cfg.deepseek_reasoning_effort = "max"
+    cfg.deepseek_max_tokens = 32000
+    cfg.claude_bin = CLAUDE_BIN
+
+    envelope = json.dumps({
+        "type": "result", "subtype": "success", "is_error": False,
+        "result": "VERDICT: ACCEPT", "num_turns": 1,
+        "stop_reason": "end_turn", "permission_denials": [],
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    })
+
+    def fake_run(cmd, **kw):
+        return subprocess.CompletedProcess(args=["claude"], returncode=0,
+                                           stderr="", stdout=envelope)
+
+    routes = [(4, Route(provider="deepseek", model=MODEL))]
+
+    with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "k"}), \
+            patch("src.agent_claude.subprocess.run", side_effect=fake_run):
+        with_token = ClaudeAgent(
+            claude_bin=CLAUDE_BIN, api_key="k", base_url=BASE, model=MODEL,
+            gh_token="ghs_installation_token")
+        store_ok = _FakeUsageStore()
+        with_token.run_with_chain(_zeus_brief(), routes, cfg,
+                                  "ghs_installation_token",
+                                  usage_store=store_ok, job_id=21)
+        row_ok, = store_ok.rows
+        assert row_ok.had_gh_token is True
+
+        no_token = ClaudeAgent(
+            claude_bin=CLAUDE_BIN, api_key="k", base_url=BASE, model=MODEL)
+        store_missing = _FakeUsageStore()
+        no_token.run_with_chain(_zeus_brief(), routes, cfg, "",
+                                usage_store=store_missing, job_id=22)
+        row_missing, = store_missing.rows
+        assert row_missing.had_gh_token is False, (
+            "a run without GitHub identity must be flagged in metering")
+
+
+def test_rounds_default_follows_lower_bounce_floors() -> None:
+    """[Apollo r4, MEDIUM] Document the clamp blast radius explicitly: with
+    a bounce floor below 5 the reader default (2) is lifted to the FLOOR, so
+    a deployment that sets NEO_BOUNCES_BEFORE_ESCALATION changes its builder
+    budget — here is exactly what it gets."""
+    import src.config as config_mod
+
+    with patch.dict(os.environ, {"NEO_BOUNCES_BEFORE_ESCALATION": "3"},
+                    clear=True):
+        assert config_mod.Config().max_builder_rounds == 3
+    with patch.dict(os.environ, {"NEO_BOUNCES_BEFORE_ESCALATION": "4"},
+                    clear=True):
+        assert config_mod.Config().max_builder_rounds == 4
+
+
+def test_unusable_estimated_cost_warns_and_stays_unknown(
+        caplog: Any) -> None:
+    """[Apollo r4, MEDIUM] A malformed `estimated_cost` from the gate must
+    not crash the run (and must not invent a number): WARNING + no key."""
+    import logging as _logging
+
+    agent = _make_agent()
+    proc = subprocess.CompletedProcess(
+        args=["claude"], returncode=0, stderr="",
+        stdout=json.dumps({
+            "type": "result", "subtype": "success", "is_error": False,
+            "result": "VERDICT: ACCEPT", "num_turns": 1,
+            "stop_reason": "end_turn", "permission_denials": [],
+            "usage": {"input_tokens": 1, "output_tokens": 1,
+                      "estimated_cost": "not-a-number"},
+        }))
+    with caplog.at_level(_logging.WARNING, logger="rhobear_neo.agent"):
+        usage, _verdict = agent._parse_output(proc)
+    assert "cost_usd" not in usage
+    assert any("estimated_cost" in rec.getMessage() for rec in caplog.records)
