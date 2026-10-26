@@ -210,13 +210,13 @@ this PR branch. Do NOT merge, do NOT deploy, do NOT touch main.
   into the branch and resolve conflicts first (keep both sides' intent; prefer the PR's
   feature change on conflicts with generated files). Then do the findings.
 
-TIME BUDGET (hard): work in small increments. Fix the HIGHEST-severity finding first,
-run ONLY the focused tests for the files you changed (never the full monorepo suite --
-it can eat the whole budget), then commit and push. Your FIRST PUSH should happen
-within 30 minutes of starting. If findings remain, keep going and push again; if you
-cannot fix something, report NO-CHANGE for it and push whatever is fixed. A push
-re-arms the reviewer and Neo immediately -- partial progress is valuable, a silent
-90-minute timeout is not.
+TIME BUDGET (hard): fix the HIGHEST-severity finding first and commit each finding
+separately, but PUSH ONCE: every push starts a full review, and a review of a half-fixed
+head only finds what you have not fixed yet. Run ONLY the focused tests for the files you
+changed (never the full monorepo suite -- it can eat the whole budget). Before the push,
+check every finding below is fixed or reported NO-CHANGE with a reason, and the focused
+tests pass. If 60 minutes have passed and findings remain, push what is fixed then and
+report the rest; a silent 90-minute timeout is worse than a partial push.
 - Your cwd is the repo worktree. Focused tests only; never the full monorepo suite.
 
 Findings (reviewer JSON):

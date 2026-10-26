@@ -30,7 +30,10 @@ def build_brief(*, repo: str, pr: int, head_sha: str, reviewer_context: str,
            if builder_round < max_builder_rounds else
            "You are OUT of builder rounds — do NOT dispatch another builder. Report what is still "
            "outstanding as BOUNCE-BUILDER with the findings; the lane keeps the PR actionable "
-           "and the owner-proxy re-arms it. Running out of rounds is NOT an escalation.")
+           "and the owner-proxy re-arms it. Running out of rounds is NOT an escalation. "
+           "Do this in one step: do not clone, re-triage or run tests. Read the latest "
+           "rhobear-reviews review on this exact head once, list its open CRITICAL/HIGH findings "
+           "(file:line each) as REASONS, output the verdict and stop.")
     )
 
     return f"""You are Neo, RHOBEAR's review-and-MERGE gate. Follow your canon EXACTLY — the
@@ -62,7 +65,9 @@ CANON (do exactly this):
    - FIX-FORWARD → TRIVIAL only (wrong import, typo, missing constant, a test expectation). Fix it
      yourself, commit to the PR branch, push. Your push re-triggers the reviewer → you'll be re-invoked.
    - BOUNCE (substantial bug) → {builder_clause}
-     To dispatch a builder: write a precise brief (file · line · observed · expected · smallest fix) and
+     To dispatch a builder: write a precise brief (file · line · observed · expected · smallest fix),
+     paste the reviewer's FULL review for this head verbatim (every finding, never a summary), tell it
+     to fix every finding in one round and push ONCE after the tests pass, and
      run the same Claude Code CLI agent (same {builder_model} model/tool loop) in a checkout of {repo}@the PR
      branch; it fixes + pushes. Its push re-triggers reviewer → you'll be re-invoked to re-check.
    - ESCALATE → LAST RESORT, and it is a HANDOFF to the owner-proxy agent, not a stop. It is read by
