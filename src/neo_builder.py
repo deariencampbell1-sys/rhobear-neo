@@ -618,6 +618,15 @@ No markdown fences, nothing after the VERDICT line.
 """
 
 
+# North Star lane branches belong to their lane's worker (one writer per branch): Builder never pushes to one.
+# Conservative on purpose: the full `l8d-engine-mcps/` form and the short `l8b/` form both count.
+LANE_HEAD = re.compile(r"^l\d+[a-d]?(-[a-z0-9-]+)?/", re.IGNORECASE)
+
+
+def is_lane_branch(branch: str) -> bool:
+    return bool(LANE_HEAD.match(branch or ""))
+
+
 def dispatch_one(cfg: Config, jobs: Jobs, row: dict) -> None:
     """Dispatch one builder round. Uses Jobs for atomic claim and lifecycle.
 
@@ -681,7 +690,14 @@ def dispatch_one(cfg: Config, jobs: Jobs, row: dict) -> None:
                     "(lease recovery)", repo, pr, exc)
         return
 
-    state = pr_state(token, repo, pr).split("\t")[0]
+    full_state = pr_state(token, repo, pr)
+    state = full_state.split("\t")[0]
+    head_ref = full_state.split("\t")[-1] if "\t" in full_state else ""
+    if is_lane_branch(head_ref):
+        log.info("skip (lane branch %s, its lane's worker fixes it): %s#%s", head_ref, repo, pr)
+        jobs.resolve(row["id"], "no_change", worker_token=wtoken,
+                     payload={"skipped_lane": head_ref, "brief_dispatched": True})
+        return
     if state.upper() == "CLOSED" or state.upper() == "MERGED":
         log.info("skip (closed/merged): %s#%s", repo, pr)
         jobs.resolve(row["id"], "no_change", worker_token=wtoken,
@@ -920,8 +936,16 @@ def main() -> int:
             rows = jobs.peek_queued("builder", repo_filter=repo_filter,
                                     allowlist=cfg.repo_allowlist)
             for row in rows:
-                log.info("dry-run: would dispatch %s#%s round=%s attempt=%s",
-                         row["repo"], row["pr_number"], row["builder_round"], row["attempt"])
+                try:
+                    tok = repo_token(cfg, row["repo"],
+                                     (row.get("payload") or {}).get("installation_id"))
+                    head_ref = pr_state(tok, row["repo"], row["pr_number"]).split("\t")[-1]
+                except Exception:  # noqa: BLE001 — the dry run is read-only and never crashes
+                    head_ref = ""
+                verb = "would SKIP (lane branch)" if is_lane_branch(head_ref) else "would dispatch"
+                log.info("dry-run: %s %s#%s@%s round=%s branch=%s model=%s", verb,
+                         row["repo"], row["pr_number"], row.get("head_sha", "")[:8],
+                         row["builder_round"], head_ref, cfg.hermes_model)
             if once:
                 break
             time.sleep(POLL_SECS)  # sleep every iteration, not just when empty
