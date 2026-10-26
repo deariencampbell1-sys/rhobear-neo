@@ -148,9 +148,25 @@ def norm_name(name: str) -> str:
     return re.sub(r"[^a-z0-9]", "", s)
 
 
+#: Explicit alias rows (W1-07-r2 defect 1): when GitHub names a source
+#: differently enough that norm_name cannot reconcile it, that source's
+#: customer row gets an EXPLICIT alias here — never a heuristic prefix.  A
+#: prefix match would let a GitHub account named `ap`, `apol`, `apollox` or
+#: `apollobot2` spoof the Apollo ACCEPT that authorises a merge.
+ALIASES: dict[str, tuple[str, ...]] = {}
+
+
 def source_matches(source: str, name: str) -> bool:
     """True when a status context / check name / review author belongs to the
-    trusted source.  Normalised, separator- and [bot]-tolerant prefix match —
-    never a substring match ("CodeAnt" does not match "codecov")."""
+    trusted source.  Normalised EQUALITY only (plus the source's explicit
+    ALIASES row) — never a prefix in either direction ("ap" must not match
+    "apollo", "apollox" must not match "apollo"), never a substring match
+    ("CodeAnt" does not match "codecov").  The legitimate tolerance is all in
+    norm_name: [bot] / -bot / _bot suffixes and separators ("CodeAnt" ↔
+    "code-ant" ↔ "CodeAnt[bot]")."""
     a, b = norm_name(source), norm_name(name)
-    return bool(a) and bool(b) and (a == b or a.startswith(b) or b.startswith(a))
+    if not a or not b:
+        return False                      # an empty author/name matches nothing
+    if a == b:
+        return True
+    return b in {norm_name(alias) for alias in ALIASES.get(str(source or ""), ())}
