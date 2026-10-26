@@ -2005,33 +2005,19 @@ class TestParkRace:
         assert db.park(job_id, worker_token="not-my-token") is False
         assert db.get(job_id)["state"] == "running"
 
-    def test_retry_at_cap_never_clobbers_an_interleaved_claim(self, db, monkeypatch):
-        """The retry() requeue-then-park race: a worker that claims the row
-        between the requeue and the park must keep its row — the claimed run's
-        resolve(worker_token=...) must still succeed, and the row must never be
-        parked under it.  The interloper is injected at the park() call site so
-        the race is deterministic."""
+    def test_retry_at_cap_is_a_single_statement_outcome(self, db):
+        """W1-13-r2 defect 5: retry() at the cap is ONE statement (a CASE
+        writing done/parked directly) — there is no requeue-then-park window.
+        The r1 test ("never clobbers an interleaved claim") monkeypatched
+        db.park, which the single statement never calls: its interloper could
+        never claim and its guarded branch was unreachable, while
+        `in ("queued", "parked")` was vacuous against a deterministic answer.
+        This asserts the one outcome exactly."""
         job_id = db.create_wake("o/r", SHA1, True, max_attempts=1)
         assert db.claim(job_id, lease_secs=600, worker_token="w1") == job_id
-        real_park = db.park
-        interloper = {"claimed": False}
-
-        def racing_park(job_id_, **kw):
-            interloper["claimed"] = db.claim(job_id_, worker_token="w2") == job_id_
-            return real_park(job_id_, **kw)
-
-        monkeypatch.setattr(db, "park", racing_park)
-        assert db.retry(job_id, worker_token="w1", reason="boom") in ("queued", "parked")
-        monkeypatch.setattr(db, "park", real_park)
-        if interloper["claimed"]:
-            # the interloper claimed the row mid-retry: it must still be theirs
-            row = db.get(job_id)
-            assert row["state"] == "running", row
-            assert row["outcome"] is None, row
-            assert db.resolve(job_id, "done", worker_token="w2") is True
-        else:
-            # no window: the at-cap decision happened in the requeue statement
-            assert db.get(job_id)["outcome"] == "parked"
+        assert db.retry(job_id, worker_token="w1", reason="boom") == "parked"
+        row = db.get(job_id)
+        assert row["state"] == "done" and row["outcome"] == "parked"
 
     def test_park_race_retry_vs_claim_invariant(self, db):
         """Stress the window: concurrent retry(at cap) vs claim.  Afterwards
