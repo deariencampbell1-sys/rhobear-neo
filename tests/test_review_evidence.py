@@ -132,20 +132,21 @@ class TestTrustedCheckRun:
         assert ev["trusted_producer_ok"] is True
         assert granted is True
 
-    def test_run_without_status_but_with_conclusion_counts_as_completed(self):
-        """GitHub's check-run schema always includes `status`, and a
-        `conclusion` exists only on completed runs.  The pinned fixtures in
-        tests/test_merge_authority.py (outside this round's ownership) omit
-        `status` but carry a conclusion — such a run is treated as completed.
-        A run with neither is never evidence."""
+    def test_run_without_status_but_with_conclusion_is_not_completed(self):
+        """W1-13-r2 defect 4: the fixtures were wrong, not the predicate.  A
+        check-run payload with a `conclusion` but NO `status` is NOT completed
+        evidence — GitHub's check-run schema always carries `status`, and the
+        production predicate is `status == "completed"`, full stop.  (r1 bent
+        the predicate to keep pinned fixtures green; the fixtures now carry
+        the real shape instead.)"""
         ev, (granted, reason) = _authority([
             {"name": "rhobear-reviews", "head_sha": SHA,
              "app": {"id": TRUSTED_APP}, "conclusion": "success",
              "output": {"summary": '{"unresolved_critical_high": 0, '
                                    '"coverage": "complete"}'}},
         ])
-        assert ev["trusted_producer_ok"] is True
-        assert granted is True
+        assert ev["trusted_producer_ok"] is False
+        assert granted is False
         # no status AND no conclusion: nothing says it completed -> refused
         ev, (granted, reason) = _authority([
             {"name": "rhobear-reviews", "head_sha": SHA,
@@ -154,6 +155,10 @@ class TestTrustedCheckRun:
                                    '"coverage": "complete"}'}},
         ])
         assert granted is False
+        # the real shape (status present) keeps deciding normally
+        ev, (granted, reason) = _authority([_run(status="completed")])
+        assert ev["trusted_producer_ok"] is True
+        assert granted is True
 
 
 # ---------------------------------------------------------------------------
