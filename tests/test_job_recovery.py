@@ -153,25 +153,70 @@ class TestJobLifecycle:
             assert TERMINAL_OUTCOMES == (
                 "done", "no_change", "no_installation", "superseded", "parked")
 
-    def test_retry_returns_queued_and_parks_at_cap(self, mock_conn):
-        """failed(retryable) goes back to queued; at the cap it parks."""
-        mock_conn.execute.return_value.fetchone.return_value = (2, 3)
+    def test_retry_below_cap_requeues(self, mock_conn):
+        """failed(retryable) goes back to queued — one statement."""
+        mock_conn.execute.return_value.fetchone.return_value = ("queued",)
         with patch("src.jobs.psycopg.connect", return_value=mock_conn):
             j = Jobs("postgresql://fake:5432/db")
             assert j.retry(42, reason="boom") == "queued"
             sql, params = mock_conn.execute.call_args[0]
-            assert "state = 'queued'" in sql and "outcome = 'failed'" in sql
-            # at cap -> park
-            mock_conn.execute.return_value.fetchone.return_value = (3, 3)
-            assert j.retry(42, reason="boom") == "parked"
+            assert "state = 'running'" in sql and "outcome" in sql
+            assert mock_conn.execute.call_count == 1
 
-    def test_park_from_any_state(self, mock_conn):
+    def test_retry_at_cap_parks_in_the_same_statement(self, mock_conn):
+        """W1-13-r1 Defect 1: the at-cap decision is made in the SAME statement
+        that requeues (a CASE writing done/parked directly) — there is no
+        second park() statement whose window a claiming worker could fall
+        into.  Returns 'parked'."""
+        mock_conn.execute.return_value.fetchone.return_value = ("done",)
         with patch("src.jobs.psycopg.connect", return_value=mock_conn):
             j = Jobs("postgresql://fake:5432/db")
-            j.park(42, reason="done")
+            assert j.retry(42, worker_token="w1", reason="boom") == "parked"
+            # exactly ONE statement — never UPDATE-then-park
+            assert mock_conn.execute.call_count == 1
+            sql = mock_conn.execute.call_args[0][0]
+            assert "CASE" in sql and "'parked'" in sql
+            assert "worker_token = %s" in sql
+
+    def test_retry_without_a_touchable_row_returns_question(self, mock_conn):
+        mock_conn.execute.return_value.fetchone.return_value = None
+        with patch("src.jobs.psycopg.connect", return_value=mock_conn):
+            j = Jobs("postgresql://fake:5432/db")
+            assert j.retry(42, worker_token="w1") == "?"
+
+    def test_park_guards_accept_token_and_expected_state(self, mock_conn):
+        """W1-13-r1 Defect 1: park() accepts worker_token and/or
+        expected_state.  With a token it only touches the claimant's
+        queued/running row; with expected_state it only touches that state."""
+        mock_conn.execute.return_value.rowcount = 1
+        with patch("src.jobs.psycopg.connect", return_value=mock_conn):
+            j = Jobs("postgresql://fake:5432/db")
+            assert j.park(42, worker_token="w1", reason="done") is True
+            sql, params = mock_conn.execute.call_args[0]
+            assert "worker_token = %s" in sql
+            assert "state IN ('queued', 'running')" in sql
+            assert "w1" in params
+            assert j.park(42, expected_state="running", reason="done") is True
+            sql, params = mock_conn.execute.call_args[0]
+            assert "state = %s" in sql and "running" in params
+
+    def test_park_bare_never_touches_a_held_row(self, mock_conn):
+        """The bare form (the recovery loops' call shape) must never park a
+        row another worker currently holds: a live lease means a claimant."""
+        mock_conn.execute.return_value.rowcount = 1
+        with patch("src.jobs.psycopg.connect", return_value=mock_conn):
+            j = Jobs("postgresql://fake:5432/db")
+            j.park(42, reason="lease expired 2/2 times")
             sql = mock_conn.execute.call_args[0][0]
             assert "outcome = 'parked'" in sql
-            assert "state = 'running'" not in sql  # park is state-agnostic
+            assert "lease_expires < now()" in sql  # live-lease rows are refused
+            assert "state IN ('queued', 'running')" in sql
+
+    def test_park_returns_false_when_nothing_touched(self, mock_conn):
+        mock_conn.execute.return_value.rowcount = 0
+        with patch("src.jobs.psycopg.connect", return_value=mock_conn):
+            j = Jobs("postgresql://fake:5432/db")
+            assert j.park(42, expected_state="running") is False
 
     def test_claim_queued_newest_first(self, mock_conn):
         """GLM 7: the claim is ORDER BY created_at DESC — newest round wins."""

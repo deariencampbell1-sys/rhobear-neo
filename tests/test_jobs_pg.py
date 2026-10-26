@@ -1873,3 +1873,162 @@ def test_legacy_pre_b1_table_migrates_once():
         assert c.execute("SELECT builder_round FROM neo_jobs "
                          "WHERE pr_number=9").fetchone()[0] == 0
         c.execute("DELETE FROM neo_jobs")
+
+
+# ---------------------------------------------------------------------------
+# W1-13-r1 Defect 1 — the park race: park() must never clobber a row another
+# worker holds (the retry()/recovery requeue-then-park window).
+# ---------------------------------------------------------------------------
+
+def _expire_lease(job_id) -> None:
+    with psycopg.connect(DSN, autocommit=True) as c:
+        c.execute("UPDATE neo_jobs SET lease_expires = now() - interval '5 seconds' "
+                  "WHERE id = %s", (job_id,))
+
+
+class TestParkRace:
+    """park() guards: with a worker_token only the claimant may park; without
+    one, a row another worker currently holds (live lease) is left alone.  The
+    recovery loops call park() bare, so the bare form must be safe too."""
+
+    def test_park_with_token_never_touches_a_reclaimed_row_and_late_resolve_succeeds(self, db):
+        """A worker re-claims the row between the old claimant's requeue and
+        its park: the park must not touch the reclaimed row, and the claimed
+        run's resolve(worker_token=...) must still succeed."""
+        job_id = db.create_wake("o/r", SHA1, True, max_attempts=3)
+        assert db.claim(job_id, lease_secs=600, worker_token="w1") == job_id
+        # the old run dies; lease recovery requeues the row
+        _expire_lease(job_id)
+        assert [r["id"] for r in db.recover_expired("wake")] == [job_id]
+        # another worker re-claims it before any late park lands
+        assert db.claim(job_id, lease_secs=600, worker_token="w2") == job_id
+        # the stale claimant's park is refused; the row is untouched
+        assert db.park(job_id, worker_token="w1") is False
+        row = db.get(job_id)
+        assert row["state"] == "running"
+        assert row["outcome"] is None
+        # the claimed run resolves normally
+        assert db.resolve(job_id, "done", worker_token="w2") is True
+
+    def test_recovery_sweep_park_leaves_a_reclaimed_row_untouched(self, db):
+        """Recovery callers (the wake loops in __main__/neo_builder) park bare
+        right after recover_expired() requeued the row.  A row that has since
+        been re-claimed is left alone — its claimant resolves it."""
+        job_id = db.create_wake("o/r", SHA1, True, max_attempts=1)
+        assert db.claim(job_id, lease_secs=600, worker_token="w1") == job_id
+        _expire_lease(job_id)
+        assert [r["id"] for r in db.recover_expired("wake")] == [job_id]
+        assert db.claim(job_id, lease_secs=600, worker_token="w2") == job_id
+        # both the bare sweep form and the explicit expected_state form refuse
+        assert db.park(job_id, reason="lease expired 1/1 times") is False
+        assert db.park(job_id, expected_state="running",
+                       reason="lease expired 1/1 times") is False
+        row = db.get(job_id)
+        assert row["state"] == "running" and row["outcome"] is None
+        assert db.resolve(job_id, "done", worker_token="w2") is True
+
+    def test_recovery_sweep_park_refuses_a_row_whose_lease_has_not_expired(self, db):
+        """A sweep must not park a row whose lease has not expired — the row is
+        still being worked.  Refused, row untouched."""
+        job_id = db.create_wake("o/r", SHA1, True, max_attempts=1)
+        assert db.claim(job_id, lease_secs=600, worker_token="w1") == job_id
+        assert db.park(job_id, reason="lease expired 1/1 times") is False
+        assert db.park(job_id, expected_state="running") is False
+        row = db.get(job_id)
+        assert row["state"] == "running" and row["outcome"] is None
+        assert db.resolve(job_id, "done", worker_token="w1") is True
+
+    def test_park_expected_state_running_parks_an_abandoned_running_row(self, db):
+        """expected_state='running' parks a running row whose lease expired and
+        was never reclaimed — the recovery caller's target."""
+        job_id = db.create_wake("o/r", SHA1, True, max_attempts=1)
+        assert db.claim(job_id, lease_secs=600, worker_token="w1") == job_id
+        _expire_lease(job_id)
+        assert db.park(job_id, expected_state="running",
+                       reason="lease expired 1/1 times") is True
+        row = db.get(job_id)
+        assert row["state"] == "done" and row["outcome"] == "parked"
+
+    def test_park_expected_state_only_touches_that_state(self, db):
+        job_id = db.create_wake("o/r", SHA1, True)
+        assert db.park(job_id, expected_state="running") is False   # it is queued
+        row = db.get(job_id)
+        assert row["state"] == "queued" and row["outcome"] is None
+        assert db.park(job_id, expected_state="queued") is True
+        assert db.get(job_id)["outcome"] == "parked"
+
+    def test_park_with_token_parks_the_claimants_own_running_row(self, db):
+        """The out-of-credits shape: the claimant parks the row it holds even
+        though the lease is live."""
+        job_id = db.create_wake("o/r", SHA1, True)
+        assert db.claim(job_id, lease_secs=600, worker_token="w1") == job_id
+        assert db.park(job_id, worker_token="w1",
+                       reason="out of credits") is True
+        row = db.get(job_id)
+        assert row["state"] == "done" and row["outcome"] == "parked"
+
+    def test_park_with_wrong_token_touches_nothing(self, db):
+        job_id = db.create_wake("o/r", SHA1, True)
+        assert db.claim(job_id, lease_secs=600, worker_token="w1") == job_id
+        assert db.park(job_id, worker_token="not-my-token") is False
+        assert db.get(job_id)["state"] == "running"
+
+    def test_retry_at_cap_never_clobbers_an_interleaved_claim(self, db, monkeypatch):
+        """The retry() requeue-then-park race: a worker that claims the row
+        between the requeue and the park must keep its row — the claimed run's
+        resolve(worker_token=...) must still succeed, and the row must never be
+        parked under it.  The interloper is injected at the park() call site so
+        the race is deterministic."""
+        job_id = db.create_wake("o/r", SHA1, True, max_attempts=1)
+        assert db.claim(job_id, lease_secs=600, worker_token="w1") == job_id
+        real_park = db.park
+        interloper = {"claimed": False}
+
+        def racing_park(job_id_, **kw):
+            interloper["claimed"] = db.claim(job_id_, worker_token="w2") == job_id_
+            return real_park(job_id_, **kw)
+
+        monkeypatch.setattr(db, "park", racing_park)
+        assert db.retry(job_id, worker_token="w1", reason="boom") in ("queued", "parked")
+        monkeypatch.setattr(db, "park", real_park)
+        if interloper["claimed"]:
+            # the interloper claimed the row mid-retry: it must still be theirs
+            row = db.get(job_id)
+            assert row["state"] == "running", row
+            assert row["outcome"] is None, row
+            assert db.resolve(job_id, "done", worker_token="w2") is True
+        else:
+            # no window: the at-cap decision happened in the requeue statement
+            assert db.get(job_id)["outcome"] == "parked"
+
+    def test_park_race_retry_vs_claim_invariant(self, db):
+        """Stress the window: concurrent retry(at cap) vs claim.  Afterwards
+        exactly one world holds — the retry parked the row, or the claimant
+        owns a live run that resolves normally.  Never both."""
+        import threading
+        for i in range(20):
+            job_id = db.create_wake("o/r", f"{i:040x}", True, max_attempts=1)
+            assert db.claim(job_id, lease_secs=600, worker_token="w1") == job_id
+            barrier = threading.Barrier(2)
+            out = {}
+
+            def do_retry():
+                barrier.wait()
+                out["retry"] = db.retry(job_id, worker_token="w1", reason="boom")
+
+            def do_claim():
+                barrier.wait()
+                out["claim"] = db.claim(job_id, lease_secs=600, worker_token="w2")
+
+            t1 = threading.Thread(target=do_retry)
+            t2 = threading.Thread(target=do_claim)
+            t1.start(); t2.start(); t1.join(); t2.join()
+            if out.get("claim") == job_id:
+                # the claimant owns the row: it must not be parked under them
+                assert out.get("retry") == "?", out
+                row = db.get(job_id)
+                assert row["state"] == "running" and row["outcome"] is None, row
+                assert db.resolve(job_id, "done", worker_token="w2") is True
+            else:
+                assert out.get("retry") == "parked", out
+                assert db.get(job_id)["outcome"] == "parked"
