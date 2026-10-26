@@ -138,13 +138,16 @@ def _require_loopback_roulegate(url: str) -> str:
 
     Parsed, not prefixed: a prefix check lets
     `http://127.0.0.1:8645@evil.example/...` (userinfo) or an arbitrary
-    loopback port through.  validate() whitelists the exact base, but a cfg
+    loopback port through.  Queries and fragments are refused outright
+    (Apollo r7 — accepting `.../v1/messages?x=1` and slicing positions
+    mangled the base), and the returned base is REBUILT from the parsed
+    parts, never a string slice.  validate() whitelists the exact base, but a cfg
     can be mutated after it — so both construction paths (from_config and
     _for_roulegate) re-check here and refuse anything that would route a
     brief (and its repo context) off-box.  The error message quotes only
-    scheme/host/port/path — never userinfo — so a credential parked in a
-    mistyped URL cannot leak into logs or escalation output.  Returns the
-    normalised BASE.
+    scheme/host/port/path — never userinfo or query — so a credential
+    parked in a mistyped URL cannot leak into logs or escalation output.
+    Returns the normalised BASE.
     """
     clean = (url or "").strip().rstrip("/")
     parts = urlsplit(clean)
@@ -160,15 +163,16 @@ def _require_loopback_roulegate(url: str) -> str:
             or parts.username is not None
             or parts.password is not None
             or port != ROUTEGATE_LOOPBACK_PORT
+            or parts.query or parts.fragment
             or path not in ("", "/", "/v1/messages")):
         raise AgentError(
             f"routegate_anthropic_url must be the loopback RouteGate BASE "
             f"(http://127.0.0.1:{ROUTEGATE_LOOPBACK_PORT} — the CLI "
             f"appends /v1/messages), got {shown!r}"
         )
-    if path == "/v1/messages":
-        return clean[:-len("/v1/messages")]
-    return clean
+    # Rebuilt from parsed parts — never a position slice over the raw
+    # string (Apollo r7): scheme/host/port are already verified above.
+    return f"{parts.scheme}://{parts.hostname}:{port}"
 
 
 # Canonical Neo verdicts — anything else is rejected.
