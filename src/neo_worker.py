@@ -318,17 +318,29 @@ def _enabled_reviewers(cfg: Config, state, repo: str) -> tuple[str, ...]:
     """The customer's enabled trusted reviewers for this repo.
 
     Reads the trusted_reviewers table through the state's DSN (install-scoped;
-    a repo-exact row overrides the '*' wildcard).  Fail closed: a database
-    that cannot be read means no outside reviewer counts (green 2 then needs
-    the architect)."""
+    a repo-exact row overrides the '*' wildcard).  The query is keyed on the
+    repo's REAL GitHub App installation id (W1-07-r2 defect 6: passing the org
+    login found no rows for any customer whose install_id differs from it —
+    their trusted reviewers silently never counted).  The id comes from the
+    same App resolution the token call uses (installation_for_repo, cached).
+    Fail closed: an unresolvable installation — or a database that cannot be
+    read — logs a WARNING naming the repo and means no outside reviewer
+    counts (green 2 then needs the architect)."""
     dsn = getattr(state, "dsn", "")
     if not isinstance(dsn, str) or not dsn:
         return ()
     try:
+        from . import github_app as _gh_app
         from . import trusted_reviewers
-        return trusted_reviewers.enabled_sources(dsn, repo.split("/", 1)[0], repo)
-    except Exception:  # noqa: BLE001 — fail closed, never strand the wake
-        log.exception("trusted_reviewers read failed — no outside reviewer counts")
+        app = _gh_app.github_app_for(cfg)
+        if app is None:
+            raise _gh_app.AppNotConfigured("no GitHub App identity configured")
+        install_id = app.installation_for_repo(repo)
+        return trusted_reviewers.enabled_sources(dsn, str(install_id), repo)
+    except Exception as exc:  # noqa: BLE001 — fail closed, never strand the wake
+        log.warning("trusted_reviewers: installation id for %s unresolvable "
+                    "(%s) — no outside reviewer counts (fail closed)",
+                    repo, type(exc).__name__)
         return ()
 
 
