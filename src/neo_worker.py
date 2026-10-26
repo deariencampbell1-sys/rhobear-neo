@@ -23,6 +23,7 @@ import os
 import re
 import secrets
 import subprocess
+from datetime import datetime
 
 from .config import Config, DEFAULT_OWNER_INSTALL_ID
 from .jobs import Jobs
@@ -153,6 +154,36 @@ def _trusted_contexts(cfg: Config) -> tuple[str, ...]:
 
 def _is_trusted(context: str, trusted: tuple[str, ...]) -> bool:
     return any(context == c or context.startswith(c) for c in trusted)
+
+
+def _parse_instant(value: str):
+    """An aware datetime for a GitHub timestamp, or None when unusable.
+
+    W1-07-r2 defect 7: created_at was compared as strings, so mixed `Z` and
+    `+offset` timestamps sorted lexicographically wrong ('...T12:00:00+05:00'
+    is OLDER than '...T10:00:00Z' but sorts above it as a string).  'Z' maps
+    to +00:00; a value that parses to a NAIVE datetime counts as unparseable
+    too — comparison must always be between aware instants."""
+    s = str(value or "").strip()
+    if s.endswith(("Z", "z")):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo is not None else None
+
+
+def _newer(candidate: str, incumbent: str) -> bool:
+    """True when candidate's instant is strictly newer than incumbent's.
+    A value that cannot be parsed sorts LAST: an unparseable candidate never
+    wins; an unparseable incumbent is always beaten by a parseable one."""
+    a, b = _parse_instant(candidate), _parse_instant(incumbent)
+    if a is None:
+        return False
+    if b is None:
+        return True
+    return a > b
 
 
 # --- W1-07-r1: the two greens on ONE head SHA (the merge rule (b)-(d)) -----
@@ -430,7 +461,7 @@ def _review_evidence(token: str, cfg: Config, repo: str, pr: int, sha: str,
                 continue
             created = str(item.get("created_at") or "")
             prior = newest.get(context)
-            if prior is None or created > prior[0]:
+            if prior is None or _newer(created, prior[0]):
                 newest[context] = (created, str(item.get("state") or "").lower())
         trusted_states = [state for _, state in newest.values()]
     except Exception as exc:  # noqa: BLE001
