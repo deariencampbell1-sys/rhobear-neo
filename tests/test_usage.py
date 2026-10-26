@@ -1098,7 +1098,7 @@ def test_header_and_row_consumer_match(store: UsageStore) -> None:
     cfg.deepseek_model = "deepseek-v4-flash"
     cfg.deepseek_reasoning_effort = "max"
     cfg.deepseek_max_tokens = 32000
-    cfg.routegate_anthropic_url = "http://127.0.0.1:8645/v1/messages"
+    cfg.routegate_anthropic_url = "http://127.0.0.1:8645"
     cfg.routegate_model = "peak"
 
     captured: dict[str, str] = {}
@@ -1163,7 +1163,7 @@ def test_bad_install_id_never_reaches_the_wire(store: UsageStore) -> None:
     cfg.deepseek_model = "deepseek-v4-flash"
     cfg.deepseek_reasoning_effort = "max"
     cfg.deepseek_max_tokens = 32000
-    cfg.routegate_anthropic_url = "http://127.0.0.1:8645/v1/messages"
+    cfg.routegate_anthropic_url = "http://127.0.0.1:8645"
     cfg.routegate_model = "peak"
 
     captured: dict[str, str] = {}
@@ -1273,3 +1273,21 @@ def test_route_name_and_cost_round_trip_postgres(store: UsageStore) -> None:
         assert row.head_sha == "ab" * 20
     finally:
         store.clear(555003)
+
+
+def test_brief_target_never_guesses():
+    """[Apollo r5, LOW] Anything the brief does not carry stays None — a bare
+    40-hex token without the commits/checkout context, a PR mention without
+    the TARGET line, and a round ratio outside the builder sentence must all
+    be ignored (the anchors may never loosen into guessing)."""
+    from src.usage import brief_target
+
+    target = brief_target(
+        "Please look at PR 44, sha 1234567890abcdef1234567890abcdef12345678, "
+        "and we are at 7/9 rounds of patience. No structure here.")
+    assert target.pr_number is None
+    assert target.head_sha is None
+    assert target.builder_round is None
+
+    empty = brief_target("")
+    assert (empty.pr_number, empty.head_sha, empty.builder_round) == (None, None, None)
