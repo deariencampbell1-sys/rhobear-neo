@@ -186,3 +186,32 @@ def test_integration_real_sql_roundtrip():
     tr.ensure_schema(dsn)
     assert tr.enabled_sources(dsn, tr.DEFAULT_OWNER_INSTALL_ID, "any/repo") == ()
     tr.set_source(dsn, tr.DEFAULT_OWNER_INSTALL_ID, "*", tr.SEED_SOURCE, enabled=True)
+
+# ---------------------------------------------------------------------------
+# Defect 3 (HIGH): the fake DB must be installed AND restored, and the
+# integration test must skip with a printed reason when NEO_TEST_DSN is
+# unset — never run against a stale fake and never silently pass.
+# ---------------------------------------------------------------------------
+
+def test_the_connect_fake_is_restored_after_the_fixture_exits():
+    """After the fixture exits, module._connect is the original object (the
+    old _install leaked the fake, so the NEO_TEST_DSN integration test ran
+    against stale fake SQL and proved nothing)."""
+    from src import trusted_reviewers as tr
+    original = tr._connect
+    with recording_db(rows=[(OWNER, "*", "Greptile", True, "2026-10-26T00:00:00Z")]) as conn:
+        assert tr._connect is not original
+        assert tr.enabled_sources("dsn", OWNER, "deariencampbell1-sys/rhobear-neo") == ("Greptile",)
+        assert conn.cur.calls, "the fake must actually serve the read"
+    assert tr._connect is original
+
+
+def test_the_integration_guard_skips_with_a_printed_reason(monkeypatch, capsys):
+    """NEO_TEST_DSN unset: the integration guard SKIPS with a printed reason —
+    it never silently passes without touching real SQL."""
+    monkeypatch.delenv("NEO_TEST_DSN", raising=False)
+    with pytest.raises(BaseException) as exc:   # pytest.skip.Exception
+        _require_dsn()
+    out = capsys.readouterr().out
+    assert "NEO_TEST_DSN" in out, out
+    assert "NEO_TEST_DSN" in str(exc.value), str(exc.value)
