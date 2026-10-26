@@ -392,8 +392,16 @@ class Config:
             log.info("routegate_anthropic_url: endpoint form normalised "
                      "to the base %s", ROUTEGATE_ANTHROPIC_URL)
             rg_anthropic = ROUTEGATE_ANTHROPIC_URL
+        if not rg_anthropic:
+            pass  # gate off stays off — the field default is empty
+        elif rg_anthropic == ROUTEGATE_ANTHROPIC_URL:
+            # Accept branch (Apollo r7): store the ONE canonical base, so
+            # the post-validate field holds the same value from_config and
+            # the agent guard will see, whatever spelling was read
+            # (trailing slash / whitespace were only stripped for the
+            # comparison before).
             self.routegate_anthropic_url = rg_anthropic
-        if rg_anthropic and rg_anthropic != ROUTEGATE_ANTHROPIC_URL:
+        else:
             # Not the allow-listed endpoint: DISCARD it (gate off, the direct
             # chain stands) instead of raising.  Raising would crash-loop both
             # services on a typo — the exact failure this codebase already
