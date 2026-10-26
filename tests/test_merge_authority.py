@@ -2067,3 +2067,21 @@ def test_a_review_by_a_prefix_login_is_never_a_trusted_green():
     assert greens["green1_ok"] is False, greens
     ok, reason = _authority(_bundle(greens))
     assert ok is False, reason
+
+
+def test_a_red_reviewer_after_a_green_one_still_refuses_the_merge():
+    """Defect 2 (HIGH): green 2b `break`ed on the first enabled green, so a
+    red reviewer sorted after a green one was never collected into
+    trusted_red and rule (d) ("no enabled trusted reviewer is red on this
+    head") failed open on merge authority.  Both source orders refuse and
+    name z-red."""
+    for sources in (("a-green", "z-red"), ("z-red", "a-green")):
+        greens = _greens(enabled=sources,
+                         statuses=[_status("a-green"),
+                                   _status("z-red", "failure")],
+                         reviews=[_review("APPROVED")])
+        assert any("z-red" in r for r in greens["trusted_red"]), (sources, greens)
+        assert greens["green2_ok"] is False, (sources, greens)
+        ok, reason = _authority(_bundle(greens))
+        assert ok is False, (sources, reason)
+        assert "z-red" in reason, (sources, reason)
