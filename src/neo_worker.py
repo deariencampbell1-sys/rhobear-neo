@@ -242,6 +242,7 @@ def _green_fields(cfg: Config, repo: str, sha: str, reviews: list, statuses: lis
 
     # --- green 2b: an enabled trusted reviewer's green (either counts) -----
     if not out.get("green2_ok"):
+        greens_found: list = []
         for src in enabled_sources:
             st = next((s for s in (statuses or [])
                        if tr.source_matches(src, str(s.get("context") or ""))), None)
@@ -281,13 +282,19 @@ def _green_fields(cfg: Config, repo: str, sha: str, reviews: list, statuses: lis
                     f"{label} (" + ("requested changes" if "changes" in state or
                                    "request" in state else state) + ")")
             elif green:
-                match, _, kind, url, at = green[0]
-                word = "accepted" if kind == "review" else "passed"
-                out.update(green2_ok=True, green2_kind="trusted",
-                           green2_label=f"{match} {word} (trusted)",
-                           green2_url=str(url or ""), green2_at=str(at or ""),
-                           green2_reason="")
-                break
+                greens_found.append(green[0])
+        # Rule (d) is decided only after EVERY enabled source is collected
+        # (W1-07-r2 defect 2): `break` on the first green hid a red reviewer
+        # sorted after it, so "no enabled trusted reviewer is red on this
+        # head" failed open on merge authority.  Any red refuses; a green
+        # counts only when nothing is red.
+        if greens_found and not out["trusted_red"]:
+            match, _, kind, url, at = greens_found[0]
+            word = "accepted" if kind == "review" else "passed"
+            out.update(green2_ok=True, green2_kind="trusted",
+                       green2_label=f"{match} {word} (trusted)",
+                       green2_url=str(url or ""), green2_at=str(at or ""),
+                       green2_reason="")
 
     if not out.get("green2_ok"):
         out.update(green2_ok=False, green2_kind="", green2_label="", green2_url="",
