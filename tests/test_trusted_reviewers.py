@@ -78,7 +78,7 @@ def test_set_list_delete_are_install_scoped():
     from src import trusted_reviewers as tr
     conn = _install(tr)
     tr.set_source("dsn", OWNER, "*", "Greptile", enabled=True)
-    upsert = [c for c in conn.cur.calls if "INSERT" in c[0].upper()]
+    upsert = [c for c in conn.cur.calls if "DO UPDATE" in c[0].upper()]
     assert upsert, conn.cur.calls
     sql, params = upsert[0]
     assert "ON CONFLICT (install_id, repo, source) DO UPDATE" in sql, sql

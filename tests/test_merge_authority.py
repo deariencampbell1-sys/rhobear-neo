@@ -1790,6 +1790,8 @@ def _bundle(greens, **over):
     ev = {"ok": True, "head_sha": SHA1, "decided_sha": SHA1, "review_bound_ok": True,
           "trusted_green": True, "trusted_states": ["success"],
           "trusted_producer_ok": True, "review_sha_match": True,
+          "required_checks_pass": True, "unresolved_critical_high": 0,
+          "coverage_complete": True, "auto_merge": True,
           "failing_checks": 0}
     ev.update(greens)
     ev.update(over)
@@ -2000,6 +2002,6 @@ def test_merge_posts_the_comment_then_merges():
         result = merge("o/r", 5, SHA1, ev, "tok")
     assert result["merged"] is True
     kinds = ["comment" if c[:2] == ("pr", "comment") else
-             "merge" if ("PUT" in c and "merge" in c) else "other" for c in calls]
+             "merge" if ("PUT" in c and "-X" in c) else "other" for c in calls]
     assert "comment" in kinds and "merge" in kinds
     assert kinds.index("comment") < kinds.index("merge"), kinds
