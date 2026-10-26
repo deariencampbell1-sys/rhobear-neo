@@ -911,9 +911,59 @@ class TestStaleHeadAndFence:
         assert "[LOW]" in block and "a.py:0" in block and "**ID:** f1" in block
 
     def test_credit_or_advisor_park_does_not_satisfy_recovery_gate(self):
-        import inspect
-        from src import neo_worker
-        src = inspect.getsource(neo_worker)
-        gate = src[src.index("for done_phase in ("):src.index("):", src.index("for done_phase in ("))]
-        assert '"parked"' not in gate, "transient parks must not mark a SHA as acted"
-        assert '"builder_blocked"' in gate
+        """A transient `parked` record (credit / advisor gate) must NOT satisfy
+        the done_phase recovery gate and must not short-circuit the run — the
+        agent still runs; a `builder_blocked` record DOES gate (job resolved
+        done).  Driven through the real run_neo gate."""
+        from src.jev_review import JevAssessment
+        from src.jobs import Jobs
+        from src.neo_worker import run_neo
+
+        sha = "a" * 40
+        cfg = Config()
+        cfg.gh_token = "t"
+        cfg.deepseek_model = "deepseek-v4-flash"
+        cfg.max_builder_rounds = 3
+        cfg.auto_merge_default = False
+        cfg.deepseek_timeout = 30
+        state = MagicMock()
+        state.builder_rounds.return_value = 0
+        state.install.return_value = {"install_id": "acme", "plan": "",
+                                      "credits_balance": 100}
+        state.already_escalated.return_value = False
+        jobs = MagicMock(spec=Jobs)
+        jobs.claim.return_value = 42
+        wake = {"repo": "o/r", "sha": sha, "green": True,
+                "context": "test", "pr_number": 5, "job_id": 42}
+        evidence = {"ok": True, "head_sha": sha, "decided_sha": sha,
+                    "review_sha": sha, "review_bound_ok": True,
+                    "trusted_states": ["success"], "trusted_green": True,
+                    "failing_checks": 0, "rollup_green": True,
+                    "required_checks_pass": True, "coverage_complete": True,
+                    "unresolved_critical_high": 0, "comments_addressed": True,
+                    "review_state": "APPROVED"}
+
+        def run(agent):
+            with patch("src.neo_worker.repo_token", return_value="tok"), \
+                 patch("src.neo_worker.resolve_pr", return_value=5), \
+                 patch("src.neo_worker._review_evidence", return_value=evidence), \
+                 patch("src.neo_worker._jev_for_pr",
+                       return_value=JevAssessment(False, reason="no key")), \
+                 patch("src.neo_worker._run_agent", agent), \
+                 patch("src.neo_worker._gh", return_value=(0, "")):
+                run_neo(cfg, state, jobs, wake)
+
+        # a parked record must NOT gate: the agent runs
+        state.already_acted.side_effect = \
+            lambda repo, pr, s, phase, green=None: phase == "parked"
+        agent = MagicMock(return_value=({"input_tokens": 1}, "NO-CHANGE", 0, None))
+        run(agent)
+        agent.assert_called_once()
+
+        # the builder_blocked phase DOES gate: no agent run at all
+        state.already_acted.side_effect = \
+            lambda repo, pr, s, phase, green=None: phase == "builder_blocked"
+        agent = MagicMock(return_value=({"input_tokens": 1}, "NO-CHANGE", 0, None))
+        run(agent)
+        agent.assert_not_called()
+        assert jobs.resolve.call_args.args[1] == "done"

@@ -31,7 +31,6 @@ Covers:
 from __future__ import annotations
 
 import json
-import inspect
 from unittest.mock import MagicMock, patch, ANY
 
 import pytest
@@ -260,13 +259,39 @@ class TestSchemaSingleDefinition:
         assert "builder_round" in JOBS_SCHEMA
         assert "UNIQUE (repo, pr_number, head_sha)" not in JOBS_SCHEMA  # legacy gone
 
-    def test_neo_state_delegates_not_defines(self):
+    def test_neo_state_delegates_not_defines(self, monkeypatch):
         """Only ONE schema definition for neo_jobs — neo_state no longer
-        defines the table; its ensure_schema() calls jobs.ensure_schema()."""
+        defines the table: running NeoState.ensure_schema() hands the table to
+        jobs.ensure_schema() and never creates it itself."""
         from src.neo_state import SCHEMA as STATE_SCHEMA, NeoState
         assert "CREATE TABLE IF NOT EXISTS neo_jobs" not in STATE_SCHEMA
-        src = inspect.getsource(NeoState.ensure_schema)
-        assert "Jobs(self.dsn).ensure_schema()" in src
+        executed, delegated = [], []
+
+        class _Cursor:
+            def execute(self, sql, *args):
+                executed.append(sql)
+
+        class _Ctx:
+            def __enter__(self):
+                return _Cursor()
+
+            def __exit__(self, *exc):
+                return False
+
+        class _FakeJobs:
+            def __init__(self, dsn):
+                self.dsn = dsn
+
+            def ensure_schema(self):
+                delegated.append(self.dsn)
+
+        monkeypatch.setattr(NeoState, "_conn", lambda self: _Ctx())
+        monkeypatch.setattr("src.jobs.Jobs", _FakeJobs)
+        NeoState("postgresql://unit").ensure_schema()
+        assert delegated == ["postgresql://unit"], \
+            "NeoState.ensure_schema() must delegate neo_jobs to jobs.ensure_schema()"
+        assert all("neo_jobs" not in sql for sql in executed), \
+            "NeoState must never define neo_jobs itself"
 
     def test_ensure_schema_runs_migration_once(self, mock_conn):
         """No neo_schema_version row (pre-B1 upgrade OR fresh install): the
@@ -434,33 +459,230 @@ class TestDefect3AgentErrors:
         self._run(lambda *a, **kw: ({}, "", None, None), jobs)
         jobs.retry.assert_called_once()
 
+    def test_crash_retry_passes_the_claim_token(self):
+        """The crash retry targets THIS claim: retry(42) presents the same
+        worker_token that claimed the job."""
+        jobs = MagicMock(spec=Jobs)
+        jobs.claim.return_value = 42
+        self._run(FileNotFoundError("agent binary not found"), jobs)
+        jobs.retry.assert_called_once()
+        assert jobs.retry.call_args.args == (42,)
+        assert jobs.retry.call_args.kwargs["worker_token"] == \
+            jobs.claim.call_args.kwargs["worker_token"]
+
 
 # ---------------------------------------------------------------------------
 # Defect 4 — wakes persisted before the executor; nothing dropped
 # ---------------------------------------------------------------------------
 
+class _ScriptedJobs:
+    """Fake Jobs for driving __main__.main() and its _recovery_loop closure
+    without a DB.  Script `expired` / `orphaned` / `dedup` per scenario;
+    every call is appended to `events` in order."""
+    events: list = []
+    expired: list = []
+    orphaned: list = []
+    dedup: bool = False
+
+    def __init__(self, dsn):
+        pass
+
+    def ensure_schema(self):
+        pass
+
+    def reset_queued_submissions(self, kind):
+        self.events.append(("reset", kind))
+
+    def create_wake(self, repo, sha, green, pr_number=None, payload=None):
+        self.events.append(("create_wake", repo, sha, pr_number))
+        if self.dedup:
+            return None
+        return len([e for e in self.events if e[0] == "create_wake"])
+
+    def mark_submitted(self, job_id):
+        self.events.append(("mark_submitted", job_id))
+
+    def clear_submitted(self, job_id):
+        self.events.append(("clear_submitted", job_id))
+
+    def recover_expired(self, kind):
+        self.events.append(("recover_expired", kind))
+        return [dict(r) for r in self.expired]
+
+    def stale_queued(self, kind, older_than_secs):
+        self.events.append(("stale_queued", kind, older_than_secs))
+        return [dict(r) for r in self.orphaned]
+
+    def park(self, job_id, **kw):
+        self.events.append(("park", job_id, kw.get("reason")))
+        return True
+
+
+def _drive_wake_main(monkeypatch, events):
+    """Run __main__.main() with fakes (no DB, no threads, no network) and
+    return the REAL (on_verdict, _recovery_loop) closures it builds."""
+    import concurrent.futures
+    import src.__main__ as main_mod
+
+    captured = {}
+    cfg = MagicMock()
+    cfg.orgs = ("o",)
+    cfg.escalation_poll_secs = 3600.0
+    cfg.escalation_timeout_secs = 60
+
+    class _FakeState:
+        def __init__(self, dsn):
+            pass
+
+        def ensure_schema(self):
+            pass
+
+    class _FakeUsage:
+        def __init__(self, dsn):
+            pass
+
+        def ensure_schema(self):
+            pass
+
+    class _FakeExecutor:
+        def __init__(self, **kw):
+            pass
+
+        def submit(self, fn, wake):
+            events.append(("submit", wake.get("job_id")))
+
+    class _FakeThread:
+        def __init__(self, target=None, **kw):
+            captured["recovery"] = target
+
+        def start(self):
+            pass
+
+    _ScriptedJobs.events = events
+    monkeypatch.setattr("src.__main__._config.load", lambda: cfg)
+    monkeypatch.setattr("src.__main__.github_app_for", lambda c: {"id": 1})
+    monkeypatch.setattr("src.__main__.NeoState", _FakeState)
+    monkeypatch.setattr("src.__main__.Jobs", lambda dsn: _ScriptedJobs(dsn))
+    monkeypatch.setattr("src.__main__.UsageStore", _FakeUsage)
+    monkeypatch.setattr("src.__main__.run_neo", lambda *a, **kw: None)
+    monkeypatch.setattr("src.__main__.serve", lambda *a, **kw: None)
+    monkeypatch.setattr("src.__main__.NeoDispatcher",
+                        lambda c, cb: captured.setdefault("on_verdict", cb))
+    monkeypatch.setattr(concurrent.futures, "ThreadPoolExecutor", _FakeExecutor)
+    monkeypatch.setattr("threading.Thread", _FakeThread)
+    main_mod.main()
+    return captured["on_verdict"], captured["recovery"]
+
+
 class TestDefect4DroppedWakes:
-    def test_on_verdict_persists_before_submit(self):
-        import src.__main__ as main_mod
-        source = open(main_mod.__file__).read()
-        assert "jobs.create_wake(repo, sha, green" in source
-        assert "Semaphore" not in source  # backpressure cap removed
+    def test_on_verdict_persists_before_submit(self, monkeypatch):
+        """The wake is persisted as a durable job BEFORE the executor ever
+        sees it — and no backpressure cap drops any of them (32/32 handed
+        off, each exactly once)."""
+        events = []
+        on_verdict, _ = _drive_wake_main(monkeypatch, events)
+        for i in range(32):
+            on_verdict({"repo": "o/r", "sha": f"{i:040x}", "green": True,
+                        "context": "test", "pr_number": 1})
+        assert [e[0] for e in events] == ["create_wake", "submit", "mark_submitted"] * 32
 
-    def test_status_wake_without_pr_creates_job(self):
-        """GLM 1: on_verdict passes pr_number (may be None) into create_wake —
-        a `status` event with no PR number still gets a durable job."""
-        import src.__main__ as main_mod
-        source = open(main_mod.__file__).read()
-        assert "pr_number=wake.get(\"pr_number\")" in source
+    def test_duplicate_wake_is_never_submitted(self, monkeypatch):
+        """A deduped wake (another job owns the SHA) is never handed off."""
+        events = []
+        _ScriptedJobs.dedup = True
+        try:
+            on_verdict, _ = _drive_wake_main(monkeypatch, events)
+            on_verdict({"repo": "o/r", "sha": "a" * 40, "green": True,
+                        "context": "test", "pr_number": 1})
+        finally:
+            _ScriptedJobs.dedup = False
+        assert [e[0] for e in events] == ["create_wake"]
 
-    def test_recovery_loop_resubmits_expired_and_orphaned(self):
-        """GLM 4: __main__ runs a lease-recovery loop that re-queues expired
-        wake leases and re-submits orphaned queued wakes (no strand)."""
+    def test_status_wake_without_pr_creates_job(self, monkeypatch):
+        """GLM 1: a `status` wake carries no pr_number — the durable job is
+        created anyway (pr resolved later via the head SHA) and submitted."""
+        events = []
+        on_verdict, _ = _drive_wake_main(monkeypatch, events)
+        on_verdict({"repo": "o/r", "sha": "a" * 40, "green": True,
+                    "context": "test"})
+        assert ("create_wake", "o/r", "a" * 40, None) in events
+        assert ("submit", 1) in events and ("mark_submitted", 1) in events
+
+    def test_recovery_loop_resubmits_expired_and_orphaned(self, monkeypatch):
+        """GLM 4: one recovery pass parks ONLY the wake that is out of
+        attempts and re-submits everything else exactly once (expired leases
+        below the cap AND orphaned queued wakes)."""
         import src.__main__ as main_mod
-        source = open(main_mod.__file__).read()
-        assert "jobs.recover_expired(\"wake\")" in source
-        assert "jobs.stale_queued(\"wake\"" in source
-        assert "_submit_wake(executor, jobs, wake, _run_wake)" in source
+        events = []
+        _ScriptedJobs.events = events
+        _ScriptedJobs.expired = [
+            {"id": 1, "repo": "o/r", "head_sha": "a" * 40,
+             "attempt": 2, "max_attempts": 2,
+             "payload": {"repo": "o/r", "sha": "a" * 40}},
+            {"id": 2, "repo": "o/r", "head_sha": "b" * 40,
+             "attempt": 1, "max_attempts": 3,
+             "payload": {"repo": "o/r", "sha": "b" * 40}},
+        ]
+        _ScriptedJobs.orphaned = [
+            {"id": 3, "repo": "o/r", "head_sha": "c" * 40,
+             "payload": {"repo": "o/r", "sha": "c" * 40}},
+        ]
+        try:
+            _, recovery = _drive_wake_main(monkeypatch, events)
+            sleeps = []
+
+            def fake_sleep(secs):
+                sleeps.append(secs)
+                if len(sleeps) >= 2:
+                    raise KeyboardInterrupt
+
+            monkeypatch.setattr("time.sleep", fake_sleep)
+            monkeypatch.setattr("src.escalation.recover_escalations",
+                                lambda *a, **kw: None)
+            with pytest.raises(KeyboardInterrupt):
+                recovery()
+        finally:
+            _ScriptedJobs.expired = []
+            _ScriptedJobs.orphaned = []
+        # out-of-attempts wake: parked once (by name), never re-submitted
+        assert [e for e in events if e[0] == "park"] == [
+            ("park", 1, "lease expired 2/2 times")]
+        # below-cap expired wake + orphan: each submitted exactly once
+        assert [e for e in events if e[0] == "submit"] == [("submit", 2), ("submit", 3)]
+        assert ("mark_submitted", 2) in events and ("mark_submitted", 3) in events
+        assert ("reset", "wake") in events           # startup un-strand
+        assert ("recover_expired", "wake") in events
+        assert ("stale_queued", "wake", main_mod.RECOVERY_SECS) in events
+        assert sleeps == [main_mod.RECOVERY_SECS, main_mod.RECOVERY_SECS]
+
+    def test_recovery_loop_does_not_park_a_recoverable_wake(self, monkeypatch):
+        """A wake with attempts left is never parked — it is re-submitted
+        exactly once."""
+        events = []
+        _ScriptedJobs.events = events
+        _ScriptedJobs.expired = [
+            {"id": 7, "repo": "o/r", "head_sha": "d" * 40,
+             "attempt": 1, "max_attempts": 3,
+             "payload": {"repo": "o/r", "sha": "d" * 40}},
+        ]
+        try:
+            _, recovery = _drive_wake_main(monkeypatch, events)
+            sleeps = []
+
+            def fake_sleep(secs):
+                sleeps.append(secs)
+                if len(sleeps) >= 2:
+                    raise KeyboardInterrupt
+
+            monkeypatch.setattr("time.sleep", fake_sleep)
+            monkeypatch.setattr("src.escalation.recover_escalations",
+                                lambda *a, **kw: None)
+            with pytest.raises(KeyboardInterrupt):
+                recovery()
+        finally:
+            _ScriptedJobs.expired = []
+        assert not [e for e in events if e[0] == "park"]
+        assert [e for e in events if e[0] == "submit"] == [("submit", 7)]
 
     def test_webhook_status_wake_has_no_pr(self):
         """The status webhook deliberately carries no pr_number; on_verdict
@@ -489,12 +711,46 @@ class TestDefect4DroppedWakes:
 # ---------------------------------------------------------------------------
 
 class TestDefect5RollupGreen:
-    def test_rollup_green_computed_from_rollup(self):
+    def _evidence(self, rollup):
+        """Run the REAL _review_evidence against a scripted gh CLI."""
+        import json as _json
         from src.neo_worker import _review_evidence
-        source = inspect.getsource(_review_evidence)
-        assert "rollup_green" in source
-        assert "SUCCESS" in source
-        assert "statusCheckRollup" in source
+        from src.config import Config
+        cfg = Config()
+        cfg.trusted_reviewer_app_id = "12345"
+        cfg.trusted_review_contexts = ("rhobear-reviews",)
+        sha = "a" * 40
+
+        def fake_gh(token, *args, **kw):
+            if args[0] == "pr":
+                return 0, _json.dumps({"headRefOid": sha, "reviews": [],
+                                       "statusCheckRollup": rollup})
+            if "check-runs" in args[1]:
+                run = {"name": "rhobear-reviews", "head_sha": sha,
+                       "app": {"id": "12345"}, "status": "completed",
+                       "conclusion": "success",
+                       "output": {"summary": '{"unresolved_critical_high": 0, '
+                                             '"coverage": "complete"}'}}
+                return 0, _json.dumps({"check_runs": [run], "total_count": 1})
+            return 0, _json.dumps({"statuses": [
+                {"context": "rhobear-reviews", "state": "success"}]})
+
+        with patch("src.neo_worker._gh", side_effect=fake_gh):
+            return _review_evidence("tok", cfg, "o/r", 5, sha)
+
+    def test_rollup_green_computed_from_the_rollup(self):
+        """rollup_green is computed from the branch-protection check rollup:
+        green only when every check is SUCCESS, red on any FAILURE, and
+        UNKNOWN (None) when there is no rollup data at all."""
+        ev = self._evidence([{"context": "ci/test", "conclusion": "SUCCESS"}])
+        assert ev["rollup_green"] is True
+        assert ev["required_checks_pass"] is True
+        ev = self._evidence([{"context": "ci/test", "conclusion": "FAILURE"}])
+        assert ev["rollup_green"] is False
+        assert ev["required_checks_pass"] is False
+        ev = self._evidence([])
+        assert ev["rollup_green"] is None
+        assert ev["required_checks_pass"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -502,12 +758,57 @@ class TestDefect5RollupGreen:
 # ---------------------------------------------------------------------------
 
 class TestDefect6DryRun:
-    def test_dry_run_uses_read_only_peek(self):
+    def _run(self, monkeypatch, argv, jobs, fake_sleep=None):
+        import sys
         import src.neo_builder as builder
-        source = open(builder.__file__).read()
-        dry_section = source[source.index("if dry:"):source.index("continue", source.index("if dry:"))]
-        assert "jobs.peek_queued" in dry_section
-        assert "time.sleep(POLL_SECS)" in dry_section
+        cfg = MagicMock()
+        cfg.max_builder_rounds = 2
+        cfg.repo_allowlist = ()
+        cfg.gh_token = "t"
+        cfg.hermes_bin = "/fake/hermes"
+        cfg.hermes_provider = "zai"
+        cfg.hermes_model = "glm-5.3-flash"
+        cfg.deepseek_timeout = 30
+        monkeypatch.setattr(builder, "Config", lambda: cfg)
+        monkeypatch.setattr(builder, "Jobs", lambda dsn: jobs)
+        monkeypatch.setattr(sys, "argv", ["neo_builder"] + argv)
+        if fake_sleep is not None:
+            monkeypatch.setattr(builder.time, "sleep", fake_sleep)
+        builder.main()
+
+    def test_dry_run_is_read_only(self, monkeypatch):
+        """A dry-run peeks at the queue (peek_queued) and mutates NOTHING —
+        no claim, no resolve, no park, no retry, no release, no recovery."""
+        jobs = MagicMock(spec=Jobs)
+        jobs.peek_queued.return_value = [
+            {"repo": "o/r", "pr_number": 5, "builder_round": 1, "attempt": 1}]
+        self._run(monkeypatch, ["--once", "--dry-run"], jobs)
+        jobs.peek_queued.assert_called_once()
+        jobs.claim_queued.assert_not_called()
+        jobs.resolve.assert_not_called()
+        jobs.park.assert_not_called()
+        jobs.retry.assert_not_called()
+        jobs.release.assert_not_called()
+        jobs.create_builder.assert_not_called()
+        jobs.supersede_older.assert_not_called()
+        jobs.recover_expired.assert_not_called()
+
+    def test_dry_run_sleeps_every_iteration(self, monkeypatch):
+        """The dry-run poll sleeps POLL_SECS on EVERY iteration (the bug was
+        sleeping only on an empty queue)."""
+        jobs = MagicMock(spec=Jobs)
+        jobs.peek_queued.return_value = []
+        sleeps = []
+
+        def fake_sleep(secs):
+            sleeps.append(secs)
+            if len(sleeps) >= 3:
+                raise KeyboardInterrupt
+
+        with pytest.raises(KeyboardInterrupt):
+            self._run(monkeypatch, ["--dry-run"], jobs, fake_sleep)
+        assert sleeps == [POLL_SECS] * 3
+        assert jobs.peek_queued.call_count == 3
 
 
 # ---------------------------------------------------------------------------
@@ -641,11 +942,43 @@ class TestGLM6LeaseRenewal:
 # ---------------------------------------------------------------------------
 
 class TestGLM8TransientPrState:
-    def test_main_loop_does_not_resolve_failed(self):
+    def _cfg(self):
+        cfg = MagicMock()
+        cfg.max_builder_rounds = 3
+        cfg.deepseek_timeout = 30
+        cfg.hermes_bin = "/fake/hermes"
+        return cfg
+
+    def _row(self):
+        return {"id": 1, "repo": "o/r", "pr_number": 5,
+                "head_sha": "a" * 40, "builder_round": 1,
+                "attempt": 1, "worker_token": "w1"}
+
+    def test_transient_pr_state_never_resolves_the_job(self):
+        """GLM 8: a transient empty pr_state (gh failure) leaves the job
+        RUNNING for lease recovery — it is never resolved/failed terminally."""
         import src.neo_builder as builder
-        source = open(builder.__file__).read()
-        assert 'resolve(row["id"], "failed"' not in source
-        assert "job stays running" in source
+        jobs = MagicMock(spec=Jobs)
+        with patch("src.neo_builder.repo_token", return_value="tok"), \
+             patch("src.neo_builder.pr_state", return_value=""):
+            builder.dispatch_one(self._cfg(), jobs, self._row())
+        jobs.resolve.assert_not_called()
+        jobs.retry.assert_not_called()
+        jobs.park.assert_not_called()
+
+    def test_transient_github_error_never_resolves_the_job(self):
+        """A transient GitHub error (token mint / 5xx) also leaves the job
+        running — never a terminal resolve."""
+        from src.github_app import GitHubAppError
+        import src.neo_builder as builder
+        jobs = MagicMock(spec=Jobs)
+        with patch("src.neo_builder.repo_token",
+                   side_effect=GitHubAppError("502 bad gateway")), \
+             patch("src.neo_builder.pr_state", return_value="OPEN\tmain"):
+            builder.dispatch_one(self._cfg(), jobs, self._row())
+        jobs.resolve.assert_not_called()
+        jobs.retry.assert_not_called()
+        jobs.park.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
