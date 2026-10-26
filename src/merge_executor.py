@@ -139,6 +139,16 @@ def merge(
                     "coverage_complete", "auto_merge")
     if any(k in evidence for k in _gate_fields):
         granted, reason = _review_ev.merge_authority(evidence)
+        # Belt (W1-13 defect 1): `ok` is checked HERE, in front of the gate —
+        # `not ok or not granted` denies.  merge_authority subsumes `ok`
+        # (its first condition denies an ok=False bundle), so the gate branch
+        # is transitively closed today; the belt stays because `ok` encodes
+        # evidence completeness the six gate fields do not ("evidence
+        # retrieval partially failed but the fetched fields look green"), and
+        # the merge path must fail closed on it even if the gate's answer ever
+        # drifts.  A gate that grants must never override ok=False.
+        if not evidence.get("ok"):
+            raise MergeDenied(f"evidence unavailable ({evidence.get('reason', 'unknown')})")
         if not granted:
             raise MergeDenied(f"merge authority denied: {reason}")
     elif not evidence.get("ok"):
