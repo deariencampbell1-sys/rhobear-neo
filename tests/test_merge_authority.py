@@ -2160,3 +2160,33 @@ def test_created_at_instants_are_compared_as_instants_not_strings():
     for statuses in ([unparsable, newer], [newer, unparsable]):
         ev = run(statuses)
         assert ev["trusted_states"] == ["success"], (statuses, ev["trusted_states"])
+
+
+def test_a_refused_merge_posts_no_two_greens_comment():
+    """Defect 9 (LOW): the merge comment was posted BEFORE the merge, so a
+    refused or moved-head merge left a stale "Two greens on <sha>" comment
+    and a retry posted a duplicate.  Decision (W1-07-r2): the comment is
+    posted AFTER a successful merge — a refused merge leaves NO comment."""
+    greens = _greens(enabled=("CodeAnt",),
+                     statuses=[_status("CodeAnt"), _status("rhobear-reviews")],
+                     reviews=[_review("APPROVED")])
+    ev = _bundle(greens)
+    calls = []
+
+    def fake_gh(token, *args, **kw):
+        calls.append(args)
+        if args[:3] == ("pr", "view", "5"):
+            return 0, json.dumps({"headRefOid": SHA1, "state": "OPEN",
+                                  "mergeable": "MERGEABLE", "headRefName": "topic",
+                                  "isCrossRepository": False})
+        if args[:2] == ("pr", "comment"):
+            return 0, "{}"
+        if args[:2] == ("api", "-X") and "PUT" in args:
+            return 1, "Protected branch hook declined: pull request is not mergeable"
+        raise AssertionError(f"unexpected call: {args}")
+
+    with patch("src.merge_executor._gh", side_effect=fake_gh):
+        with pytest.raises((MergeDenied, MergeFailed)):
+            merge("o/r", 5, SHA1, ev, "tok")
+    assert not [c for c in calls if c[:2] == ("pr", "comment")], \
+        f"a refused merge must leave no comment, got: {calls}"
