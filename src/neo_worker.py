@@ -318,6 +318,7 @@ def merge_authority(install_auto_merge: bool, evidence: dict,
 # commit status "architect/<lane>" set from the owner's account. L0 ruling 2026-10-25, north-star #1.
 LANE_BRANCH = re.compile(r"^(l\d+[a-d]?(?:-[a-z0-9-]+)?)/", re.IGNORECASE)
 ARCHITECT_CONTEXT = "architect/"
+DRIFT_CONTEXT = "l0/drift"   # L0 sentinel, SPRINT.md section 9
 
 
 def lane_of(branch: str) -> str:
@@ -326,7 +327,8 @@ def lane_of(branch: str) -> str:
 
 
 def lane_merge_authority(lane_merge: bool, evidence: dict, lane: str,
-                         statuses: list[dict], reviews: list[dict], owner: str) -> tuple[bool, str]:
+                         statuses: list[dict], reviews: list[dict], owner: str,
+                         require_drift: bool = False) -> tuple[bool, str]:
     """Merge authority for a lane PR. Fails closed. Follows NEO_LANE_MERGE, not the install switch."""
     if not lane_merge:
         return False, "lane merges disabled (NEO_LANE_MERGE is off)"
@@ -348,6 +350,12 @@ def lane_merge_authority(lane_merge: bool, evidence: dict, lane: str,
         return False, f"waiting for the {lane} architect to accept this exact head"
     if str((latest.get("creator") or {}).get("login") or "").lower() != owner.lower():
         return False, f"the {ARCHITECT_CONTEXT}{lane} status was not set from the owner's account"
+    if require_drift:
+        drift = next((s for s in statuses if str(s.get("context") or "").lower() == DRIFT_CONTEXT), None)
+        if not drift:
+            return False, "waiting for L0's drift check (l0/drift) on this exact head"
+        if str(drift.get("state") or "").lower() != "success":
+            return False, f"L0's drift check fails on this exact head ({drift.get('description') or 'see the PR'})"
     return True, "Apollo and the lane architect both passed this exact head"
 
 
@@ -365,7 +373,8 @@ def run_lane_gate(token: str, cfg: Config, state: NeoState, repo: str, pr: int, 
     except (TypeError, ValueError):
         statuses = []
     ok, reason = lane_merge_authority(bool(getattr(cfg, "lane_merge", False)), evidence, lane,
-                                      statuses if isinstance(statuses, list) else [], reviews, org)
+                                      statuses if isinstance(statuses, list) else [], reviews, org,
+                                      require_drift=getattr(cfg, "lane_require_drift", False) is True)
     log.info("%s#%s@%s lane=%s merge authority=%s (%s)", repo, pr, sha[:8], lane, ok, reason)
     if ok:
         rc, out = _gh(token, "pr", "merge", str(pr), "-R", repo, "--squash",
@@ -654,8 +663,8 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict,
     if lane_pr:
         run_lane_gate(token, cfg, state, repo, pr, sha, lane_pr[0], lane_pr[1])
         return
-    if str(wake.get("context") or "").startswith(ARCHITECT_CONTEXT):
-        return  # an architect status only ever drives a lane PR
+    if str(wake.get("context") or "").startswith(ARCHITECT_CONTEXT) or wake.get("context") == DRIFT_CONTEXT:
+        return  # an architect or L0 drift status only ever drives a lane PR
 
     # Jev never supplies a green verdict.
     jev = _jev_for_pr(token, cfg, repo, pr, sha)

@@ -182,3 +182,56 @@ def test_architect_status_wakes_neo_but_other_untrusted_contexts_do_not():
     assert d.dispatch("status", {**payload, "context": "architect/l3-kit"}).code == 200
     assert d.dispatch("status", {**payload, "context": "ci/random"}).code == 204
     assert [w["context"] for w in wakes] == ["architect/l3-kit"]
+
+
+def test_drift_gate_needs_a_green_l0_drift_on_this_head():
+    """SPRINT section 9: with require_drift, a failing or missing l0/drift holds the merge."""
+    drift_ok = {"context": "l0/drift", "state": "success", "creator": {"login": OWNER}}
+    drift_bad = {"context": "l0/drift", "state": "failure", "description": "2 hard", "creator": {"login": OWNER}}
+    ok, _ = neo_worker.lane_merge_authority(True, evidence(), "l3-kit", [drift_ok, architect()], [], OWNER,
+                                            require_drift=True)
+    assert ok
+    ok, reason = neo_worker.lane_merge_authority(True, evidence(), "l3-kit", [architect()], [], OWNER,
+                                                 require_drift=True)
+    assert not ok and "waiting for L0" in reason
+    ok, reason = neo_worker.lane_merge_authority(True, evidence(), "l3-kit", [drift_bad, architect()], [], OWNER,
+                                                 require_drift=True)
+    assert not ok and "fails" in reason
+    ok, _ = neo_worker.lane_merge_authority(True, evidence(), "l3-kit", [architect()], [], OWNER)
+    assert ok   # switch off: unchanged behaviour
+
+
+def test_lane_require_drift_is_off_by_default_and_on_with_the_switch(monkeypatch):
+    """NEO_LANE_REQUIRE_DRIFT is opt-in: default off, and the run-time check
+    (`… is True`) refuses a non-True value — an unset switch is never green."""
+    monkeypatch.delenv("NEO_LANE_REQUIRE_DRIFT", raising=False)
+    assert Config().lane_require_drift is False
+    monkeypatch.setenv("NEO_LANE_REQUIRE_DRIFT", "true")
+    assert Config().lane_require_drift is True
+
+
+def test_drift_status_wakes_the_lane_gate_but_never_the_agent():
+    """An l0/drift event wakes the lane gate like an architect status, and never
+    starts the agent on a non-lane PR (dc317b0)."""
+    wakes = []
+    cfg = mock.Mock(repo_allowlist=(REPO,), trusted_review_contexts=("rhobear-reviews",))
+    d = NeoDispatcher(cfg, wakes.append)
+    payload = {"repository": {"full_name": REPO}, "sha": HEAD, "state": "success"}
+    assert d.dispatch("status", {**payload, "context": "l0/drift"}).code == 200
+    assert [w["context"] for w in wakes] == ["l0/drift"]
+
+    state = FakeState()
+    gh, calls = fake_gh([])
+    with mock.patch.object(neo_worker, "_gh", gh), \
+         mock.patch.object(neo_worker, "repo_token", return_value="tok"), \
+         mock.patch.object(neo_worker, "resolve_pr", return_value=51), \
+         mock.patch.object(neo_worker, "_review_evidence",
+                           return_value=evidence(head_ref="feature/not-a-lane")), \
+         mock.patch.object(neo_worker.ClaudeAgent, "from_config") as agent:
+        neo_worker.run_neo(dataclasses.replace(Config(), lane_merge=True),
+                           state, mock.MagicMock(),
+                           {"job_id": 1, "repo": REPO, "sha": HEAD, "green": True,
+                            "context": "l0/drift"})
+    agent.assert_not_called()
+    assert not any(c[:2] == ("pr", "merge") for c in calls)
+    assert state.rows == []
