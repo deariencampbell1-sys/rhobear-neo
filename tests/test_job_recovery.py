@@ -1426,3 +1426,89 @@ class TestNoSourceTextAssertions:
                     f"{name} asserts on source text ({m.group(0)!r}) — "
                     "drive the real function and assert on calls made instead"
                 )
+
+
+# ---------------------------------------------------------------------------
+# W1-13-r1 Defect 7 — the owner install id must come from Config
+# ---------------------------------------------------------------------------
+
+class TestOwnerInstallIdFromConfig:
+    """A hard-coded install id in the worker is exactly what drifts per
+    deployment: the owner workspace must be NEO_OWNER_INSTALL_ID on Config."""
+
+    def test_owner_install_id_is_env_configured(self, monkeypatch):
+        from src.config import Config
+        monkeypatch.setenv("NEO_OWNER_INSTALL_ID", "deploy-specific-owner")
+        assert Config().owner_install_id == "deploy-specific-owner"
+
+    def test_owner_install_id_defaults_to_the_legacy_value(self):
+        from src.config import Config
+        from src.neo_worker import OWNER_INSTALL_ID
+        assert Config().owner_install_id == OWNER_INSTALL_ID
+
+    def test_metering_follows_the_config_value(self, monkeypatch):
+        from src.config import Config
+        from src.neo_worker import OWNER_INSTALL_ID, meters_credits
+        monkeypatch.setenv("NEO_OWNER_INSTALL_ID", "deploy-specific-owner")
+        cfg = Config()
+        # the CONFIGURED owner never meters ...
+        assert meters_credits(
+            {"install_id": "deploy-specific-owner", "plan": "pro"}, cfg) is False
+        # ... and the legacy hard-coded id decides nothing any more
+        assert meters_credits(
+            {"install_id": OWNER_INSTALL_ID, "plan": "pro"}, cfg) is True
+
+    def test_credit_gate_uses_the_config_owner(self, monkeypatch):
+        """run_neo's out-of-credits gate follows cfg.owner_install_id: the
+        configured owner is exempt; the legacy hard-coded id is a customer."""
+        from src.config import Config
+        from src.jev_review import JevAssessment
+        from src.neo_worker import OWNER_INSTALL_ID, run_neo
+        monkeypatch.setenv("NEO_OWNER_INSTALL_ID", "custom-owner")
+        cfg = Config()
+        cfg.gh_token = "t"
+        cfg.deepseek_model = "deepseek-v4-flash"
+        cfg.max_builder_rounds = 3
+        cfg.auto_merge_default = False
+        cfg.deepseek_timeout = 30
+        state = MagicMock()
+        state.builder_rounds.return_value = 0
+        state.already_acted.return_value = False
+        state.already_escalated.return_value = False
+        jobs = MagicMock(spec=Jobs)
+        jobs.claim.return_value = 42
+        wake = {"repo": "o/r", "sha": "a" * 40, "green": True,
+                "context": "test", "pr_number": 5, "job_id": 42}
+        evidence = {"ok": True, "head_sha": "a" * 40, "decided_sha": "a" * 40,
+                    "review_sha": "a" * 40, "review_bound_ok": True,
+                    "trusted_states": ["success"], "trusted_green": True,
+                    "failing_checks": 0, "rollup_green": True,
+                    "required_checks_pass": True, "coverage_complete": True,
+                    "unresolved_critical_high": 0, "comments_addressed": True,
+                    "review_state": "APPROVED"}
+
+        def drive(inst):
+            state.install.return_value = inst
+            jobs.reset_mock()
+            with patch("src.neo_worker.repo_token", return_value="tok"), \
+                 patch("src.neo_worker.resolve_pr", return_value=5), \
+                 patch("src.neo_worker._review_evidence", return_value=evidence), \
+                 patch("src.neo_worker._jev_for_pr",
+                       return_value=JevAssessment(False, reason="no key")), \
+                 patch("src.neo_worker._run_agent",
+                       return_value=({"input_tokens": 1}, "NO-CHANGE", 0, None)) as agent, \
+                 patch("src.neo_worker._gh", return_value=(0, "")):
+                run_neo(cfg, state, jobs, wake)
+            return agent
+
+        # the legacy hard-coded id with zero balance: a plain customer -> gated
+        agent = drive({"install_id": OWNER_INSTALL_ID, "plan": "pro",
+                       "credits_balance": 0})
+        agent.assert_not_called()
+        assert jobs.park.called, "customer install with no credits is parked"
+
+        # the CONFIGURED owner with zero balance: never metered -> runs
+        agent = drive({"install_id": "custom-owner", "plan": "pro",
+                       "credits_balance": 0})
+        agent.assert_called_once()
+        assert not jobs.park.called
