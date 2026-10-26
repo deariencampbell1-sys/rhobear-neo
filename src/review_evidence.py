@@ -45,18 +45,48 @@ def _parse_evidence_summary(summary: str) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+def _check_run_completed(cr: dict) -> bool:
+    """True only for a check run that actually COMPLETED.
+
+    `status` must be "completed" (a queued/in_progress/pending run is not
+    evidence).  GitHub's check-run schema always includes `status`, and a
+    `conclusion` exists only on completed runs: a run carrying a conclusion
+    but no `status` (pinned test fixtures) is therefore treated as completed.
+    A run with neither is never evidence.
+    """
+    status = cr.get("status")
+    if status is not None:
+        return str(status) == "completed"
+    return cr.get("conclusion") is not None
+
+
 def _trusted_check_run(check_runs: list, app_id: str, sha: str) -> dict | None:
     """The ONE check run that authorizes `sha`.
 
     Trusts only a check run whose `app.id` equals the configured Reviews App
-    id AND whose `head_sha` equals `sha` (full 40-char equality).
+    id AND whose `head_sha` equals `sha` (full 40-char equality) AND that
+    COMPLETED successfully (conclusion in success/neutral).  When several
+    runs match, the NEWEST (by completed_at, then by id) decides — never the
+    first in the list, and never a fallback to an older run when the newest
+    one is failing or still pending.
     """
+    matches = []
     for cr in check_runs or []:
         cr_app = (cr.get("app") or {}) or {}
         if str(cr_app.get("id", "") or "") == str(app_id) \
                 and str(cr.get("head_sha", "") or "") == sha:
-            return cr
-    return None
+            matches.append(cr)
+    if not matches:
+        return None
+    cr = max(matches, key=lambda r: (str(r.get("completed_at") or ""),
+                                     int(r.get("id") or 0)))
+    # The newest matching run decides; if IT is not acceptable evidence,
+    # there is no evidence (never fall back to an older run).
+    if not _check_run_completed(cr):
+        return None
+    if str(cr.get("conclusion") or "").lower() not in ("success", "neutral"):
+        return None
+    return cr
 
 
 def build_evidence(
