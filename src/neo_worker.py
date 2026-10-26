@@ -550,6 +550,10 @@ def merge_authority(install_auto_merge: bool, evidence: dict,
         return False, "auto-merge disabled for this install"
     if not evidence.get("ok"):
         return False, f"review evidence unavailable ({evidence.get('reason')})"
+    # An unreadable head branch cannot prove the PR is not a lane PR, so it may
+    # never be merged under the non-lane rule (which skips architect and drift).
+    if "head_ref" in evidence and not evidence.get("head_ref"):
+        return False, "PR head branch unavailable — cannot rule out a lane PR"
     if evidence.get("head_sha") != evidence.get("decided_sha"):
         return False, "head moved since the wake — stale evidence cannot authorize this SHA"
     if not evidence.get("review_bound_ok", True):

@@ -2238,3 +2238,15 @@ def test_a_refused_merge_posts_no_two_greens_comment():
             merge("o/r", 5, SHA1, ev, "tok")
     assert not [c for c in calls if c[:2] == ("pr", "comment")], \
         f"a refused merge must leave no comment, got: {calls}"
+
+
+def test_unreadable_head_branch_never_merges_under_the_non_lane_rule():
+    """A PR whose head branch could not be read may be a lane PR: the non-lane
+    two-greens rule must refuse it rather than skip the architect/drift gates."""
+    greens = _greens(enabled=("CodeAnt",),
+                     statuses=[_status("CodeAnt"), _status("rhobear-reviews")],
+                     reviews=[_review("APPROVED")])
+    ok, _ = _authority(_bundle(greens, head_ref="l3-kit/buttons"))
+    assert ok is True
+    ok, reason = _authority(_bundle(greens, head_ref=""))
+    assert ok is False and "head branch unavailable" in reason
