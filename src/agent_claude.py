@@ -27,15 +27,18 @@ from __future__ import annotations
 import json
 import logging
 import os
+import posixpath
 import re
 import subprocess
 import tempfile
 import threading
 import time
+from urllib.parse import urlsplit
 
 from .config import Config
 from .usage import (
-    BriefTarget, Route, UsageAttempt, brief_target, classify_error_text,
+    DEFAULT_CONSUMER, BriefTarget, Route, UsageAttempt, brief_target,
+    classify_error_text,
 )
 
 log = logging.getLogger("rhobear_neo.agent")
@@ -66,18 +69,40 @@ def _warn_missing_gh_token() -> None:
     )
 
 
+ROUTEGATE_LOOPBACK_PORT = 8645
+
+
 def _require_loopback_roulegate(url: str) -> str:
     """Fail-closed: only the loopback RouteGate may receive a brief.
 
-    validate() whitelists the exact URLs, but a cfg can be mutated after it —
-    so both construction paths (from_config and _for_roulegate) re-check here
-    and refuse anything that would route a brief (and its repo context)
-    off-box.  Returns the normalised URL.
+    Parsed, not prefixed: a prefix check lets
+    `http://127.0.0.1:8645@evil.example/...` (userinfo) or an arbitrary
+    loopback port through, so this requires scheme http, host exactly
+    127.0.0.1, no userinfo, RouteGate's port, and a path under /v1 with no
+    `..` hop.  validate() whitelists the exact URLs, but a cfg can be
+    mutated after it — so both construction paths (from_config and
+    _for_roulegate) re-check here and refuse anything that would route a
+    brief (and its repo context) off-box.  Returns the normalised URL.
     """
     clean = (url or "").strip().rstrip("/")
-    if not clean.startswith("http://127.0.0.1:"):
+    parts = urlsplit(clean)
+    path = parts.path or ""
+    normalised = posixpath.normpath(path or "/")
+    try:
+        port = parts.port
+    except ValueError:  # unparseable port → not the gate
+        port = None
+    if (parts.scheme != "http"
+            or parts.hostname != "127.0.0.1"
+            or parts.username is not None
+            or parts.password is not None
+            or port != ROUTEGATE_LOOPBACK_PORT
+            or ".." in path
+            or not (normalised == "/v1"
+                    or normalised.startswith("/v1/"))):
         raise AgentError(
-            f"routegate_anthropic_url must be the loopback RouteGate, "
+            f"routegate_anthropic_url must be the loopback RouteGate "
+            f"(http://127.0.0.1:{ROUTEGATE_LOOPBACK_PORT}/v1/...), "
             f"got {url!r}"
         )
     return clean
@@ -231,12 +256,13 @@ class ClaudeAgent:
     # Public API
     # ------------------------------------------------------------------
 
-    def run(self, brief: str) -> tuple[dict[str, int], str]:
+    def run(self, brief: str) -> tuple[dict[str, int | float], str]:
         """Run the Neo brief through Claude Code CLI on the configured route.
 
         Returns (usage, verdict) where usage is normalised to
-        {input_tokens, output_tokens} plus cached_input/cost_usd ONLY when the
-        response carried them, and verdict is the extracted VERDICT: line value.
+        {input_tokens: int, output_tokens: int} plus cached_input (int) and
+        cost_usd (float) ONLY when the response carried them — hence the
+        widened value type — and verdict is the extracted VERDICT: line value.
 
         Raises AgentError subclasses on failure — the caller should
         catch and return empty usage + empty verdict.
@@ -254,11 +280,14 @@ class ClaudeAgent:
 
     @classmethod
     def _for_route(cls, cfg: Config, route: Route, gh_token: str,
-                   base_url: str) -> ClaudeAgent:
+                   base_url: str,
+                   consumer: str | None = None) -> ClaudeAgent:
         """Create a ClaudeAgent for a specific route in the chain.
 
         `base_url` is the Anthropic-wire endpoint for this provider.
         The API key is read from the route's env var.
+        `consumer` is the run's wire consumer (install-qualified from the
+        owning job when known) so the header matches the stored row.
         """
         api_key = cfg.api_key_for(route.provider)
         return cls(
@@ -270,11 +299,12 @@ class ClaudeAgent:
             max_tokens=cfg.deepseek_max_tokens,
             timeout=cfg.deepseek_timeout,
             gh_token=gh_token,
-            consumer=cfg.zeus_consumer(),
+            consumer=consumer or cfg.zeus_consumer(),
         )
 
     def _for_roulegate(self, cfg: Config, gh_token: str,
-                       base_url: str) -> "ClaudeAgent":
+                       base_url: str,
+                       consumer: str | None = None) -> "ClaudeAgent":
         """ClaudeAgent pointed at RouteGate's Anthropic wire (brief steps 1+2).
 
         Fail-closed: only the loopback gate may receive a brief — a foreign
@@ -294,8 +324,25 @@ class ClaudeAgent:
             max_tokens=cfg.deepseek_max_tokens,
             timeout=cfg.deepseek_timeout,
             gh_token=gh_token,
-            consumer=self.consumer,
+            consumer=consumer or self.consumer,
         )
+
+    def _wire_consumer(self, usage_store, job_id: int | None) -> str:
+        """The consumer for THIS run's wire header.
+
+        Install-qualified from the owning job's payload when the store knows
+        it, so the consumer the gate meters (header) and the consumer in the
+        row can never disagree; falls back to the agent's own consumer when
+        the store or row has nothing.  A store without the method (test
+        doubles, older callers) keeps the agent's own consumer.
+        """
+        consumer = (self.consumer or "").strip() or DEFAULT_CONSUMER
+        if usage_store is None or job_id is None or "/" in consumer:
+            return consumer
+        getter = getattr(usage_store, "job_consumer", None)
+        if getter is None:
+            return consumer
+        return getter(job_id) or consumer
 
     @staticmethod
     def _record_attempt(usage_store, *, job_id: int | None, **kwargs) -> None:
@@ -328,7 +375,7 @@ class ClaudeAgent:
         usage_store=None,
         job_id: int | None = None,
         attempt_number: int = 1,
-    ) -> tuple[dict[str, int], str, int | None, Route | None]:
+    ) -> tuple[dict[str, int | float], str, int | None, Route | None]:
         """Walk the available route chain, trying each in order.
 
         RouteGate first (W1-06): when the gate serves this wire
@@ -358,14 +405,16 @@ class ClaudeAgent:
         route_idx/route are the winning route (None if all failed).
         """
         target = brief_target(brief)
+        consumer = self._wire_consumer(usage_store, job_id)
         rg_url = str(getattr(cfg, "routegate_anthropic_url", "") or "").strip()
         if rg_url:
             return self._run_roulegate(
                 brief, cfg, rg_url, gh_token, usage_store=usage_store,
-                job_id=job_id, attempt_number=attempt_number, target=target)
+                job_id=job_id, attempt_number=attempt_number, target=target,
+                consumer=consumer)
 
         start_time = time.monotonic()
-        attribution = self._attribution(target, self.consumer)
+        attribution = self._attribution(target, consumer)
 
         for idx, route in available_routes:
             # Skip routes Claude Code can't serve (no Anthropic-wire endpoint).
@@ -395,7 +444,8 @@ class ClaudeAgent:
                     **attribution)
                 continue
 
-            route_agent = self._for_route(cfg, route, gh_token, base_url)
+            route_agent = self._for_route(cfg, route, gh_token, base_url,
+                                          consumer=consumer)
 
             with tempfile.TemporaryDirectory(prefix="neo-work-") as work_dir:
                 with tempfile.TemporaryDirectory(prefix="neo-config-") as config_dir:
@@ -459,19 +509,22 @@ class ClaudeAgent:
         job_id: int | None,
         attempt_number: int,
         target: BriefTarget,
-    ) -> tuple[dict[str, int], str, int | None, Route | None]:
+        consumer: str,
+    ) -> tuple[dict[str, int | float], str, int | None, Route | None]:
         """One attempt through RouteGate, metered as its capability (`peak`).
 
         RouteGate owns failover ("same-model fallback is RouteGate's job"),
         so a fallthrough-class failure records the row and ends the run —
         the caller's normal retry is the next attempt.  Anything else fails
-        closed and raises.  Every row carries consumer reviews:zeus and the
+        closed and raises.  Every row carries the run's consumer — the same
+        value that went out on the wire header — and the
         PR / head SHA / builder round the brief drove at; cost is recorded
         only if the response carried one.
         """
-        route_agent = self._for_roulegate(cfg, gh_token, base_url)
+        route_agent = self._for_roulegate(cfg, gh_token, base_url,
+                                          consumer=consumer)
         attribution = {
-            **self._attribution(target, self.consumer),
+            **self._attribution(target, consumer),
             "route_name": cfg.routegate_model,
         }
         with tempfile.TemporaryDirectory(prefix="neo-work-") as work_dir:
@@ -566,7 +619,7 @@ class ClaudeAgent:
 
     def _run_in(
         self, brief: str, work_dir: str, config_dir: str,
-    ) -> tuple[dict[str, int], str]:
+    ) -> tuple[dict[str, int | float], str]:
         """Run inside pre-created temp directories."""
         env = self._build_env(config_dir)
         cmd = self._build_cmd(brief)
@@ -677,7 +730,7 @@ class ClaudeAgent:
 
     def _parse_output(
         self, proc: subprocess.CompletedProcess[str],
-    ) -> tuple[dict[str, int], str]:
+    ) -> tuple[dict[str, int | float], str]:
         """Parse the Claude Code CLI output.
 
         Claude Code --output-format json returns a single JSON result object

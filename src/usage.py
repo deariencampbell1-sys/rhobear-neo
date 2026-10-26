@@ -265,7 +265,9 @@ class UsageStore:
 
         Best effort only: usage recording must never fail because the jobs
         table (owned by src/jobs.py, created by its own schema) is absent or
-        the row is gone.  Anything unknown comes back as None.
+        the row is gone.  The caller's connection is autocommit (see
+        `_conn`), so a failed lookup cannot poison the INSERT that follows.
+        Anything unknown comes back as None.
         """
         if job_id is None:
             return None, None, None, None
@@ -287,6 +289,26 @@ class UsageStore:
                 str(sha) if sha else None,
                 int(rnd) if rnd is not None else None,
                 str(install_id) if install_id else None)
+
+    def job_consumer(self, job_id: int | None) -> str | None:
+        """`reviews:zeus/<install>` for this job's payload, else None.
+
+        Lets the WIRE header carry the same consumer the row will store
+        (Apollo r2): the agent resolves this before the call instead of
+        letting the row be upgraded after it.  Best effort — never raises.
+        """
+        if job_id is None:
+            return None
+        try:
+            with self._conn() as c:
+                _pr, _sha, _rnd, install_id = self._job_target(c, job_id)
+        except Exception:  # noqa: BLE001 — attribution must never raise
+            log.debug("job consumer lookup failed for job %s", job_id,
+                      exc_info=True)
+            return None
+        if not install_id:
+            return None
+        return f"{DEFAULT_CONSUMER}/{install_id}"
 
     def get_attempts(self, job_id: int) -> list[UsageAttempt]:
         """Get all recorded attempts for a job, ordered by route_idx."""

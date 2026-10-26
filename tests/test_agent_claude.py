@@ -1473,6 +1473,13 @@ def test_zeus_calls_go_through_roulegate(tmp_path: Any) -> None:
     )
     cfg.routegate_model = "peak"
 
+    # The guard demands RouteGate's loopback PORT; this test's fake gate
+    # binds an ephemeral one, so pin the constant to the bound port for the
+    # run (production keeps 8645 — see ROUTEGATE_LOOPBACK_PORT).
+    port_patch = patch("src.agent_claude.ROUTEGATE_LOOPBACK_PORT",
+                       server.server_address[1])
+    port_patch.start()
+
     try:
         # RouteGate first: the agent must NOT build a direct provider client.
         agent = ClaudeAgent.from_config(cfg, gh_token=GH_TOKEN)
@@ -1519,6 +1526,7 @@ def test_zeus_calls_go_through_roulegate(tmp_path: Any) -> None:
     finally:
         server.shutdown()
         server.server_close()
+        port_patch.stop()
 
 
 def test_from_config_without_gh_token(caplog: Any) -> None:
@@ -1623,7 +1631,7 @@ def test_roulegate_refuses_foreign_url() -> None:
         )
 
 
-def test_consumer_header_rejects_bad_install_id() -> None:
+def test_consumer_header_rejects_bad_install_id(tmp_path: Any) -> None:
     """[Apollo MEDIUM] The consumer embeds an install id that reaches a
     header env var: a value with newlines/CRLF must never get there."""
     cfg = Config()
@@ -1636,15 +1644,14 @@ def test_consumer_header_rejects_bad_install_id() -> None:
     bad = ClaudeAgent.from_config(
         cfg, gh_token=GH_TOKEN, install_id="123\r\nX-Injected: 1")
     assert bad.consumer == "reviews:zeus"
-    env = bad._build_env(str(tmp_env_dir := os.path.join(tempfile.gettempdir(),
-                                                          "neo-cfg-test")))
+    env = bad._build_env(str(tmp_path / "neo-config"))
     assert "\n" not in env["ANTHROPIC_CUSTOM_HEADERS"]
     assert "\r" not in env["ANTHROPIC_CUSTOM_HEADERS"]
 
     # A real install id still qualifies the consumer (L0's consumer shape).
     good = ClaudeAgent.from_config(cfg, gh_token=GH_TOKEN, install_id="987654321")
     assert good.consumer == "reviews:zeus/987654321"
-    assert good._build_env(str(tmp_env_dir))["X_RHOBEAR_CONSUMER"] == \
+    assert good._build_env(str(tmp_path / "neo-config"))["X_RHOBEAR_CONSUMER"] == \
         "reviews:zeus/987654321"
 
 
