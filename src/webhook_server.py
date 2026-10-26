@@ -74,7 +74,9 @@ class NeoDispatcher:
             sha = payload.get("sha") or ""
             if state == "pending":
                 return DispatchOutcome(204, f"status pending ({context})")
-            if not self._trusted(context):
+            # "architect/<lane>" is a lane architect accepting an exact head; it wakes the lane
+            # gate only and is never review evidence (neo_worker.run_lane_gate checks its author).
+            if not self._trusted(context) and not context.startswith("architect/"):
                 return DispatchOutcome(204, f"untrusted status context={context!r}")
             # A commit status carries no PR number — resolve via the head SHA.
             self.on_verdict({
