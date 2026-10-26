@@ -1953,6 +1953,7 @@ def test_missing_gh_token_is_recorded_on_the_attempt_row() -> None:
     child_env: dict[str, str] = {}
 
     def recording_run(cmd, **kw):
+        child_env.clear()          # each run's own env, no carry-over
         child_env.update(kw.get("env") or {})
         return fake_run(cmd, **kw)
 

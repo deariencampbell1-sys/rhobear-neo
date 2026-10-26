@@ -41,11 +41,14 @@ MAX_BUILDER_ROUNDS_DEFAULT = 2
 # values below pass validate().
 ROUTEGATE_PORT = 8645
 ROUTEGATE_BASE_URL = f"http://127.0.0.1:{ROUTEGATE_PORT}/v1"
-# The exact loopback Anthropic endpoint RouteGate serves (once L2 exposes it).
-# NOTE: this is the ALLOW-LIST value `routegate_anthropic_url` is checked
-# against — NOT the field's default (the field defaults to empty: the gate
-# stays off until L2 serves the wire and the owner flips the switch).
-ROUTEGATE_ANTHROPIC_URL = f"http://127.0.0.1:{ROUTEGATE_PORT}/v1/messages"
+# The loopback BASE for the Anthropic wire (once L2 exposes it):
+# ANTHROPIC_BASE_URL is a BASE and the Claude CLI appends /v1/messages
+# itself — exactly how this repo already points it at
+# deepseek_base_url = https://api.deepseek.com/anthropic.  This constant is
+# the ALLOW-LIST value `routegate_anthropic_url` is checked against — NOT the
+# field's default (the field defaults to empty: the gate stays off until L2
+# serves the wire and the owner flips the switch).
+ROUTEGATE_ANTHROPIC_URL = f"http://127.0.0.1:{ROUTEGATE_PORT}"
 # The RouteGate capability that serves peak-hours/cost-aware routing
 # (route-policy.yaml); also the route name recorded on gated attempts.
 ROUTEGATE_MODEL = "peak"

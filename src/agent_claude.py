@@ -27,15 +27,14 @@ from __future__ import annotations
 import json
 import logging
 import os
-import posixpath
 import re
 import subprocess
 import tempfile
 import threading
 import time
-from urllib.parse import urlsplit, unquote
+from urllib.parse import urlsplit
 
-from .config import Config, ROUTEGATE_PORT
+from .config import Config, ROUTEGATE_MODEL, ROUTEGATE_PORT
 from .usage import (
     DEFAULT_CONSUMER, BriefTarget, Route, UsageAttempt, brief_target,
     classify_error_text,
@@ -94,9 +93,22 @@ def _scrub_consumer(consumer: str | None) -> str:
     return value
 
 
+def _scrub_capability(name: str | None) -> str:
+    """Validate the RouteGate capability name AT THE SINK — it lands in the
+    child's argv (`--model`) and in the metered `route_name`, so a
+    post-validate mutation of `cfg.routegate_model` must not put e.g.
+    `--evil` into either.  Non-conforming → the real capability (`peak`)."""
+    value = (name or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,32}", value):
+        log.warning("routegate capability refused at the agent sink: %r — "
+                    "using %r", value, ROUTEGATE_MODEL)
+        return ROUTEGATE_MODEL
+    return value
+
+
 def _is_gate_url(url: str) -> bool:
-    """True when `url` is the loopback RouteGate Anthropic wire (parsed by
-    the same fail-closed guard that refuses foreign URLs)."""
+    """True when `url` is the loopback RouteGate base (parsed by the same
+    fail-closed guard that refuses foreign URLs)."""
     try:
         _require_loopback_roulegate(url)
     except AgentError:
@@ -107,21 +119,24 @@ def _is_gate_url(url: str) -> bool:
 def _require_loopback_roulegate(url: str) -> str:
     """Fail-closed: only the loopback RouteGate may receive a brief.
 
+    The value is a BASE (`http://127.0.0.1:8645`) — the Claude CLI appends
+    `/v1/messages` itself, exactly as it does for `deepseek_base_url`
+    (`https://api.deepseek.com/anthropic`).  The guard therefore requires
+    scheme http, host exactly 127.0.0.1, no userinfo, RouteGate's port, and
+    NO path at all: any path (including `..`, `%2e%2e`, or a doubled
+    `/v1/messages`) is refused, so the client always resolves
+    `base + /v1/messages` and nothing else.
+
     Parsed, not prefixed: a prefix check lets
     `http://127.0.0.1:8645@evil.example/...` (userinfo) or an arbitrary
-    loopback port through, so this requires scheme http, host exactly
-    127.0.0.1, no userinfo, RouteGate's port, and a DECODED path under /v1
-    with no `..` hop (percent-encoded dot segments like %2e%2e decode before
-    the check — urlsplit alone does not decode).  validate() whitelists the exact URLs, but a cfg can be
-    mutated after it — so both construction paths (from_config and
+    loopback port through.  validate() whitelists the exact base, but a cfg
+    can be mutated after it — so both construction paths (from_config and
     _for_roulegate) re-check here and refuse anything that would route a
     brief (and its repo context) off-box.  Returns the normalised URL.
     """
     clean = (url or "").strip().rstrip("/")
     parts = urlsplit(clean)
     path = parts.path or ""
-    decoded = unquote(path)          # %2e%2e is '..' after decoding
-    normalised = posixpath.normpath(decoded or "/")
     try:
         port = parts.port
     except ValueError:  # unparseable port → not the gate
@@ -131,13 +146,11 @@ def _require_loopback_roulegate(url: str) -> str:
             or parts.username is not None
             or parts.password is not None
             or port != ROUTEGATE_LOOPBACK_PORT
-            or ".." in decoded
-            or not (normalised == "/v1"
-                    or normalised.startswith("/v1/"))):
+            or path not in ("", "/")):
         raise AgentError(
-            f"routegate_anthropic_url must be the loopback RouteGate "
-            f"(http://127.0.0.1:{ROUTEGATE_LOOPBACK_PORT}/v1/...), "
-            f"got {url!r}"
+            f"routegate_anthropic_url must be the loopback RouteGate BASE "
+            f"(http://127.0.0.1:{ROUTEGATE_LOOPBACK_PORT} — the CLI "
+            f"appends /v1/messages), got {url!r}"
         )
     return clean
 
@@ -273,7 +286,7 @@ class ClaudeAgent:
             # mutated after startup must not carry a brief off-box.
             base_url = _require_loopback_roulegate(routegate_url)
             api_key = "routegate-loopback"
-            model = cfg.routegate_model
+            model = _scrub_capability(cfg.routegate_model)
         else:
             api_key = cfg.deepseek_key
             base_url = cfg.deepseek_base_url
@@ -357,7 +370,7 @@ class ClaudeAgent:
             claude_bin=cfg.claude_bin,
             api_key="routegate-loopback",
             base_url=url,
-            model=cfg.routegate_model,
+            model=_scrub_capability(cfg.routegate_model),
             effort=cfg.deepseek_reasoning_effort,
             max_tokens=cfg.deepseek_max_tokens,
             timeout=cfg.deepseek_timeout,
@@ -457,8 +470,9 @@ class ClaudeAgent:
         attribution = {
             **self._attribution(target, self.consumer),
             # A run without GitHub identity is visible in METERING, not just
-            # in a boot log (Apollo r4): every row says whether it had one.
-            "had_gh_token": bool(self.gh_token),
+            # in a boot log (Apollo r4): every row says whether the CHILD of
+            # THIS run carried one (the run's gh_token argument — r5).
+            "had_gh_token": bool(gh_token),
         }
 
         for idx, route in available_routes:
@@ -568,10 +582,16 @@ class ClaudeAgent:
         """
         route_agent = self._for_roulegate(cfg, gh_token, base_url,
                                           consumer=consumer)
+        # The capability is scrubbed once at the sink and used for argv,
+        # metering and the returned Route alike — one value everywhere.
+        capability = _scrub_capability(cfg.routegate_model)
         attribution = {
             **self._attribution(target, consumer),
-            "route_name": cfg.routegate_model,
-            "had_gh_token": bool(self.gh_token),
+            "route_name": capability,
+            # Truth for metering = the identity this run hands the CHILD (the
+            # gh_token argument the chain builds its agents from), never
+            # self.gh_token (Apollo r5: the divergent case must read False).
+            "had_gh_token": bool(gh_token),
         }
         # route_idx 0: the gate occupies the first chain slot.  The unique
         # key (job_id, attempt_number, route_idx) then provides idempotency:
@@ -590,11 +610,11 @@ class ClaudeAgent:
                         exc, route_agent,
                         proc=getattr(route_agent, '_last_proc', None))
                     log.info("routegate (%s) failed: %s (fallthrough=%s)",
-                             cfg.routegate_model, exc, fallthrough)
+                             capability, exc, fallthrough)
                     self._record_attempt(
                         usage_store, job_id=job_id,
                         attempt_number=attempt_number, route_idx=0,
-                        provider="routegate", model=cfg.routegate_model,
+                        provider="routegate", model=capability,
                         latency_ms=elapsed_ms,
                         outcome="fallthrough" if fallthrough else "error",
                         error_class=err_class, **attribution)
@@ -606,7 +626,7 @@ class ClaudeAgent:
                 self._record_attempt(
                     usage_store, job_id=job_id,
                     attempt_number=attempt_number, route_idx=0,
-                    provider="routegate", model=cfg.routegate_model,
+                    provider="routegate", model=capability,
                     uncached_input=usage.get("input_tokens"),
                     cached_input=usage.get("cached_input"),
                     output_tokens=usage.get("output_tokens"),
@@ -614,8 +634,8 @@ class ClaudeAgent:
                     cost_usd=usage.get("cost_usd"),
                     **attribution)
                 log.info("routegate (%s) succeeded — verdict=%s",
-                         cfg.routegate_model, verdict)
-                return usage, verdict, 0, Route("routegate", cfg.routegate_model)
+                         capability, verdict)
+                return usage, verdict, 0, Route("routegate", capability)
 
     def _classify_agent_error(
         self, exc: AgentError, agent: ClaudeAgent,
@@ -751,15 +771,14 @@ class ClaudeAgent:
         # GATED calls only (a third-party provider never receives it).
         # ANTHROPIC_CUSTOM_HEADERS is how Claude Code carries a custom header
         # on the wire; X_RHOBEAR_CONSUMER is this service's own auditable env
-        # form of the same value.  Neither is a secret.  An operator-supplied
-        # ANTHROPIC_CUSTOM_HEADERS (proxy auth, tracing) is EXTENDED, never
-        # replaced — ours appends as an extra line.
+        # form of the same value.  Neither is a secret.  The child env is a
+        # strict allowlist: an operator's own ANTHROPIC_CUSTOM_HEADERS is NOT
+        # re-admitted (credentials parked there must never ride our calls).
         if self.gated and self.consumer:
             env["X_RHOBEAR_CONSUMER"] = self.consumer
-            ours = f"X-RHOBEAR-Consumer: {self.consumer}"
-            existing = (os.environ.get("ANTHROPIC_CUSTOM_HEADERS") or "").strip()
             env["ANTHROPIC_CUSTOM_HEADERS"] = (
-                f"{existing}\n{ours}" if existing else ours)
+                f"X-RHOBEAR-Consumer: {self.consumer}"
+            )
         return env
 
     def _build_cmd(self, brief: str) -> list[str]:
