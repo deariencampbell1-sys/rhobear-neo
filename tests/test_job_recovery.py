@@ -518,6 +518,19 @@ class _ScriptedJobs:
         return True
 
 
+class TestScriptedJobsIsolation:
+    def test_two_scripted_jobs_instances_do_not_share_events(self):
+        """W1-13-r2 defect 7: script state is per-INSTANCE (the script passed
+        through the Jobs factory lambda), never on the class — two fakes never
+        see each other's events, so one test can never leak rows into the
+        next."""
+        a = _ScriptedJobs("dsn")
+        b = _ScriptedJobs("dsn")
+        assert a.create_wake("o/r", "a" * 40, True) == 1
+        assert [e[0] for e in a.events] == ["create_wake"]
+        assert b.events == []
+
+
 def _drive_wake_main(monkeypatch, events):
     """Run __main__.main() with fakes (no DB, no threads, no network) and
     return the REAL (on_verdict, _recovery_loop) closures it builds."""
