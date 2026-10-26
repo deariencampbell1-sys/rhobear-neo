@@ -21,6 +21,7 @@ must never outrank it.
 """
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import logging
 
@@ -58,6 +59,35 @@ def _check_run_completed(cr: dict) -> bool:
     return str(cr.get("status") or "") == "completed"
 
 
+def _run_id(cr: dict) -> int:
+    """Coerce a check run id defensively (W1-13-r2 defect 10): a malformed
+    id must SORT — it may never raise a ValueError on the evidence path."""
+    try:
+        return int(cr.get("id") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _completed_at(cr: dict) -> _dt.datetime:
+    """Parse completed_at to an aware datetime before comparing (defect 10):
+    mixed `Z` / `+00:00` strings sort wrongly as text.  Missing/unparseable
+    sorts oldest (deterministic; the id tie-break still applies)."""
+    raw = cr.get("completed_at")
+    if isinstance(raw, str) and raw.strip():
+        text = raw.strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = _dt.datetime.fromisoformat(text)
+        except ValueError:
+            parsed = None
+        if parsed is not None:
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=_dt.timezone.utc)
+            return parsed
+    return _dt.datetime.min.replace(tzinfo=_dt.timezone.utc)
+
+
 def _trusted_check_run(check_runs: list, app_id: str, sha: str) -> dict | None:
     """The ONE check run that authorizes `sha`.
 
@@ -76,8 +106,7 @@ def _trusted_check_run(check_runs: list, app_id: str, sha: str) -> dict | None:
             matches.append(cr)
     if not matches:
         return None
-    cr = max(matches, key=lambda r: (str(r.get("completed_at") or ""),
-                                     int(r.get("id") or 0)))
+    cr = max(matches, key=lambda r: (_completed_at(r), _run_id(r)))
     # The newest matching run decides; if IT is not acceptable evidence,
     # there is no evidence (never fall back to an older run).
     if not _check_run_completed(cr):
