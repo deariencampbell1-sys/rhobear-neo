@@ -1563,6 +1563,12 @@ class TestOwnerInstallIdFromConfig:
                        "credits_balance": 0})
         agent.assert_not_called()
         assert jobs.park.called, "customer install with no credits is parked"
+        # W1-13-r2 defect 8: the credit-gate park presents the SAME worker_token
+        # that claimed the row — drop that argument and park() silently
+        # returns False on the live lease and the job falls through to lease
+        # recovery (exactly the behaviour the audit table calls safe).
+        wtoken = jobs.claim.call_args.kwargs["worker_token"]
+        assert jobs.park.call_args.kwargs["worker_token"] == wtoken
 
         # the CONFIGURED owner with zero balance: never metered -> runs
         agent = drive({"install_id": "custom-owner", "plan": "pro",
