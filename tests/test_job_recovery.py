@@ -475,47 +475,74 @@ class TestDefect3AgentErrors:
 # Defect 4 — wakes persisted before the executor; nothing dropped
 # ---------------------------------------------------------------------------
 
+class _Script:
+    """Per-test script for _ScriptedJobs.  One fresh instance per test (the
+    `script` fixture below) and one per _ScriptedJobs instance — nothing here
+    is ever shared (W1-13-r2 defect 7)."""
+
+    def __init__(self, expired=None, orphaned=None, dedup=False):
+        self.events: list = []
+        self.expired: list = list(expired or [])
+        self.orphaned: list = list(orphaned or [])
+        self.dedup: bool = dedup
+
+
 class _ScriptedJobs:
     """Fake Jobs for driving __main__.main() and its _recovery_loop closure
-    without a DB.  Script `expired` / `orphaned` / `dedup` per scenario;
-    every call is appended to `events` in order."""
-    events: list = []
-    expired: list = []
-    orphaned: list = []
-    dedup: bool = False
+    without a DB.  Every instance runs on its OWN _Script — passed through the
+    Jobs factory lambda — and every call is appended to `script.events` in
+    order.  Two instances never see each other's events."""
 
-    def __init__(self, dsn):
-        pass
+    def __init__(self, dsn, script=None):
+        self.script = _Script() if script is None else script
+
+    @property
+    def events(self):
+        return self.script.events
 
     def ensure_schema(self):
         pass
 
     def reset_queued_submissions(self, kind):
-        self.events.append(("reset", kind))
+        self.script.events.append(("reset", kind))
 
     def create_wake(self, repo, sha, green, pr_number=None, payload=None):
-        self.events.append(("create_wake", repo, sha, pr_number))
-        if self.dedup:
+        self.script.events.append(("create_wake", repo, sha, pr_number))
+        if self.script.dedup:
             return None
-        return len([e for e in self.events if e[0] == "create_wake"])
+        return len([e for e in self.script.events if e[0] == "create_wake"])
 
     def mark_submitted(self, job_id):
-        self.events.append(("mark_submitted", job_id))
+        self.script.events.append(("mark_submitted", job_id))
 
     def clear_submitted(self, job_id):
-        self.events.append(("clear_submitted", job_id))
+        self.script.events.append(("clear_submitted", job_id))
 
     def recover_expired(self, kind):
-        self.events.append(("recover_expired", kind))
-        return [dict(r) for r in self.expired]
+        self.script.events.append(("recover_expired", kind))
+        return [dict(r) for r in self.script.expired]
 
     def stale_queued(self, kind, older_than_secs):
-        self.events.append(("stale_queued", kind, older_than_secs))
-        return [dict(r) for r in self.orphaned]
+        self.script.events.append(("stale_queued", kind, older_than_secs))
+        return [dict(r) for r in self.script.orphaned]
 
     def park(self, job_id, **kw):
-        self.events.append(("park", job_id, kw.get("reason")))
+        self.script.events.append(("park", job_id, kw.get("reason")))
         return True
+
+
+@pytest.fixture()
+def script():
+    """A fresh _Script per test with EVERY script attribute reset (W1-13-r2
+    defect 7): a failure anywhere between setup and teardown can never leak
+    rows into the next test — the old class-level lists were cleaned only in
+    `finally` blocks (and one test never cleared `orphaned` at all)."""
+    s = _Script()
+    yield s
+    s.events.clear()
+    s.expired.clear()
+    s.orphaned.clear()
+    s.dedup = False
 
 
 class TestScriptedJobsIsolation:
@@ -531,10 +558,12 @@ class TestScriptedJobsIsolation:
         assert b.events == []
 
 
-def _drive_wake_main(monkeypatch, events):
+def _drive_wake_main(monkeypatch, script):
     """Run __main__.main() with fakes (no DB, no threads, no network) and
-    return the REAL (on_verdict, _recovery_loop) closures it builds."""
-    import concurrent.futures
+    return the REAL (on_verdict, _recovery_loop) closures it builds.  The fake
+    Jobs is built from `script` through the Jobs factory lambda, so all its
+    state is the caller's own _Script instance."""
+    import types
     import src.__main__ as main_mod
 
     captured = {}
@@ -562,7 +591,7 @@ def _drive_wake_main(monkeypatch, events):
             pass
 
         def submit(self, fn, wake):
-            events.append(("submit", wake.get("job_id")))
+            script.events.append(("submit", wake.get("job_id")))
 
     class _FakeThread:
         def __init__(self, target=None, **kw):
@@ -571,64 +600,65 @@ def _drive_wake_main(monkeypatch, events):
         def start(self):
             pass
 
-    _ScriptedJobs.events = events
     monkeypatch.setattr("src.__main__._config.load", lambda: cfg)
     monkeypatch.setattr("src.__main__.github_app_for", lambda c: {"id": 1})
     monkeypatch.setattr("src.__main__.NeoState", _FakeState)
-    monkeypatch.setattr("src.__main__.Jobs", lambda dsn: _ScriptedJobs(dsn))
+    monkeypatch.setattr("src.__main__.Jobs", lambda dsn: _ScriptedJobs(dsn, script))
     monkeypatch.setattr("src.__main__.UsageStore", _FakeUsage)
     monkeypatch.setattr("src.__main__.run_neo", lambda *a, **kw: None)
     monkeypatch.setattr("src.__main__.serve", lambda *a, **kw: None)
     monkeypatch.setattr("src.__main__.NeoDispatcher",
                         lambda c, cb: captured.setdefault("on_verdict", cb))
-    monkeypatch.setattr(concurrent.futures, "ThreadPoolExecutor", _FakeExecutor)
-    monkeypatch.setattr("threading.Thread", _FakeThread)
+    # Module-local patches (W1-13-r2 defect 7): `src.__main__.threading` is
+    # that module's own alias and `concurrent` is patched as a NAME in
+    # src.__main__ — neither patch touches the global threading /
+    # concurrent.futures modules, so a thread any other fixture starts while
+    # this test runs is never hijacked.
+    monkeypatch.setattr("src.__main__.threading.Thread", _FakeThread)
+    monkeypatch.setattr(
+        "src.__main__.concurrent",
+        types.SimpleNamespace(
+            futures=types.SimpleNamespace(ThreadPoolExecutor=_FakeExecutor)))
     main_mod.main()
     return captured["on_verdict"], captured["recovery"]
 
 
 class TestDefect4DroppedWakes:
-    def test_on_verdict_persists_before_submit(self, monkeypatch):
+    def test_on_verdict_persists_before_submit(self, monkeypatch, script):
         """The wake is persisted as a durable job BEFORE the executor ever
         sees it — and no backpressure cap drops any of them (32/32 handed
         off, each exactly once)."""
-        events = []
-        on_verdict, _ = _drive_wake_main(monkeypatch, events)
+        on_verdict, _ = _drive_wake_main(monkeypatch, script)
         for i in range(32):
             on_verdict({"repo": "o/r", "sha": f"{i:040x}", "green": True,
                         "context": "test", "pr_number": 1})
-        assert [e[0] for e in events] == ["create_wake", "submit", "mark_submitted"] * 32
+        assert [e[0] for e in script.events] == \
+            ["create_wake", "submit", "mark_submitted"] * 32
 
-    def test_duplicate_wake_is_never_submitted(self, monkeypatch):
+    def test_duplicate_wake_is_never_submitted(self, monkeypatch, script):
         """A deduped wake (another job owns the SHA) is never handed off."""
-        events = []
-        _ScriptedJobs.dedup = True
-        try:
-            on_verdict, _ = _drive_wake_main(monkeypatch, events)
-            on_verdict({"repo": "o/r", "sha": "a" * 40, "green": True,
-                        "context": "test", "pr_number": 1})
-        finally:
-            _ScriptedJobs.dedup = False
-        assert [e[0] for e in events] == ["create_wake"]
+        script.dedup = True
+        on_verdict, _ = _drive_wake_main(monkeypatch, script)
+        on_verdict({"repo": "o/r", "sha": "a" * 40, "green": True,
+                    "context": "test", "pr_number": 1})
+        assert [e[0] for e in script.events] == ["create_wake"]
 
-    def test_status_wake_without_pr_creates_job(self, monkeypatch):
+    def test_status_wake_without_pr_creates_job(self, monkeypatch, script):
         """GLM 1: a `status` wake carries no pr_number — the durable job is
         created anyway (pr resolved later via the head SHA) and submitted."""
-        events = []
-        on_verdict, _ = _drive_wake_main(monkeypatch, events)
+        on_verdict, _ = _drive_wake_main(monkeypatch, script)
         on_verdict({"repo": "o/r", "sha": "a" * 40, "green": True,
                     "context": "test"})
-        assert ("create_wake", "o/r", "a" * 40, None) in events
-        assert ("submit", 1) in events and ("mark_submitted", 1) in events
+        assert ("create_wake", "o/r", "a" * 40, None) in script.events
+        assert ("submit", 1) in script.events
+        assert ("mark_submitted", 1) in script.events
 
-    def test_recovery_loop_resubmits_expired_and_orphaned(self, monkeypatch):
+    def test_recovery_loop_resubmits_expired_and_orphaned(self, monkeypatch, script):
         """GLM 4: one recovery pass parks ONLY the wake that is out of
         attempts and re-submits everything else exactly once (expired leases
         below the cap AND orphaned queued wakes)."""
         import src.__main__ as main_mod
-        events = []
-        _ScriptedJobs.events = events
-        _ScriptedJobs.expired = [
+        script.expired = [
             {"id": 1, "repo": "o/r", "head_sha": "a" * 40,
              "attempt": 2, "max_attempts": 2,
              "payload": {"repo": "o/r", "sha": "a" * 40}},
@@ -636,66 +666,60 @@ class TestDefect4DroppedWakes:
              "attempt": 1, "max_attempts": 3,
              "payload": {"repo": "o/r", "sha": "b" * 40}},
         ]
-        _ScriptedJobs.orphaned = [
+        script.orphaned = [
             {"id": 3, "repo": "o/r", "head_sha": "c" * 40,
              "payload": {"repo": "o/r", "sha": "c" * 40}},
         ]
-        try:
-            _, recovery = _drive_wake_main(monkeypatch, events)
-            sleeps = []
+        _, recovery = _drive_wake_main(monkeypatch, script)
+        sleeps = []
 
-            def fake_sleep(secs):
-                sleeps.append(secs)
-                if len(sleeps) >= 2:
-                    raise KeyboardInterrupt
+        def fake_sleep(secs):
+            sleeps.append(secs)
+            if len(sleeps) >= 2:
+                raise KeyboardInterrupt
 
-            monkeypatch.setattr("time.sleep", fake_sleep)
-            monkeypatch.setattr("src.escalation.recover_escalations",
-                                lambda *a, **kw: None)
-            with pytest.raises(KeyboardInterrupt):
-                recovery()
-        finally:
-            _ScriptedJobs.expired = []
-            _ScriptedJobs.orphaned = []
+        monkeypatch.setattr("time.sleep", fake_sleep)
+        monkeypatch.setattr("src.escalation.recover_escalations",
+                            lambda *a, **kw: None)
+        with pytest.raises(KeyboardInterrupt):
+            recovery()
         # out-of-attempts wake: parked once (by name), never re-submitted
-        assert [e for e in events if e[0] == "park"] == [
+        assert [e for e in script.events if e[0] == "park"] == [
             ("park", 1, "lease expired 2/2 times")]
         # below-cap expired wake + orphan: each submitted exactly once
-        assert [e for e in events if e[0] == "submit"] == [("submit", 2), ("submit", 3)]
-        assert ("mark_submitted", 2) in events and ("mark_submitted", 3) in events
-        assert ("reset", "wake") in events           # startup un-strand
-        assert ("recover_expired", "wake") in events
-        assert ("stale_queued", "wake", main_mod.RECOVERY_SECS) in events
+        assert [e for e in script.events if e[0] == "submit"] == \
+            [("submit", 2), ("submit", 3)]
+        assert ("mark_submitted", 2) in script.events
+        assert ("mark_submitted", 3) in script.events
+        assert ("reset", "wake") in script.events           # startup un-strand
+        assert ("recover_expired", "wake") in script.events
+        assert ("stale_queued", "wake", main_mod.RECOVERY_SECS) in script.events
         assert sleeps == [main_mod.RECOVERY_SECS, main_mod.RECOVERY_SECS]
 
-    def test_recovery_loop_does_not_park_a_recoverable_wake(self, monkeypatch):
+    def test_recovery_loop_does_not_park_a_recoverable_wake(self, monkeypatch, script):
         """A wake with attempts left is never parked — it is re-submitted
-        exactly once."""
-        events = []
-        _ScriptedJobs.events = events
-        _ScriptedJobs.expired = [
+        exactly once.  (r1 left `_ScriptedJobs.orphaned` populated after this
+        test; the per-test script fixture resets everything.)"""
+        script.expired = [
             {"id": 7, "repo": "o/r", "head_sha": "d" * 40,
              "attempt": 1, "max_attempts": 3,
              "payload": {"repo": "o/r", "sha": "d" * 40}},
         ]
-        try:
-            _, recovery = _drive_wake_main(monkeypatch, events)
-            sleeps = []
+        _, recovery = _drive_wake_main(monkeypatch, script)
+        sleeps = []
 
-            def fake_sleep(secs):
-                sleeps.append(secs)
-                if len(sleeps) >= 2:
-                    raise KeyboardInterrupt
+        def fake_sleep(secs):
+            sleeps.append(secs)
+            if len(sleeps) >= 2:
+                raise KeyboardInterrupt
 
-            monkeypatch.setattr("time.sleep", fake_sleep)
-            monkeypatch.setattr("src.escalation.recover_escalations",
-                                lambda *a, **kw: None)
-            with pytest.raises(KeyboardInterrupt):
-                recovery()
-        finally:
-            _ScriptedJobs.expired = []
-        assert not [e for e in events if e[0] == "park"]
-        assert [e for e in events if e[0] == "submit"] == [("submit", 7)]
+        monkeypatch.setattr("time.sleep", fake_sleep)
+        monkeypatch.setattr("src.escalation.recover_escalations",
+                            lambda *a, **kw: None)
+        with pytest.raises(KeyboardInterrupt):
+            recovery()
+        assert not [e for e in script.events if e[0] == "park"]
+        assert [e for e in script.events if e[0] == "submit"] == [("submit", 7)]
 
     def test_webhook_status_wake_has_no_pr(self):
         """The status webhook deliberately carries no pr_number; on_verdict
