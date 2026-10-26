@@ -1936,7 +1936,7 @@ def _merge_comment(evidence):
 
 def test_merge_comment_lists_both_greens_with_links_and_ci_summary():
     """The one merge comment (board `verdicts` 02): the two greens with links
-    and the CI summary, posted BEFORE the merge call."""
+    and the CI summary, posted AFTER the merge (W1-07-r2 defect 9)."""
     greens = _greens(enabled=("CodeAnt",),
                      statuses=[_status("CodeAnt"), _status("rhobear-reviews")],
                      reviews=[_review("APPROVED")],
@@ -1976,8 +1976,10 @@ def test_merge_rechecks_the_two_green_gate_immediately_before_the_merge():
     assert not [c for c in calls if c[:2] == ("pr", "comment")], calls
 
 
-def test_merge_posts_the_comment_then_merges():
-    """Two greens present: one comment is posted first, then the merge."""
+def test_merge_merges_then_posts_the_comment():
+    """Two greens present: the merge goes first, then the one comment is
+    posted (W1-07-r2 defect 9: posting the comment first left a stale
+    'Two greens on <sha>' comment on every refused merge)."""
     greens = _greens(enabled=("CodeAnt",),
                      statuses=[_status("CodeAnt"), _status("rhobear-reviews")],
                      reviews=[_review("APPROVED")])
@@ -2004,7 +2006,7 @@ def test_merge_posts_the_comment_then_merges():
     kinds = ["comment" if c[:2] == ("pr", "comment") else
              "merge" if ("PUT" in c and "-X" in c) else "other" for c in calls]
     assert "comment" in kinds and "merge" in kinds
-    assert kinds.index("comment") < kinds.index("merge"), kinds
+    assert kinds.index("merge") < kinds.index("comment"), kinds
 
 
 def test_newest_status_per_trusted_context_decides():

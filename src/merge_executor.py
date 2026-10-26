@@ -89,7 +89,8 @@ def two_green_gate(evidence: dict) -> tuple[bool, str]:
 def two_green_comment(evidence: dict) -> str:
     """The one merge comment (board `verdicts` 02): the two greens with links
     and the CI summary — "Two greens on a91d2e0 / 1: Apollo ACCEPT / 2: Zeus
-    ACCEPT / CI: 6 of 6 checks passed" — posted before the merge."""
+    ACCEPT / CI: 6 of 6 checks passed" — posted right AFTER a successful
+    merge (W1-07-r2 defect 9)."""
     head = str(evidence.get("head_sha") or evidence.get("decided_sha") or "")
 
     def _line(n: int, label: str, url: str, at: str) -> str:
@@ -206,8 +207,10 @@ def merge(
 
     # W1-07-r1 steps 3/5: the two-green merge rule runs AGAIN immediately
     # before the merge API call (a new push since the wake resets both greens
-    # and is denied here), and the one merge comment (the two greens with
-    # links + the CI summary) is posted first — then the merge.  A bundle
+    # and is denied here).  The one merge comment (the two greens with links +
+    # the CI summary) is posted AFTER a successful merge (W1-07-r2 defect 9:
+    # posting it first left a stale "Two greens on <sha>" comment on every
+    # refused or moved-head merge, and a retry posted a duplicate).  A bundle
     # without the rule's fields is the legacy {"ok", shas} mechanics shape
     # contract-pinned in tests/test_merge_authority: nothing to consult here,
     # so the W1-13 belt above applies unchanged.
@@ -215,10 +218,6 @@ def merge(
         ok, why = two_green_gate(evidence)
         if not ok:
             raise MergeDenied(f"merge authority denied: {why}")
-        rc, out = _gh(token, "pr", "comment", str(pr), "-R", repo,
-                      "--body", two_green_comment(evidence), timeout=30)
-        if rc != 0:
-            raise MergeFailed(f"merge comment refused by GitHub: {out[:200]}")
 
     # --- Step 4: Execute the merge -----------------------------------------
     # REST merge API with sha=expected_sha: GitHub rejects with 422 if the
@@ -254,6 +253,17 @@ def merge(
         raise MergeFailed(f"GitHub returned no merge confirmation: {out[:200]}")
 
     log.info("merged %s#%s at %s", repo, pr, expected_sha[:12])
+
+    # --- the one merge comment, post-merge (defect 9) ---------------------
+    # Only now, so a refused or moved-head merge leaves no stale comment.
+    # The merge is already confirmed: a refused comment is logged, never a
+    # failed merge.
+    if all(k in evidence for k in _RULE_FIELDS):
+        rc, out = _gh(token, "pr", "comment", str(pr), "-R", repo,
+                      "--body", two_green_comment(evidence), timeout=30)
+        if rc != 0:
+            log.warning("merge comment refused by GitHub after the merge: %s",
+                        out[:200])
 
     # --- Step 5: delete the head branch -----------------------------------
     # The REST merge API never deletes the branch; gh's --delete-branch did it
