@@ -36,6 +36,13 @@ class FakeCursor:
         self.calls.append((sql, params))
 
     def fetchall(self):
+        # The real SQL filters by install_id; a faithful fake does too, so a
+        # query under the wrong id finds no rows (defect 6's test depends on
+        # this being discriminating).
+        if self.calls:
+            sql, params = self.calls[-1]
+            if params and len(params) == 1 and sql.strip().upper().startswith("SELECT"):
+                return [r for r in self.rows if r and r[0] == params[0]]
         return list(self.rows)
 
 
@@ -182,6 +189,70 @@ def test_disabled_source_is_not_in_the_enabled_set():
     from src import trusted_reviewers as tr
     with recording_db(rows=[(OWNER, "*", "CodeAnt", False, "")]):
         assert tr.enabled_sources("dsn", OWNER, "deariencampbell1-sys/rhobear-neo") == ()
+
+
+# ---------------------------------------------------------------------------
+# Defect 6 (MEDIUM): _enabled_reviewers must query under the repo's REAL
+# GitHub App installation id — never the org login, which silently disabled
+# the feature for every customer whose install_id differs from the login.
+# ---------------------------------------------------------------------------
+
+class _FakeApp:
+    def __init__(self, install_id=None, error=None):
+        self._install_id = install_id
+        self._error = error
+        self.repos: list[str] = []
+
+    def installation_for_repo(self, repo):
+        self.repos.append(repo)
+        if self._error is not None:
+            raise self._error
+        return self._install_id
+
+
+def _state():
+    from types import SimpleNamespace
+    return SimpleNamespace(dsn="dsn")
+
+
+def test_enabled_reviewers_resolves_the_real_installation_id(monkeypatch):
+    """A row written under install id 12345 is found when the resolver returns
+    12345 — the query is keyed on the installation id, not the org login."""
+    from src import neo_worker
+    from src.config import Config
+    from src import github_app
+    app = _FakeApp(install_id=12345)
+    monkeypatch.setattr(github_app, "github_app_for", lambda cfg: app)
+    with recording_db(rows=[("12345", "*", "Greptile", True, "")]) as conn:
+        got = neo_worker._enabled_reviewers(Config(), _state(), "acme/checkout")
+        selects = [p for sql, p in conn.cur.calls
+                   if sql.strip().upper().startswith("SELECT") and p]
+    assert got == ("Greptile",), got
+    assert app.repos == ["acme/checkout"], app.repos
+    assert ("12345",) in selects, selects
+
+
+def test_enabled_reviewers_fail_closed_when_the_installation_cannot_resolve(
+        monkeypatch, caplog):
+    """A resolver failure logs a WARNING naming the repo and returns no
+    sources (fail closed) — a customer's trusted reviewers must never
+    silently count, and must never silently NOT count either."""
+    import logging
+    from src import neo_worker
+    from src.config import Config
+    from src import github_app
+    errors = (github_app.NoInstallation("repo acme/checkout has no installation"),
+              github_app.GitHubAppError("lookup failed"))
+    for error in errors:
+        app = _FakeApp(error=error)
+        monkeypatch.setattr(github_app, "github_app_for", lambda cfg, _app=app: _app)
+        with recording_db(rows=[("12345", "*", "Greptile", True, "")]):
+            with caplog.at_level(logging.WARNING, logger="rhobear_neo.worker"):
+                got = neo_worker._enabled_reviewers(Config(), _state(), "acme/checkout")
+        assert got == (), got
+        warned = [r for r in caplog.records if r.levelno >= logging.WARNING
+                  and "acme/checkout" in r.getMessage()]
+        assert warned, [r.getMessage() for r in caplog.records]
 
 
 # ---------------------------------------------------------------------------
