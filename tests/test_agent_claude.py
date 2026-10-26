@@ -1353,6 +1353,7 @@ class TestAnchoredFallthroughClassification:
         assert got[0] is False and got[1] != "5xx"
 
 
+
 # ===================================================================
 # W1-06 — RouteGate wiring, optional gh_token, config defaults
 # ===================================================================
@@ -1385,174 +1386,206 @@ def _zeus_brief() -> str:
     )
 
 
-class TestRouteGateWiring:
+def test_zeus_calls_go_through_roulegate(tmp_path: Any) -> None:
     """Zeus's model calls resolve through RouteGate — never a direct provider
-    client built on the agent's own initiative."""
+    client built on the agent's own initiative.
 
-    def test_zeus_calls_go_through_roulegate(self, tmp_path: Any) -> None:
-        """from_config points the CLI at RouteGate's Anthropic wire (the
-        step-2 conditional) with the consumer header, the attempt is executed
-        against a live loopback RouteGate, and the row lands metered with the
-        consumer, PR, head SHA, builder round, tokens and the cost the
-        response actually carried."""
-        import threading
-        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from_config points the CLI at RouteGate's Anthropic wire (brief step 2's
+    conditional endpoint) with the consumer header, the attempt executes
+    against a live loopback RouteGate, and the row lands metered with the
+    consumer, PR, head SHA, builder round, tokens in/out/cached and only the
+    cost the response actually carried.
+    """
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-        captured: dict[str, Any] = {}
+    captured: dict[str, Any] = {}
 
-        class RouteGateHandler(BaseHTTPRequestHandler):
-            def do_POST(self) -> None:  # noqa: N802
-                length = int(self.headers.get("Content-Length") or 0)
-                self.rfile.read(length)
-                captured["path"] = self.path
-                captured["consumer"] = self.headers.get("X-RHOBEAR-Consumer")
-                body = json.dumps({
-                    "id": "msg_1", "type": "message", "role": "assistant",
-                    "model": "peak",
-                    "content": [{"type": "text", "text": "ok"}],
-                    "usage": {"input_tokens": 7, "output_tokens": 3,
-                              "estimated_cost": 0.0042},
-                }).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+    class RouteGateHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802
+            length = int(self.headers.get("Content-Length") or 0)
+            self.rfile.read(length)
+            captured["path"] = self.path
+            captured["consumer"] = self.headers.get("X-RHOBEAR-Consumer")
+            body = json.dumps({
+                "id": "msg_1", "type": "message", "role": "assistant",
+                "model": "peak",
+                "content": [{"type": "text", "text": "ok"}],
+                "usage": {"input_tokens": 7, "output_tokens": 3,
+                          "estimated_cost": 0.0042},
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
-            def log_message(self, *args: Any) -> None:
-                pass
+        def log_message(self, *args: Any) -> None:
+            pass
 
-        server = ThreadingHTTPServer(("127.0.0.1", 0), RouteGateHandler)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), RouteGateHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
 
-        # Fake Claude CLI: talks to whatever base URL the agent configured,
-        # carrying the consumer header the way Claude Code carries
-        # ANTHROPIC_CUSTOM_HEADERS, then emits a normal result envelope
-        # (with the cost RouteGate reported — nothing invented).
-        script = (
-            "import json, os, sys, urllib.request\n"
-            "base = os.environ['ANTHROPIC_BASE_URL']\n"
-            "headers = {'Content-Type': 'application/json'}\n"
-            "custom = os.environ.get('ANTHROPIC_CUSTOM_HEADERS', '')\n"
-            "if ':' in custom:\n"
-            "    name, value = custom.split(':', 1)\n"
-            "    headers[name.strip()] = value.strip()\n"
-            "if os.environ.get('X_RHOBEAR_CONSUMER'):\n"
-            "    headers['X-RHOBEAR-Consumer'] = os.environ['X_RHOBEAR_CONSUMER']\n"
-            "req = urllib.request.Request(base, data=b'{}', headers=headers)\n"
-            "try:\n"
-            "    urllib.request.urlopen(req, timeout=5).read()\n"
-            "except Exception as exc:\n"
-            "    print('route gate probe failed: %s' % exc, file=sys.stderr)\n"
-            "    sys.exit(3)\n"
-            "print(json.dumps({\n"
-            "    'type': 'result', 'subtype': 'success', 'is_error': False,\n"
-            "    'result': 'VERDICT: ACCEPT-READY',\n"
-            "    'usage': {'input_tokens': 11, 'output_tokens': 5,\n"
-            "              'cache_read_input_tokens': 4,\n"
-            "              'estimated_cost': 0.0042},\n"
-            "    'num_turns': 1, 'stop_reason': 'end_turn',\n"
-            "    'permission_denials': [],\n"
-            "}))\n"
-            "sys.exit(0)\n"
+    # Fake Claude CLI: talks to whatever base URL the agent configured,
+    # carrying the consumer header the way Claude Code carries
+    # ANTHROPIC_CUSTOM_HEADERS, then emits a normal result envelope (with the
+    # cost RouteGate reported — nothing invented).
+    script = (
+        "import json, os, sys, urllib.request\n"
+        "base = os.environ['ANTHROPIC_BASE_URL']\n"
+        "headers = {'Content-Type': 'application/json'}\n"
+        "custom = os.environ.get('ANTHROPIC_CUSTOM_HEADERS', '')\n"
+        "if ':' in custom:\n"
+        "    name, value = custom.split(':', 1)\n"
+        "    headers[name.strip()] = value.strip()\n"
+        "if os.environ.get('X_RHOBEAR_CONSUMER'):\n"
+        "    headers['X-RHOBEAR-Consumer'] = os.environ['X_RHOBEAR_CONSUMER']\n"
+        "req = urllib.request.Request(base, data=b'{}', headers=headers)\n"
+        "try:\n"
+        "    urllib.request.urlopen(req, timeout=5).read()\n"
+        "except Exception as exc:\n"
+        "    print('route gate probe failed: %s' % exc, file=sys.stderr)\n"
+        "    sys.exit(3)\n"
+        "print(json.dumps({\n"
+        "    'type': 'result', 'subtype': 'success', 'is_error': False,\n"
+        "    'result': 'VERDICT: ACCEPT-READY',\n"
+        "    'usage': {'input_tokens': 11, 'output_tokens': 5,\n"
+        "              'cache_read_input_tokens': 4,\n"
+        "              'estimated_cost': 0.0042},\n"
+        "    'num_turns': 1, 'stop_reason': 'end_turn',\n"
+        "    'permission_denials': [],\n"
+        "}))\n"
+        "sys.exit(0)\n"
+    )
+    script_path = tmp_path / "claude-fake"
+    script_path.write_text("#!" + sys.executable + "\n" + script)
+    script_path.chmod(0o755)
+
+    cfg = Config()
+    cfg.claude_bin = str(script_path)
+    cfg.deepseek_base_url = BASE
+    cfg.deepseek_model = MODEL
+    cfg.deepseek_reasoning_effort = "max"
+    cfg.deepseek_max_tokens = 32000
+    cfg.deepseek_timeout = 60
+    cfg.routegate_anthropic_url = (
+        "http://127.0.0.1:%d/v1/messages" % server.server_address[1]
+    )
+    cfg.routegate_model = "peak"
+
+    try:
+        # RouteGate first: the agent must NOT build a direct provider client.
+        agent = ClaudeAgent.from_config(cfg, gh_token=GH_TOKEN)
+        assert agent.base_url.rstrip("/") == cfg.routegate_anthropic_url
+        env = agent._build_env(str(tmp_path / "neo-config"))
+        assert env["ANTHROPIC_BASE_URL"] == cfg.routegate_anthropic_url
+        # The consumer header travels with the call.
+        assert env["ANTHROPIC_CUSTOM_HEADERS"].startswith(
+            "X-RHOBEAR-Consumer: reviews:zeus"
         )
-        script_path = tmp_path / "claude-fake"
-        script_path.write_text("#!" + sys.executable + "\n" + script)
-        script_path.chmod(0o755)
+        assert env["X_RHOBEAR_CONSUMER"] == env["ANTHROPIC_CUSTOM_HEADERS"].split(
+            "X-RHOBEAR-Consumer: ", 1
+        )[1]
 
-        cfg = Config()
-        cfg.claude_bin = str(script_path)
-        cfg.deepseek_base_url = BASE
-        cfg.deepseek_model = MODEL
-        cfg.deepseek_reasoning_effort = "max"
-        cfg.deepseek_max_tokens = 32000
-        cfg.deepseek_timeout = 60
-        cfg.routegate_anthropic_url = (
-            "http://127.0.0.1:%d/v1/messages" % server.server_address[1]
+        store = _FakeUsageStore()
+        usage, verdict, ridx, route = agent.run_with_chain(
+            _zeus_brief(), [], cfg, GH_TOKEN,
+            usage_store=store, job_id=11,
         )
-        cfg.routegate_model = "peak"
 
-        try:
-            # RouteGate first: the agent must NOT build a direct provider client.
-            agent = ClaudeAgent.from_config(cfg, gh_token=GH_TOKEN)
-            assert agent.base_url.rstrip("/") == cfg.routegate_anthropic_url
-            env = agent._build_env(str(tmp_path / "neo-config"))
-            assert env["ANTHROPIC_BASE_URL"] == cfg.routegate_anthropic_url
-            # The consumer header travels with the call.
-            assert env["ANTHROPIC_CUSTOM_HEADERS"].startswith(
-                "X-RHOBEAR-Consumer: reviews:zeus"
-            )
-            assert env["X_RHOBEAR_CONSUMER"] == env["ANTHROPIC_CUSTOM_HEADERS"].split(
-                "X-RHOBEAR-Consumer: ", 1
-            )[1]
+        # The call actually reached RouteGate, with the header.
+        assert captured.get("path", "").endswith("/v1/messages")
+        assert captured.get("consumer", "").startswith("reviews:zeus")
+        assert captured["consumer"] == env["X_RHOBEAR_CONSUMER"]
 
-            store = _FakeUsageStore()
-            usage, verdict, ridx, route = agent.run_with_chain(
-                _zeus_brief(), [], cfg, GH_TOKEN,
-                usage_store=store, job_id=11,
-            )
+        assert verdict == "ACCEPT-READY"
+        assert usage["input_tokens"] == 11
+        assert route is not None and route.provider == "routegate"
 
-            # The call actually reached RouteGate, with the header.
-            assert captured.get("path", "").endswith("/v1/messages")
-            assert captured.get("consumer", "").startswith("reviews:zeus")
-            assert captured["consumer"] == env["X_RHOBEAR_CONSUMER"]
+        # The attempt is metered: consumer, PR, head SHA, builder round,
+        # tokens in/out/cached, and only the cost the response carried.
+        assert len(store.rows) == 1
+        row = store.rows[0]
+        assert row.outcome == "success"
+        assert row.route_name == "peak"
+        assert row.consumer == captured["consumer"]
+        assert row.pr_number == 44
+        assert row.head_sha == "ab" * 20
+        assert row.builder_round == 1
+        assert row.uncached_input == 11
+        assert row.output_tokens == 5
+        assert row.cached_input == 4
+        assert row.cost_usd == 0.0042
+    finally:
+        server.shutdown()
+        server.server_close()
 
-            assert verdict == "ACCEPT-READY"
-            assert usage["input_tokens"] == 11
-            assert route is not None and route.provider == "routegate"
 
-            # The attempt is metered: consumer, PR, head SHA, builder round,
-            # tokens in/out/cached, and only the cost the response carried.
-            assert len(store.rows) == 1
-            row = store.rows[0]
-            assert row.outcome == "success"
-            assert row.route_name == "peak"
-            assert row.consumer == captured["consumer"]
-            assert row.pr_number == 44
-            assert row.head_sha == "ab" * 20
-            assert row.builder_round == 1
-            assert row.uncached_input == 11
-            assert row.output_tokens == 5
-            assert row.cached_input == 4
-            assert row.cost_usd == 0.0042
-        finally:
-            server.shutdown()
-            server.server_close()
+def test_from_config_without_gh_token(caplog: Any) -> None:
+    """from_config() must construct WITHOUT a gh_token keyword, warn once per
+    process, and never raise (edge 5: a caller that does pass a token still
+    gets it — see test_from_config above)."""
+    import logging as _logging
 
-    def test_from_config_without_gh_token(self, caplog: Any) -> None:
-        """from_config() must construct WITHOUT a gh_token keyword, warn once
-        per process, and never raise."""
-        import logging as _logging
+    import src.agent_claude as agent_mod
 
-        import src.agent_claude as agent_mod
+    cfg = Config()
+    cfg.deepseek_base_url = BASE
+    cfg.deepseek_model = MODEL
+    cfg.deepseek_reasoning_effort = "max"
+    cfg.deepseek_max_tokens = 32000
+    cfg.deepseek_timeout = 1800
+    cfg.claude_bin = CLAUDE_BIN
 
-        cfg = Config()
-        cfg.deepseek_base_url = BASE
-        cfg.deepseek_model = MODEL
-        cfg.deepseek_reasoning_effort = "max"
-        cfg.deepseek_max_tokens = 32000
-        cfg.deepseek_timeout = 1800
-        cfg.claude_bin = CLAUDE_BIN
+    with patch.object(agent_mod, "_GH_TOKEN_WARNED", False):
+        with caplog.at_level(_logging.WARNING):
+            agent = ClaudeAgent.from_config(cfg)
+            ClaudeAgent.from_config(cfg)  # second call must not re-warn
 
-        with patch.object(agent_mod, "_GH_TOKEN_WARNED", False):
-            with caplog.at_level(_logging.WARNING):
-                agent = ClaudeAgent.from_config(cfg)
-                ClaudeAgent.from_config(cfg)  # second call must not re-warn
+    assert agent is not None
+    assert agent.gh_token == ""
+    warnings = [r.getMessage() for r in caplog.records
+                if "GH_TOKEN" in r.getMessage()]
+    assert len(warnings) == 1, warnings
 
-        assert agent is not None
-        assert agent.gh_token == ""
-        warnings = [r.getMessage() for r in caplog.records
-                    if "GH_TOKEN" in r.getMessage()]
-        assert len(warnings) == 1, warnings
 
-    def test_neo_max_builder_rounds_default_is_2(self) -> None:
-        """The SOURCE default for NEO_MAX_BUILDER_ROUNDS is 2 (the owner's
-        rule). The runtime clamp to bounces_before_escalation is a separate,
-        later safety net — the env reader itself must default to 2."""
-        import inspect
+def test_neo_max_builder_rounds_default_is_2() -> None:
+    """The SOURCE default for NEO_MAX_BUILDER_ROUNDS is 2 (the owner's rule).
+    The runtime clamp to bounces_before_escalation is a separate, later safety
+    net — the env reader itself must default to 2."""
+    import inspect
+    import re
 
-        import src.config as config_mod
+    import src.config as config_mod
 
-        assert config_mod.MAX_BUILDER_ROUNDS_DEFAULT == 2
-        source = inspect.getsource(config_mod)
-        assert '_get_int("NEO_MAX_BUILDER_ROUNDS", MAX_BUILDER_ROUNDS_DEFAULT)' in source
+    assert config_mod.MAX_BUILDER_ROUNDS_DEFAULT == 2
+    source = inspect.getsource(config_mod)
+    assert re.search(
+        r'_get_int\(\s*"NEO_MAX_BUILDER_ROUNDS",\s*'
+        r'MAX_BUILDER_ROUNDS_DEFAULT\s*\)',
+        source,
+    ), "the env reader must fall back to MAX_BUILDER_ROUNDS_DEFAULT (2)"
+
+
+def test_validate_rejects_foreign_routegate_url() -> None:
+    """Fail-closed: only the loopback RouteGate may hold Zeus's briefs — a
+    foreign routegate_base_url / routegate_anthropic_url is refused at
+    startup, same discipline as deepseek_base_url."""
+    cfg = Config()
+    cfg.deepseek_base_url = BASE
+    cfg.deepseek_model = MODEL
+    cfg.deepseek_reasoning_effort = "max"
+    cfg.deepseek_max_tokens = 32000
+    cfg.claude_bin = sys.executable  # hermetic: no production binary needed
+
+    cfg.validate()  # loopback defaults are valid
+
+    foreign = Config()
+    foreign.routegate_base_url = "https://elsewhere.example/v1"
+    with pytest.raises(ValueError, match="routegate_base_url"):
+        foreign.validate()
+
+    offbox = Config()
+    offbox.routegate_anthropic_url = "https://elsewhere.example/v1/messages"
+    with pytest.raises(ValueError, match="routegate_anthropic_url"):
+        offbox.validate()

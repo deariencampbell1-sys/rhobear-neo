@@ -923,6 +923,11 @@ def test_fallthrough_classification_not_substring():
     assert classify_error_text("status: 400 bad request") == (False, "400")
     assert classify_error_text("read 400 bytes then 150 files") != (False, "400")
 
+    # Edge 3: a log line containing the word "error" in a normal message is
+    # not a status at all — no anchor, no fallthrough.
+    fall, _cls = classify_error_text("retrying after error, all tools available")
+    assert fall is False
+
 
 def test_stream_close_is_fallthrough():
     """Edge 2: a stream that closes before any output is a fallthrough —
@@ -949,3 +954,41 @@ def test_stream_close_is_fallthrough():
     fall2, cls2 = agent._classify_agent_error(
         MissingResult("no result text from claude"), agent, proc=ran)
     assert fall2 is False
+
+
+@requires_pg
+def test_attempt_consumer_carries_install_id(store):
+    """L0's consumer shape: a row for a job that knows its GitHub App
+    installation is written `reviews:zeus/<install_id>`; a job payload without
+    one keeps the bare lane default — never an invented id."""
+    from src.jobs import Jobs
+
+    Jobs(DSN).ensure_schema()
+    with psycopg.connect(DSN, autocommit=True) as c:
+        job_id = c.execute(
+            "INSERT INTO neo_jobs(kind, repo, head_sha, payload) "
+            "VALUES ('wake', 'acme/widget', %s, %s) RETURNING id",
+            ("ee" * 40, json.dumps({"installation_id": "987654321"})),
+        ).fetchone()[0]
+        bare_job_id = c.execute(
+            "INSERT INTO neo_jobs(kind, repo, head_sha, payload) "
+            "VALUES ('wake', 'acme/other', %s, '{}') RETURNING id",
+            ("ef" * 40,),
+        ).fetchone()[0]
+
+    store.record_attempt(UsageAttempt(
+        job_id=job_id, attempt_number=1, route_idx=0,
+        provider="deepseek", model="deepseek-v4-flash",
+        uncached_input=10, output_tokens=5, outcome="success",
+    ))
+    store.record_attempt(UsageAttempt(
+        job_id=bare_job_id, attempt_number=1, route_idx=0,
+        provider="deepseek", model="deepseek-v4-flash",
+        outcome="success", consumer="reviews:zeus/42",
+    ))
+
+    with_install, bare = store.get_attempts(job_id)[0], \
+        store.get_attempts(bare_job_id)[0]
+    assert with_install.consumer == "reviews:zeus/987654321"
+    # An already-qualified consumer is explicit — never rewritten.
+    assert bare.consumer == "reviews:zeus/42"

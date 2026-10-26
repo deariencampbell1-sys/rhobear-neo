@@ -21,6 +21,30 @@ from dataclasses import dataclass, field
 
 log = logging.getLogger("rhobear_neo.config")
 
+# ── Owner constants (the env defaults they govern) ───────────────────────────
+# Q14: the owner's rule is TWO builder rounds.  This is the value the env
+# reader falls back to when NEO_MAX_BUILDER_ROUNDS is unset/non-integer;
+# _clamp_rounds() may still raise a *smaller* value up to
+# bounces_before_escalation at construction — a later, separate safety net
+# for escalation reachability (not a different default).
+MAX_BUILDER_ROUNDS_DEFAULT = 2
+
+# ── RouteGate (L2-platform, loopback) ────────────────────────────────────────
+# Zeus's model calls are metered at the gate, one consumer header per lane:
+#   X-RHOBEAR-Consumer: reviews:zeus/<install_id>
+# The loopback root speaks the OpenAI shape (/v1/chat/completions,
+# /v1/rerank); RouteGate does NOT expose an Anthropic Messages endpoint today
+# (no /v1/messages in routegate.py, none documented in L2 CONTRACT.md), so
+# NEO_ROUTEGATE_ANTHROPIC_URL stays EMPTY until L2 serves the wire — empty
+# keeps Zeus's Claude-CLI triage on DeepSeek's Anthropic endpoint exactly as
+# brief step 2's "if not" branch requires.  Fail-closed: only the loopback
+# values below pass validate().
+ROUTEGATE_BASE_URL = "http://127.0.0.1:8645/v1"
+ROUTEGATE_ANTHROPIC_URL = "http://127.0.0.1:8645/v1/messages"
+# The RouteGate capability that serves peak-hours/cost-aware routing
+# (route-policy.yaml); also the route name recorded on gated attempts.
+ROUTEGATE_MODEL = "peak"
+
 
 def _get(name: str, default: str = "") -> str:
     return (os.environ.get(name) or default).strip()
@@ -100,6 +124,24 @@ class Config:
     deepseek_timeout: int = field(default_factory=lambda: _get_int(
         "NEO_TIMEOUT", 1800))
 
+    # --- RouteGate: Zeus's metered gate (L2-platform) ------------------------
+    # OpenAI-shape root of the gate (its /v1/chat/completions ingress).  There
+    # is no OpenAI-shape call inside the files this lane owns today — Zeus's
+    # triage runs the Claude Code CLI on the Anthropic wire — so this is the
+    # documented step-1 default, validated fail-closed to the loopback gate.
+    routegate_base_url: str = field(default_factory=lambda: _get(
+        "NEO_ROUTEGATE_BASE_URL", ROUTEGATE_BASE_URL))
+    # Anthropic-wire endpoint of the gate.  Empty = gate not serving this wire
+    # yet (the current state): the CLI keeps DeepSeek's Anthropic endpoint.
+    # Set to http://127.0.0.1:8645/v1/messages the moment L2 exposes it, and
+    # every triage attempt runs through RouteGate with consumer reviews:zeus
+    # (RouteGate then owns failover — no provider fallback outside the gate).
+    routegate_anthropic_url: str = field(default_factory=lambda: _get(
+        "NEO_ROUTEGATE_ANTHROPIC_URL", ""))
+    # RouteGate capability name — also the route name metered on gated attempts.
+    routegate_model: str = field(default_factory=lambda: _get(
+        "NEO_ROUTEGATE_MODEL", ROUTEGATE_MODEL))
+
     # --- claude binary path (on the VPS: /usr/bin/claude) ---
     claude_bin: str = field(default_factory=lambda: _get("NEO_CLAUDE_BIN", "/usr/bin/claude"))
 
@@ -116,16 +158,14 @@ class Config:
     auto_merge_default: bool = field(default_factory=lambda: _get_bool("NEO_AUTO_MERGE", False))
 
     # --- safety floors ---
-    # Defaults to bounces_before_escalation (5): a smaller default would make
-    # the 5-bounce escalation unreachable (the builder lane parks the round
-    # after max_builder_rounds before the PR ever bounces 5 times).  A value
-    # BELOW bounces_before_escalation is clamped up with a warning — the
-    # previous release shipped NEO_MAX_BUILDER_ROUNDS=2 on the live box, and a
-    # config the previous release shipped must never crash-loop production
-    # (round-2 finding: the old validate() raised here and kept both services
-    # down until a human edited .env).
+    # The env default is the owner's rule: TWO builder rounds
+    # (MAX_BUILDER_ROUNDS_DEFAULT).  A value BELOW bounces_before_escalation
+    # is then clamped up with a warning by _clamp_rounds() at construction —
+    # that later clamp keeps escalation reachable and keeps a config the
+    # previous release shipped (NEO_MAX_BUILDER_ROUNDS=2 on the live box) from
+    # crash-looping production; it is a floor on small values, not the default.
     max_builder_rounds: int = field(default_factory=lambda: _get_int(
-        "NEO_MAX_BUILDER_ROUNDS", 5))
+        "NEO_MAX_BUILDER_ROUNDS", MAX_BUILDER_ROUNDS_DEFAULT))
 
     # --- bounce / escalation ---
     # Number of builder bounces before escalation to a frontier advisor.
@@ -208,6 +248,15 @@ class Config:
     jev_api_key: str = field(default_factory=lambda: (
         _get("NEO_OPENROUTER_API_KEY") or _get("OPENROUTER_API_KEY")))
 
+    def zeus_consumer(self, install_id: str = "") -> str:
+        """The consumer attribution for Zeus's model calls (brief step 1):
+
+            reviews:zeus/<install_id>   when the caller knows the install
+            reviews:zeus                when it does not (never invented)
+        """
+        install_id = (install_id or "").strip()
+        return f"reviews:zeus/{install_id}" if install_id else "reviews:zeus"
+
     def __post_init__(self) -> None:
         # Clamp the round limit up to the escalation floor at construction, so
         # every consumer (and a bare Config()) sees the effective value.
@@ -270,7 +319,31 @@ class Config:
           - claude_bin exists/executable (where practical)
 
         Raises ValueError (safe to log — no secrets) on any violation.
+
+        RouteGate endpoints are validated fail-closed the same way: only the
+        loopback gate passes, so a stale/foreign URL can never point Zeus's
+        briefs (and their context) off-box.
         """
+        # --- RouteGate: loopback only, Anthropic wire only when L2 serves it ---
+        if self.routegate_base_url.rstrip("/") != ROUTEGATE_BASE_URL:
+            raise ValueError(
+                f"routegate_base_url must be the loopback RouteGate "
+                f"({ROUTEGATE_BASE_URL}), got {self.routegate_base_url!r}"
+            )
+        rg_anthropic = self.routegate_anthropic_url.strip().rstrip("/")
+        if rg_anthropic and rg_anthropic != ROUTEGATE_ANTHROPIC_URL:
+            raise ValueError(
+                f"routegate_anthropic_url must be RouteGate's Anthropic "
+                f"endpoint on the loopback ({ROUTEGATE_ANTHROPIC_URL}) or "
+                f"empty while L2 serves no Anthropic wire, got "
+                f"{self.routegate_anthropic_url!r}"
+            )
+        if self.routegate_model.strip() != ROUTEGATE_MODEL:
+            raise ValueError(
+                f"routegate_model must be the RouteGate capability "
+                f"{ROUTEGATE_MODEL!r}, got {self.routegate_model!r}"
+            )
+
         base = self.deepseek_base_url.rstrip("/")
         if base not in {
             "https://api.deepseek.com/anthropic",
