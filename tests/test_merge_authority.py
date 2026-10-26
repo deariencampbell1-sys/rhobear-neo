@@ -2005,3 +2005,51 @@ def test_merge_posts_the_comment_then_merges():
              "merge" if ("PUT" in c and "-X" in c) else "other" for c in calls]
     assert "comment" in kinds and "merge" in kinds
     assert kinds.index("comment") < kinds.index("merge"), kinds
+
+
+def test_newest_status_per_trusted_context_decides():
+    """Defect 3: the collector took the UNION of every trusted status on the
+    head — one failing status that a later re-run drove to success kept the PR
+    red forever. The newest status per trusted context decides."""
+    from src import neo_worker
+
+    cfg = Config()
+    cfg.trusted_reviewer_app_id = "12345"
+    statuses = [
+        {"context": "rhobear-reviews", "state": "success",
+         "created_at": "2026-10-26T11:55:00Z"},
+        {"context": "rhobear-reviews", "state": "failure",
+         "created_at": "2026-10-26T11:50:00Z"},   # the run that was re-driven
+    ]
+
+    def fake_gh(token, *args, timeout=30):
+        if args[:2] == ("pr", "view"):
+            return 0, json.dumps({"headRefOid": SHA1, "headRefName": "topic",
+                                  "reviews": [],
+                                  "statusCheckRollup": [
+                                      {"__typename": "StatusContext",
+                                       "context": "rhobear-reviews", "state": "SUCCESS",
+                                       "createdAt": "2026-10-26T11:55:00Z"}]})
+        if args[0] == "api" and "/check-runs" in args[1]:
+            return 0, json.dumps({"total_count": 0, "check_runs": []})
+        if args[0] == "api" and args[1].endswith("/status"):
+            return 0, json.dumps({"total_count": len(statuses), "statuses": statuses})
+        raise AssertionError(f"unexpected gh call {args}")
+
+    with patch("src.neo_worker._gh", side_effect=fake_gh):
+        ev = neo_worker._review_evidence("tok", cfg, "acme/a", 5, SHA1)
+    assert ev["trusted_states"] == ["success"], ev["trusted_states"]
+    assert ev["trusted_green"] is True
+
+    # ...and a fresh failure on top of an old success keeps it red (the newest
+    # status of the context decides in both directions).
+    statuses[:] = [
+        {"context": "rhobear-reviews", "state": "failure",
+         "created_at": "2026-10-26T12:00:00Z"},
+        {"context": "rhobear-reviews", "state": "success",
+         "created_at": "2026-10-26T11:50:00Z"},
+    ]
+    with patch("src.neo_worker._gh", side_effect=fake_gh):
+        ev = neo_worker._review_evidence("tok", cfg, "acme/a", 5, SHA1)
+    assert ev["trusted_states"] == ["failure"], ev["trusted_states"]
+    assert ev["trusted_green"] is False
