@@ -34,5 +34,13 @@ the product boundary: Reviews only reads + posts a verdict; Neo **writes and mer
 - `src/__main__.py` — webhook server + background worker queue.
 - `deploy/` — systemd unit, installer, Caddy snippet.
 
+## Environment
+Env-driven (`src/config.py`, no secrets baked in). The lane switches:
+- `NEO_LANE_MERGE` (default `false`) — lane PRs (`l<n>-<lane>/...`) merge on Apollo's pass plus the
+  lane architect's acceptance of the exact head (an `architect/<lane>` commit status set from the
+  owner's account), independent of the per-install auto-merge toggle (L0, 2026-10-25).
+- `NEO_LANE_REQUIRE_DRIFT` (default `false`) — lane PRs also need L0's drift check (`l0/drift`)
+  green on the exact head (SPRINT section 9).
+
 ## Deploy (on rhobear-vps)
 `.env` + `app-key.pem` must be present (chmod 600). Then: `bash deploy/install.sh`.
