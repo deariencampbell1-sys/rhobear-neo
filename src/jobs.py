@@ -457,42 +457,84 @@ class Jobs:
         owner-actionable — never silently re-armed).  Returns the resulting
         state, 'queued' or 'parked'.  Clears submitted_at so the recovery loop
         re-submits a retried wake exactly once (it is stamped again on
-        submission — never every pass while waiting in the executor)."""
+        submission — never every pass while waiting in the executor).
+
+        The at-cap decision is made in the SAME statement that requeues (a
+        CASE writing done/parked directly): there is no window between the
+        requeue and the park in which another worker could claim the row and
+        be clobbered."""
         note = dict(payload or {})
         if reason:
             note["reason"] = reason
         token_cond, token_params = _token_where(worker_token)
         with self._conn() as c:
             cur = c.execute(
-                "UPDATE neo_jobs SET state = 'queued', outcome = 'failed', "
+                "UPDATE neo_jobs SET "
+                "state = CASE WHEN attempt >= max_attempts "
+                "  THEN 'done' ELSE 'queued' END, "
+                "outcome = CASE WHEN attempt >= max_attempts "
+                "  THEN 'parked' ELSE 'failed' END, "
                 "lease_expires = NULL, worker_token = NULL, submitted_at = NULL, "
-                "payload = payload || %s, updated_at = now() "
+                "payload = payload || %s || CASE WHEN attempt >= max_attempts "
+                "  THEN jsonb_build_object('reason', "
+                "       'retryable failure exhausted ' || attempt || '/' "
+                "       || max_attempts || ' attempts') "
+                "  ELSE '{}'::jsonb END, "
+                "updated_at = now() "
                 "WHERE id = %s AND state = 'running'" + token_cond + " "
-                "RETURNING attempt, max_attempts",
+                "RETURNING state",
                 [json.dumps(note), job_id] + token_params,
             )
             row = cur.fetchone()
             if not row:
                 return "?"   # not running (e.g. already resolved) — nothing to retry
-            attempt, max_attempts = int(row[0]), int(row[1])
-        if attempt >= max_attempts:
-            self.park(job_id, reason=f"retryable failure exhausted {attempt}/{max_attempts} attempts")
-            return "parked"
-        return "queued"
+            return "parked" if row[0] == "done" else "queued"
 
-    def park(self, job_id: int, *, reason: str = "", payload: dict | None = None) -> bool:
-        """Terminal `parked` from any state (used by recovery/retry paths where
-        the row was already reset to queued)."""
+    def park(self, job_id: int, *, reason: str = "", payload: dict | None = None,
+             worker_token: str | None = None,
+             expected_state: str | None = None) -> bool:
+        """Terminal `parked` — only for a row no live worker holds.
+
+        Guards (fail closed — a row another worker currently holds is never
+        clobbered):
+
+        * ``worker_token``: only the current claimant may park, and only while
+          the row is queued/running (never re-parks a terminal row).
+        * ``expected_state``: only a row in exactly that state is touched.
+        * without a token, the row must additionally have NO live lease —
+          a live lease means a claimant is working it (a lease-expired row
+          that has since been re-claimed is left alone; its claimant's
+          resolve() finishes it).
+
+        Returns False when it touched nothing (row missing, other state, or
+        held by another worker)."""
         note = dict(payload or {})
         if reason:
             note["reason"] = reason
+        conds = ["id = %s"]
+        params: list[Any] = [job_id]
+        if worker_token is not None:
+            conds.append("worker_token = %s")
+            params.append(worker_token)
+            conds.append("state IN ('queued', 'running')")
+            if expected_state is not None:
+                conds.append("state = %s")
+                params.append(expected_state)
+        else:
+            if expected_state is not None:
+                conds.append("state = %s")
+                params.append(expected_state)
+            else:
+                conds.append("state IN ('queued', 'running')")
+            # A live lease = another worker is running this row right now.
+            conds.append("(lease_expires IS NULL OR lease_expires < now())")
         with self._conn() as c:
             cur = c.execute(
                 "UPDATE neo_jobs SET state = 'done', outcome = 'parked', "
                 "lease_expires = NULL, "
                 "payload = payload || %s, updated_at = now() "
-                "WHERE id = %s",
-                (json.dumps(note), job_id),
+                "WHERE " + " AND ".join(conds),
+                (json.dumps(note), *params),
             )
             return cur.rowcount > 0
 

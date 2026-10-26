@@ -91,12 +91,25 @@ def _get_bool(name: str, default: bool) -> bool:
     return v in {"1", "true", "yes", "on"}
 
 
+#: Default install id whose usage is the owner workspace's own (never
+#: metered).  Deployments override it with NEO_OWNER_INSTALL_ID — no install
+#: id may be hard-coded in the worker.
+DEFAULT_OWNER_INSTALL_ID = "deariencampbell1-sys"
+
+
 @dataclass
 class Config:
     # --- webhook ingress (loopback; Caddy fronts the public endpoint) ---
     bind_host: str = field(default_factory=lambda: _get("NEO_BIND_HOST", "127.0.0.1"))
     bind_port: int = field(default_factory=lambda: _get_int("NEO_BIND_PORT", 8767))
     webhook_secret: str = field(default_factory=lambda: _get("RHOBEAR_NEO_WEBHOOK_SECRET"))
+
+    # --- metering: which install id is the owner workspace (never metered) ---
+    # Deployment-specific (W1-13-r1 defect 7): configured, never hard-coded
+    # in the worker.  Defaults to the legacy value for compatibility.
+    owner_install_id: str = field(
+        default_factory=lambda: _get("NEO_OWNER_INSTALL_ID", DEFAULT_OWNER_INSTALL_ID)
+    )
 
     # --- who Neo trusts as a "green" review signal (reviewer-agnostic) ---
     # A commit status context OR a check-run name from any of these counts as a

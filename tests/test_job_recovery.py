@@ -31,7 +31,6 @@ Covers:
 from __future__ import annotations
 
 import json
-import inspect
 from unittest.mock import MagicMock, patch, ANY
 
 import pytest
@@ -153,25 +152,70 @@ class TestJobLifecycle:
             assert TERMINAL_OUTCOMES == (
                 "done", "no_change", "no_installation", "superseded", "parked")
 
-    def test_retry_returns_queued_and_parks_at_cap(self, mock_conn):
-        """failed(retryable) goes back to queued; at the cap it parks."""
-        mock_conn.execute.return_value.fetchone.return_value = (2, 3)
+    def test_retry_below_cap_requeues(self, mock_conn):
+        """failed(retryable) goes back to queued — one statement."""
+        mock_conn.execute.return_value.fetchone.return_value = ("queued",)
         with patch("src.jobs.psycopg.connect", return_value=mock_conn):
             j = Jobs("postgresql://fake:5432/db")
             assert j.retry(42, reason="boom") == "queued"
             sql, params = mock_conn.execute.call_args[0]
-            assert "state = 'queued'" in sql and "outcome = 'failed'" in sql
-            # at cap -> park
-            mock_conn.execute.return_value.fetchone.return_value = (3, 3)
-            assert j.retry(42, reason="boom") == "parked"
+            assert "state = 'running'" in sql and "outcome" in sql
+            assert mock_conn.execute.call_count == 1
 
-    def test_park_from_any_state(self, mock_conn):
+    def test_retry_at_cap_parks_in_the_same_statement(self, mock_conn):
+        """W1-13-r1 Defect 1: the at-cap decision is made in the SAME statement
+        that requeues (a CASE writing done/parked directly) — there is no
+        second park() statement whose window a claiming worker could fall
+        into.  Returns 'parked'."""
+        mock_conn.execute.return_value.fetchone.return_value = ("done",)
         with patch("src.jobs.psycopg.connect", return_value=mock_conn):
             j = Jobs("postgresql://fake:5432/db")
-            j.park(42, reason="done")
+            assert j.retry(42, worker_token="w1", reason="boom") == "parked"
+            # exactly ONE statement — never UPDATE-then-park
+            assert mock_conn.execute.call_count == 1
+            sql = mock_conn.execute.call_args[0][0]
+            assert "CASE" in sql and "'parked'" in sql
+            assert "worker_token = %s" in sql
+
+    def test_retry_without_a_touchable_row_returns_question(self, mock_conn):
+        mock_conn.execute.return_value.fetchone.return_value = None
+        with patch("src.jobs.psycopg.connect", return_value=mock_conn):
+            j = Jobs("postgresql://fake:5432/db")
+            assert j.retry(42, worker_token="w1") == "?"
+
+    def test_park_guards_accept_token_and_expected_state(self, mock_conn):
+        """W1-13-r1 Defect 1: park() accepts worker_token and/or
+        expected_state.  With a token it only touches the claimant's
+        queued/running row; with expected_state it only touches that state."""
+        mock_conn.execute.return_value.rowcount = 1
+        with patch("src.jobs.psycopg.connect", return_value=mock_conn):
+            j = Jobs("postgresql://fake:5432/db")
+            assert j.park(42, worker_token="w1", reason="done") is True
+            sql, params = mock_conn.execute.call_args[0]
+            assert "worker_token = %s" in sql
+            assert "state IN ('queued', 'running')" in sql
+            assert "w1" in params
+            assert j.park(42, expected_state="running", reason="done") is True
+            sql, params = mock_conn.execute.call_args[0]
+            assert "state = %s" in sql and "running" in params
+
+    def test_park_bare_never_touches_a_held_row(self, mock_conn):
+        """The bare form (the recovery loops' call shape) must never park a
+        row another worker currently holds: a live lease means a claimant."""
+        mock_conn.execute.return_value.rowcount = 1
+        with patch("src.jobs.psycopg.connect", return_value=mock_conn):
+            j = Jobs("postgresql://fake:5432/db")
+            j.park(42, reason="lease expired 2/2 times")
             sql = mock_conn.execute.call_args[0][0]
             assert "outcome = 'parked'" in sql
-            assert "state = 'running'" not in sql  # park is state-agnostic
+            assert "lease_expires < now()" in sql  # live-lease rows are refused
+            assert "state IN ('queued', 'running')" in sql
+
+    def test_park_returns_false_when_nothing_touched(self, mock_conn):
+        mock_conn.execute.return_value.rowcount = 0
+        with patch("src.jobs.psycopg.connect", return_value=mock_conn):
+            j = Jobs("postgresql://fake:5432/db")
+            assert j.park(42, expected_state="running") is False
 
     def test_claim_queued_newest_first(self, mock_conn):
         """GLM 7: the claim is ORDER BY created_at DESC — newest round wins."""
@@ -215,13 +259,39 @@ class TestSchemaSingleDefinition:
         assert "builder_round" in JOBS_SCHEMA
         assert "UNIQUE (repo, pr_number, head_sha)" not in JOBS_SCHEMA  # legacy gone
 
-    def test_neo_state_delegates_not_defines(self):
+    def test_neo_state_delegates_not_defines(self, monkeypatch):
         """Only ONE schema definition for neo_jobs — neo_state no longer
-        defines the table; its ensure_schema() calls jobs.ensure_schema()."""
+        defines the table: running NeoState.ensure_schema() hands the table to
+        jobs.ensure_schema() and never creates it itself."""
         from src.neo_state import SCHEMA as STATE_SCHEMA, NeoState
         assert "CREATE TABLE IF NOT EXISTS neo_jobs" not in STATE_SCHEMA
-        src = inspect.getsource(NeoState.ensure_schema)
-        assert "Jobs(self.dsn).ensure_schema()" in src
+        executed, delegated = [], []
+
+        class _Cursor:
+            def execute(self, sql, *args):
+                executed.append(sql)
+
+        class _Ctx:
+            def __enter__(self):
+                return _Cursor()
+
+            def __exit__(self, *exc):
+                return False
+
+        class _FakeJobs:
+            def __init__(self, dsn):
+                self.dsn = dsn
+
+            def ensure_schema(self):
+                delegated.append(self.dsn)
+
+        monkeypatch.setattr(NeoState, "_conn", lambda self: _Ctx())
+        monkeypatch.setattr("src.jobs.Jobs", _FakeJobs)
+        NeoState("postgresql://unit").ensure_schema()
+        assert delegated == ["postgresql://unit"], \
+            "NeoState.ensure_schema() must delegate neo_jobs to jobs.ensure_schema()"
+        assert all("neo_jobs" not in sql for sql in executed), \
+            "NeoState must never define neo_jobs itself"
 
     def test_ensure_schema_runs_migration_once(self, mock_conn):
         """No neo_schema_version row (pre-B1 upgrade OR fresh install): the
@@ -389,33 +459,267 @@ class TestDefect3AgentErrors:
         self._run(lambda *a, **kw: ({}, "", None, None), jobs)
         jobs.retry.assert_called_once()
 
+    def test_crash_retry_passes_the_claim_token(self):
+        """The crash retry targets THIS claim: retry(42) presents the same
+        worker_token that claimed the job."""
+        jobs = MagicMock(spec=Jobs)
+        jobs.claim.return_value = 42
+        self._run(FileNotFoundError("agent binary not found"), jobs)
+        jobs.retry.assert_called_once()
+        assert jobs.retry.call_args.args == (42,)
+        assert jobs.retry.call_args.kwargs["worker_token"] == \
+            jobs.claim.call_args.kwargs["worker_token"]
+
 
 # ---------------------------------------------------------------------------
 # Defect 4 — wakes persisted before the executor; nothing dropped
 # ---------------------------------------------------------------------------
 
+class _Script:
+    """Per-test script for _ScriptedJobs.  One fresh instance per test (the
+    `script` fixture below) and one per _ScriptedJobs instance — nothing here
+    is ever shared (W1-13-r2 defect 7)."""
+
+    def __init__(self, expired=None, orphaned=None, dedup=False):
+        self.events: list = []
+        self.expired: list = list(expired or [])
+        self.orphaned: list = list(orphaned or [])
+        self.dedup: bool = dedup
+
+
+class _ScriptedJobs:
+    """Fake Jobs for driving __main__.main() and its _recovery_loop closure
+    without a DB.  Every instance runs on its OWN _Script — passed through the
+    Jobs factory lambda — and every call is appended to `script.events` in
+    order.  Two instances never see each other's events."""
+
+    def __init__(self, dsn, script=None):
+        self.script = _Script() if script is None else script
+
+    @property
+    def events(self):
+        return self.script.events
+
+    def ensure_schema(self):
+        pass
+
+    def reset_queued_submissions(self, kind):
+        self.script.events.append(("reset", kind))
+
+    def create_wake(self, repo, sha, green, pr_number=None, payload=None):
+        self.script.events.append(("create_wake", repo, sha, pr_number))
+        if self.script.dedup:
+            return None
+        return len([e for e in self.script.events if e[0] == "create_wake"])
+
+    def mark_submitted(self, job_id):
+        self.script.events.append(("mark_submitted", job_id))
+
+    def clear_submitted(self, job_id):
+        self.script.events.append(("clear_submitted", job_id))
+
+    def recover_expired(self, kind):
+        self.script.events.append(("recover_expired", kind))
+        return [dict(r) for r in self.script.expired]
+
+    def stale_queued(self, kind, older_than_secs):
+        self.script.events.append(("stale_queued", kind, older_than_secs))
+        return [dict(r) for r in self.script.orphaned]
+
+    def park(self, job_id, **kw):
+        self.script.events.append(("park", job_id, kw.get("reason")))
+        return True
+
+
+@pytest.fixture()
+def script():
+    """A fresh _Script per test with EVERY script attribute reset (W1-13-r2
+    defect 7): a failure anywhere between setup and teardown can never leak
+    rows into the next test — the old class-level lists were cleaned only in
+    `finally` blocks (and one test never cleared `orphaned` at all)."""
+    s = _Script()
+    yield s
+    s.events.clear()
+    s.expired.clear()
+    s.orphaned.clear()
+    s.dedup = False
+
+
+class TestScriptedJobsIsolation:
+    def test_two_scripted_jobs_instances_do_not_share_events(self):
+        """W1-13-r2 defect 7: script state is per-INSTANCE (the script passed
+        through the Jobs factory lambda), never on the class — two fakes never
+        see each other's events, so one test can never leak rows into the
+        next."""
+        a = _ScriptedJobs("dsn")
+        b = _ScriptedJobs("dsn")
+        assert a.create_wake("o/r", "a" * 40, True) == 1
+        assert [e[0] for e in a.events] == ["create_wake"]
+        assert b.events == []
+
+
+def _drive_wake_main(monkeypatch, script):
+    """Run __main__.main() with fakes (no DB, no threads, no network) and
+    return the REAL (on_verdict, _recovery_loop) closures it builds.  The fake
+    Jobs is built from `script` through the Jobs factory lambda, so all its
+    state is the caller's own _Script instance."""
+    import types
+    import src.__main__ as main_mod
+
+    captured = {}
+    cfg = MagicMock()
+    cfg.orgs = ("o",)
+    cfg.escalation_poll_secs = 3600.0
+    cfg.escalation_timeout_secs = 60
+
+    class _FakeState:
+        def __init__(self, dsn):
+            pass
+
+        def ensure_schema(self):
+            pass
+
+    class _FakeUsage:
+        def __init__(self, dsn):
+            pass
+
+        def ensure_schema(self):
+            pass
+
+    class _FakeExecutor:
+        def __init__(self, **kw):
+            pass
+
+        def submit(self, fn, wake):
+            script.events.append(("submit", wake.get("job_id")))
+
+    class _FakeThread:
+        def __init__(self, target=None, **kw):
+            captured["recovery"] = target
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr("src.__main__._config.load", lambda: cfg)
+    monkeypatch.setattr("src.__main__.github_app_for", lambda c: {"id": 1})
+    monkeypatch.setattr("src.__main__.NeoState", _FakeState)
+    monkeypatch.setattr("src.__main__.Jobs", lambda dsn: _ScriptedJobs(dsn, script))
+    monkeypatch.setattr("src.__main__.UsageStore", _FakeUsage)
+    monkeypatch.setattr("src.__main__.run_neo", lambda *a, **kw: None)
+    monkeypatch.setattr("src.__main__.serve", lambda *a, **kw: None)
+    monkeypatch.setattr("src.__main__.NeoDispatcher",
+                        lambda c, cb: captured.setdefault("on_verdict", cb))
+    # Module-local patches (W1-13-r2 defect 7): `src.__main__.threading` is
+    # that module's own alias and `concurrent` is patched as a NAME in
+    # src.__main__ — neither patch touches the global threading /
+    # concurrent.futures modules, so a thread any other fixture starts while
+    # this test runs is never hijacked.
+    monkeypatch.setattr("src.__main__.threading.Thread", _FakeThread)
+    monkeypatch.setattr(
+        "src.__main__.concurrent",
+        types.SimpleNamespace(
+            futures=types.SimpleNamespace(ThreadPoolExecutor=_FakeExecutor)))
+    main_mod.main()
+    return captured["on_verdict"], captured["recovery"]
+
+
 class TestDefect4DroppedWakes:
-    def test_on_verdict_persists_before_submit(self):
-        import src.__main__ as main_mod
-        source = open(main_mod.__file__).read()
-        assert "jobs.create_wake(repo, sha, green" in source
-        assert "Semaphore" not in source  # backpressure cap removed
+    def test_on_verdict_persists_before_submit(self, monkeypatch, script):
+        """The wake is persisted as a durable job BEFORE the executor ever
+        sees it — and no backpressure cap drops any of them (32/32 handed
+        off, each exactly once)."""
+        on_verdict, _ = _drive_wake_main(monkeypatch, script)
+        for i in range(32):
+            on_verdict({"repo": "o/r", "sha": f"{i:040x}", "green": True,
+                        "context": "test", "pr_number": 1})
+        assert [e[0] for e in script.events] == \
+            ["create_wake", "submit", "mark_submitted"] * 32
 
-    def test_status_wake_without_pr_creates_job(self):
-        """GLM 1: on_verdict passes pr_number (may be None) into create_wake —
-        a `status` event with no PR number still gets a durable job."""
-        import src.__main__ as main_mod
-        source = open(main_mod.__file__).read()
-        assert "pr_number=wake.get(\"pr_number\")" in source
+    def test_duplicate_wake_is_never_submitted(self, monkeypatch, script):
+        """A deduped wake (another job owns the SHA) is never handed off."""
+        script.dedup = True
+        on_verdict, _ = _drive_wake_main(monkeypatch, script)
+        on_verdict({"repo": "o/r", "sha": "a" * 40, "green": True,
+                    "context": "test", "pr_number": 1})
+        assert [e[0] for e in script.events] == ["create_wake"]
 
-    def test_recovery_loop_resubmits_expired_and_orphaned(self):
-        """GLM 4: __main__ runs a lease-recovery loop that re-queues expired
-        wake leases and re-submits orphaned queued wakes (no strand)."""
+    def test_status_wake_without_pr_creates_job(self, monkeypatch, script):
+        """GLM 1: a `status` wake carries no pr_number — the durable job is
+        created anyway (pr resolved later via the head SHA) and submitted."""
+        on_verdict, _ = _drive_wake_main(monkeypatch, script)
+        on_verdict({"repo": "o/r", "sha": "a" * 40, "green": True,
+                    "context": "test"})
+        assert ("create_wake", "o/r", "a" * 40, None) in script.events
+        assert ("submit", 1) in script.events
+        assert ("mark_submitted", 1) in script.events
+
+    def test_recovery_loop_resubmits_expired_and_orphaned(self, monkeypatch, script):
+        """GLM 4: one recovery pass parks ONLY the wake that is out of
+        attempts and re-submits everything else exactly once (expired leases
+        below the cap AND orphaned queued wakes)."""
         import src.__main__ as main_mod
-        source = open(main_mod.__file__).read()
-        assert "jobs.recover_expired(\"wake\")" in source
-        assert "jobs.stale_queued(\"wake\"" in source
-        assert "_submit_wake(executor, jobs, wake, _run_wake)" in source
+        script.expired = [
+            {"id": 1, "repo": "o/r", "head_sha": "a" * 40,
+             "attempt": 2, "max_attempts": 2,
+             "payload": {"repo": "o/r", "sha": "a" * 40}},
+            {"id": 2, "repo": "o/r", "head_sha": "b" * 40,
+             "attempt": 1, "max_attempts": 3,
+             "payload": {"repo": "o/r", "sha": "b" * 40}},
+        ]
+        script.orphaned = [
+            {"id": 3, "repo": "o/r", "head_sha": "c" * 40,
+             "payload": {"repo": "o/r", "sha": "c" * 40}},
+        ]
+        _, recovery = _drive_wake_main(monkeypatch, script)
+        sleeps = []
+
+        def fake_sleep(secs):
+            sleeps.append(secs)
+            if len(sleeps) >= 2:
+                raise KeyboardInterrupt
+
+        monkeypatch.setattr("time.sleep", fake_sleep)
+        monkeypatch.setattr("src.escalation.recover_escalations",
+                            lambda *a, **kw: None)
+        with pytest.raises(KeyboardInterrupt):
+            recovery()
+        # out-of-attempts wake: parked once (by name), never re-submitted
+        assert [e for e in script.events if e[0] == "park"] == [
+            ("park", 1, "lease expired 2/2 times")]
+        # below-cap expired wake + orphan: each submitted exactly once
+        assert [e for e in script.events if e[0] == "submit"] == \
+            [("submit", 2), ("submit", 3)]
+        assert ("mark_submitted", 2) in script.events
+        assert ("mark_submitted", 3) in script.events
+        assert ("reset", "wake") in script.events           # startup un-strand
+        assert ("recover_expired", "wake") in script.events
+        assert ("stale_queued", "wake", main_mod.RECOVERY_SECS) in script.events
+        assert sleeps == [main_mod.RECOVERY_SECS, main_mod.RECOVERY_SECS]
+
+    def test_recovery_loop_does_not_park_a_recoverable_wake(self, monkeypatch, script):
+        """A wake with attempts left is never parked — it is re-submitted
+        exactly once.  (r1 left `_ScriptedJobs.orphaned` populated after this
+        test; the per-test script fixture resets everything.)"""
+        script.expired = [
+            {"id": 7, "repo": "o/r", "head_sha": "d" * 40,
+             "attempt": 1, "max_attempts": 3,
+             "payload": {"repo": "o/r", "sha": "d" * 40}},
+        ]
+        _, recovery = _drive_wake_main(monkeypatch, script)
+        sleeps = []
+
+        def fake_sleep(secs):
+            sleeps.append(secs)
+            if len(sleeps) >= 2:
+                raise KeyboardInterrupt
+
+        monkeypatch.setattr("time.sleep", fake_sleep)
+        monkeypatch.setattr("src.escalation.recover_escalations",
+                            lambda *a, **kw: None)
+        with pytest.raises(KeyboardInterrupt):
+            recovery()
+        assert not [e for e in script.events if e[0] == "park"]
+        assert [e for e in script.events if e[0] == "submit"] == [("submit", 7)]
 
     def test_webhook_status_wake_has_no_pr(self):
         """The status webhook deliberately carries no pr_number; on_verdict
@@ -444,12 +748,46 @@ class TestDefect4DroppedWakes:
 # ---------------------------------------------------------------------------
 
 class TestDefect5RollupGreen:
-    def test_rollup_green_computed_from_rollup(self):
+    def _evidence(self, rollup):
+        """Run the REAL _review_evidence against a scripted gh CLI."""
+        import json as _json
         from src.neo_worker import _review_evidence
-        source = inspect.getsource(_review_evidence)
-        assert "rollup_green" in source
-        assert "SUCCESS" in source
-        assert "statusCheckRollup" in source
+        from src.config import Config
+        cfg = Config()
+        cfg.trusted_reviewer_app_id = "12345"
+        cfg.trusted_review_contexts = ("rhobear-reviews",)
+        sha = "a" * 40
+
+        def fake_gh(token, *args, **kw):
+            if args[0] == "pr":
+                return 0, _json.dumps({"headRefOid": sha, "reviews": [],
+                                       "statusCheckRollup": rollup})
+            if "check-runs" in args[1]:
+                run = {"name": "rhobear-reviews", "head_sha": sha,
+                       "app": {"id": "12345"}, "status": "completed",
+                       "conclusion": "success",
+                       "output": {"summary": '{"unresolved_critical_high": 0, '
+                                             '"coverage": "complete"}'}}
+                return 0, _json.dumps({"check_runs": [run], "total_count": 1})
+            return 0, _json.dumps({"statuses": [
+                {"context": "rhobear-reviews", "state": "success"}]})
+
+        with patch("src.neo_worker._gh", side_effect=fake_gh):
+            return _review_evidence("tok", cfg, "o/r", 5, sha)
+
+    def test_rollup_green_computed_from_the_rollup(self):
+        """rollup_green is computed from the branch-protection check rollup:
+        green only when every check is SUCCESS, red on any FAILURE, and
+        UNKNOWN (None) when there is no rollup data at all."""
+        ev = self._evidence([{"context": "ci/test", "conclusion": "SUCCESS"}])
+        assert ev["rollup_green"] is True
+        assert ev["required_checks_pass"] is True
+        ev = self._evidence([{"context": "ci/test", "conclusion": "FAILURE"}])
+        assert ev["rollup_green"] is False
+        assert ev["required_checks_pass"] is False
+        ev = self._evidence([])
+        assert ev["rollup_green"] is None
+        assert ev["required_checks_pass"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -457,12 +795,57 @@ class TestDefect5RollupGreen:
 # ---------------------------------------------------------------------------
 
 class TestDefect6DryRun:
-    def test_dry_run_uses_read_only_peek(self):
+    def _run(self, monkeypatch, argv, jobs, fake_sleep=None):
+        import sys
         import src.neo_builder as builder
-        source = open(builder.__file__).read()
-        dry_section = source[source.index("if dry:"):source.index("continue", source.index("if dry:"))]
-        assert "jobs.peek_queued" in dry_section
-        assert "time.sleep(POLL_SECS)" in dry_section
+        cfg = MagicMock()
+        cfg.max_builder_rounds = 2
+        cfg.repo_allowlist = ()
+        cfg.gh_token = "t"
+        cfg.hermes_bin = "/fake/hermes"
+        cfg.hermes_provider = "zai"
+        cfg.hermes_model = "glm-5.3-flash"
+        cfg.deepseek_timeout = 30
+        monkeypatch.setattr(builder, "Config", lambda: cfg)
+        monkeypatch.setattr(builder, "Jobs", lambda dsn: jobs)
+        monkeypatch.setattr(sys, "argv", ["neo_builder"] + argv)
+        if fake_sleep is not None:
+            monkeypatch.setattr(builder.time, "sleep", fake_sleep)
+        builder.main()
+
+    def test_dry_run_is_read_only(self, monkeypatch):
+        """A dry-run peeks at the queue (peek_queued) and mutates NOTHING —
+        no claim, no resolve, no park, no retry, no release, no recovery."""
+        jobs = MagicMock(spec=Jobs)
+        jobs.peek_queued.return_value = [
+            {"repo": "o/r", "pr_number": 5, "builder_round": 1, "attempt": 1}]
+        self._run(monkeypatch, ["--once", "--dry-run"], jobs)
+        jobs.peek_queued.assert_called_once()
+        jobs.claim_queued.assert_not_called()
+        jobs.resolve.assert_not_called()
+        jobs.park.assert_not_called()
+        jobs.retry.assert_not_called()
+        jobs.release.assert_not_called()
+        jobs.create_builder.assert_not_called()
+        jobs.supersede_older.assert_not_called()
+        jobs.recover_expired.assert_not_called()
+
+    def test_dry_run_sleeps_every_iteration(self, monkeypatch):
+        """The dry-run poll sleeps POLL_SECS on EVERY iteration (the bug was
+        sleeping only on an empty queue)."""
+        jobs = MagicMock(spec=Jobs)
+        jobs.peek_queued.return_value = []
+        sleeps = []
+
+        def fake_sleep(secs):
+            sleeps.append(secs)
+            if len(sleeps) >= 3:
+                raise KeyboardInterrupt
+
+        with pytest.raises(KeyboardInterrupt):
+            self._run(monkeypatch, ["--dry-run"], jobs, fake_sleep)
+        assert sleeps == [POLL_SECS] * 3
+        assert jobs.peek_queued.call_count == 3
 
 
 # ---------------------------------------------------------------------------
@@ -596,11 +979,43 @@ class TestGLM6LeaseRenewal:
 # ---------------------------------------------------------------------------
 
 class TestGLM8TransientPrState:
-    def test_main_loop_does_not_resolve_failed(self):
+    def _cfg(self):
+        cfg = MagicMock()
+        cfg.max_builder_rounds = 3
+        cfg.deepseek_timeout = 30
+        cfg.hermes_bin = "/fake/hermes"
+        return cfg
+
+    def _row(self):
+        return {"id": 1, "repo": "o/r", "pr_number": 5,
+                "head_sha": "a" * 40, "builder_round": 1,
+                "attempt": 1, "worker_token": "w1"}
+
+    def test_transient_pr_state_never_resolves_the_job(self):
+        """GLM 8: a transient empty pr_state (gh failure) leaves the job
+        RUNNING for lease recovery — it is never resolved/failed terminally."""
         import src.neo_builder as builder
-        source = open(builder.__file__).read()
-        assert 'resolve(row["id"], "failed"' not in source
-        assert "job stays running" in source
+        jobs = MagicMock(spec=Jobs)
+        with patch("src.neo_builder.repo_token", return_value="tok"), \
+             patch("src.neo_builder.pr_state", return_value=""):
+            builder.dispatch_one(self._cfg(), jobs, self._row())
+        jobs.resolve.assert_not_called()
+        jobs.retry.assert_not_called()
+        jobs.park.assert_not_called()
+
+    def test_transient_github_error_never_resolves_the_job(self):
+        """A transient GitHub error (token mint / 5xx) also leaves the job
+        running — never a terminal resolve."""
+        from src.github_app import GitHubAppError
+        import src.neo_builder as builder
+        jobs = MagicMock(spec=Jobs)
+        with patch("src.neo_builder.repo_token",
+                   side_effect=GitHubAppError("502 bad gateway")), \
+             patch("src.neo_builder.pr_state", return_value="OPEN\tmain"):
+            builder.dispatch_one(self._cfg(), jobs, self._row())
+        jobs.resolve.assert_not_called()
+        jobs.retry.assert_not_called()
+        jobs.park.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -624,7 +1039,8 @@ class TestRoundCapAtClaim:
         cfg.deepseek_timeout = 30
         jobs = MagicMock(spec=Jobs)
         over_cap = {"id": 10, "repo": "o/r", "pr_number": 5,
-                    "head_sha": "a" * 40, "builder_round": 3, "attempt": 3}
+                    "head_sha": "a" * 40, "builder_round": 3, "attempt": 3,
+                    "worker_token": "wtok"}
         jobs.claim_queued.side_effect = [over_cap, None]
         jobs.recover_expired.return_value = []
         monkeypatch.setattr(builder, "Config", lambda: cfg)
@@ -634,8 +1050,27 @@ class TestRoundCapAtClaim:
         with caplog.at_level(logging.INFO):
             builder.main()
         jobs.park.assert_any_call(
-            10, reason="max builder rounds (2) reached (round 3)")
+            10, worker_token="wtok",
+            reason="max builder rounds (2) reached (round 3)")
         assert jobs.claim_queued.call_count == 2  # over-cap row + empty
+        assert not jobs.resolve.called
+
+    def test_dispatch_one_round_cap_park_presents_the_claim_token(self):
+        """dispatch_one's own round-cap gate parks the row it was claimed with:
+        the park presents the claimant's worker_token (the same token
+        claim_queued minted) and the "reached" reason.  A bare park() refuses
+        the row's LIVE lease and the round sits running until lease expiry."""
+        import src.neo_builder as builder
+        cfg = MagicMock()
+        cfg.max_builder_rounds = 2
+        jobs = MagicMock(spec=Jobs)
+        row = {"id": 10, "repo": "o/r", "pr_number": 5, "head_sha": "a" * 40,
+               "builder_round": 3, "attempt": 3, "worker_token": "wtok",
+               "payload": "{}"}
+        builder.dispatch_one(cfg, jobs, row)
+        jobs.park.assert_called_once()
+        assert jobs.park.call_args.kwargs["worker_token"] == "wtok"
+        assert "reached" in jobs.park.call_args.kwargs["reason"]
         assert not jobs.resolve.called
 
     def test_main_never_dispatches_second_round_of_inflight_pr(self, monkeypatch, caplog):
@@ -1017,3 +1452,132 @@ class TestHeadReadBeforeRun:
         jobs.resolve.assert_not_called()
         jobs.retry.assert_not_called()
         agent_run.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# W1-13-r1 Defect 5 — guard: none of the three test modules may assert on
+# source text.  Substring assertions on module source pass on any refactor
+# that keeps the substring and fail on any rename that keeps the behaviour —
+# false confidence on exactly the recovery paths under test.
+# ---------------------------------------------------------------------------
+
+class TestNoSourceTextAssertions:
+    FILES = ("test_job_recovery.py", "test_builder_evidence.py", "test_baseline.py")
+
+    def test_no_test_module_asserts_on_source_text(self):
+        import re
+        from pathlib import Path
+        here = Path(__file__).parent
+        forbidden = (
+            r"open\(.*" + "__file__" + r"\).*read\(\)",
+            r"(?:src|source)\[" + r".*\.index\(",
+            r"inspect\." + r"getsource",
+            "__file__" + r"\)?.*read_text\(\)",
+        )
+        for name in self.FILES:
+            path = str(here / name)
+            text = open(path).read()
+            for pat in forbidden:
+                m = re.search(pat, text)
+                assert m is None, (
+                    f"{name} asserts on source text ({m.group(0)!r}) — "
+                    "drive the real function and assert on calls made instead"
+                )
+
+
+# ---------------------------------------------------------------------------
+# W1-13-r1 Defect 7 — the owner install id must come from Config
+# ---------------------------------------------------------------------------
+
+class TestOwnerInstallIdFromConfig:
+    """A hard-coded install id in the worker is exactly what drifts per
+    deployment: the owner workspace must be NEO_OWNER_INSTALL_ID on Config."""
+
+    def test_owner_install_id_is_env_configured(self, monkeypatch):
+        from src.config import Config
+        monkeypatch.setenv("NEO_OWNER_INSTALL_ID", "deploy-specific-owner")
+        assert Config().owner_install_id == "deploy-specific-owner"
+
+    def test_owner_install_id_defaults_to_the_legacy_value(self, monkeypatch):
+        from src.config import Config, DEFAULT_OWNER_INSTALL_ID
+        from src.neo_worker import OWNER_INSTALL_ID
+        monkeypatch.delenv("NEO_OWNER_INSTALL_ID", raising=False)
+        # Assert against the LITERAL (W1-13-r2 defect 9) so drift in EITHER
+        # constant fails: the old assertion compared OWNER_INSTALL_ID to a
+        # Config default that is assigned from it — a constant against itself.
+        assert Config().owner_install_id == "deariencampbell1-sys"
+        assert DEFAULT_OWNER_INSTALL_ID == "deariencampbell1-sys"
+        assert OWNER_INSTALL_ID == "deariencampbell1-sys"
+
+    def test_metering_follows_the_config_value(self, monkeypatch):
+        from src.config import Config
+        from src.neo_worker import OWNER_INSTALL_ID, meters_credits
+        monkeypatch.setenv("NEO_OWNER_INSTALL_ID", "deploy-specific-owner")
+        cfg = Config()
+        # the CONFIGURED owner never meters ...
+        assert meters_credits(
+            {"install_id": "deploy-specific-owner", "plan": "pro"}, cfg) is False
+        # ... and the legacy hard-coded id decides nothing any more
+        assert meters_credits(
+            {"install_id": OWNER_INSTALL_ID, "plan": "pro"}, cfg) is True
+
+    def test_credit_gate_uses_the_config_owner(self, monkeypatch):
+        """run_neo's out-of-credits gate follows cfg.owner_install_id: the
+        configured owner is exempt; the legacy hard-coded id is a customer."""
+        from src.config import Config
+        from src.jev_review import JevAssessment
+        from src.neo_worker import OWNER_INSTALL_ID, run_neo
+        monkeypatch.setenv("NEO_OWNER_INSTALL_ID", "custom-owner")
+        cfg = Config()
+        cfg.gh_token = "t"
+        cfg.deepseek_model = "deepseek-v4-flash"
+        cfg.max_builder_rounds = 3
+        cfg.auto_merge_default = False
+        cfg.deepseek_timeout = 30
+        state = MagicMock()
+        state.builder_rounds.return_value = 0
+        state.already_acted.return_value = False
+        state.already_escalated.return_value = False
+        jobs = MagicMock(spec=Jobs)
+        jobs.claim.return_value = 42
+        wake = {"repo": "o/r", "sha": "a" * 40, "green": True,
+                "context": "test", "pr_number": 5, "job_id": 42}
+        evidence = {"ok": True, "head_sha": "a" * 40, "decided_sha": "a" * 40,
+                    "review_sha": "a" * 40, "review_bound_ok": True,
+                    "trusted_states": ["success"], "trusted_green": True,
+                    "failing_checks": 0, "rollup_green": True,
+                    "required_checks_pass": True, "coverage_complete": True,
+                    "unresolved_critical_high": 0, "comments_addressed": True,
+                    "review_state": "APPROVED"}
+
+        def drive(inst):
+            state.install.return_value = inst
+            jobs.reset_mock()
+            with patch("src.neo_worker.repo_token", return_value="tok"), \
+                 patch("src.neo_worker.resolve_pr", return_value=5), \
+                 patch("src.neo_worker._review_evidence", return_value=evidence), \
+                 patch("src.neo_worker._jev_for_pr",
+                       return_value=JevAssessment(False, reason="no key")), \
+                 patch("src.neo_worker._run_agent",
+                       return_value=({"input_tokens": 1}, "NO-CHANGE", 0, None)) as agent, \
+                 patch("src.neo_worker._gh", return_value=(0, "")):
+                run_neo(cfg, state, jobs, wake)
+            return agent
+
+        # the legacy hard-coded id with zero balance: a plain customer -> gated
+        agent = drive({"install_id": OWNER_INSTALL_ID, "plan": "pro",
+                       "credits_balance": 0})
+        agent.assert_not_called()
+        assert jobs.park.called, "customer install with no credits is parked"
+        # W1-13-r2 defect 8: the credit-gate park presents the SAME worker_token
+        # that claimed the row — drop that argument and park() silently
+        # returns False on the live lease and the job falls through to lease
+        # recovery (exactly the behaviour the audit table calls safe).
+        wtoken = jobs.claim.call_args.kwargs["worker_token"]
+        assert jobs.park.call_args.kwargs["worker_token"] == wtoken
+
+        # the CONFIGURED owner with zero balance: never metered -> runs
+        agent = drive({"install_id": "custom-owner", "plan": "pro",
+                       "credits_balance": 0})
+        agent.assert_called_once()
+        assert not jobs.park.called

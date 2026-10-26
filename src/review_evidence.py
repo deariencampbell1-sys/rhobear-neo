@@ -21,6 +21,7 @@ must never outrank it.
 """
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import logging
 
@@ -45,18 +46,74 @@ def _parse_evidence_summary(summary: str) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+def _check_run_completed(cr: dict) -> bool:
+    """True only for a check run that actually COMPLETED.
+
+    The production predicate is exact: `status == "completed"`.  A
+    queued/in_progress/pending run is not evidence, and a payload carrying a
+    `conclusion` but no `status` is NOT completed either (W1-13-r2 defect 4:
+    GitHub's check-run schema always includes `status`; the pinned fixtures
+    that omitted it were wrong and have been fixed — the predicate never
+    bends to test data).
+    """
+    return str(cr.get("status") or "") == "completed"
+
+
+def _run_id(cr: dict) -> int:
+    """Coerce a check run id defensively (W1-13-r2 defect 10): a malformed
+    id must SORT — it may never raise a ValueError on the evidence path."""
+    try:
+        return int(cr.get("id") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _completed_at(cr: dict) -> _dt.datetime:
+    """Parse completed_at to an aware datetime before comparing (defect 10):
+    mixed `Z` / `+00:00` strings sort wrongly as text.  Missing/unparseable
+    sorts oldest (deterministic; the id tie-break still applies)."""
+    raw = cr.get("completed_at")
+    if isinstance(raw, str) and raw.strip():
+        text = raw.strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = _dt.datetime.fromisoformat(text)
+        except ValueError:
+            parsed = None
+        if parsed is not None:
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=_dt.timezone.utc)
+            return parsed
+    return _dt.datetime.min.replace(tzinfo=_dt.timezone.utc)
+
+
 def _trusted_check_run(check_runs: list, app_id: str, sha: str) -> dict | None:
     """The ONE check run that authorizes `sha`.
 
     Trusts only a check run whose `app.id` equals the configured Reviews App
-    id AND whose `head_sha` equals `sha` (full 40-char equality).
+    id AND whose `head_sha` equals `sha` (full 40-char equality) AND that
+    COMPLETED successfully (conclusion in success/neutral).  When several
+    runs match, the NEWEST (by completed_at, then by id) decides — never the
+    first in the list, and never a fallback to an older run when the newest
+    one is failing or still pending.
     """
+    matches = []
     for cr in check_runs or []:
         cr_app = (cr.get("app") or {}) or {}
         if str(cr_app.get("id", "") or "") == str(app_id) \
                 and str(cr.get("head_sha", "") or "") == sha:
-            return cr
-    return None
+            matches.append(cr)
+    if not matches:
+        return None
+    cr = max(matches, key=lambda r: (_completed_at(r), _run_id(r)))
+    # The newest matching run decides; if IT is not acceptable evidence,
+    # there is no evidence (never fall back to an older run).
+    if not _check_run_completed(cr):
+        return None
+    if str(cr.get("conclusion") or "").lower() not in ("success", "neutral"):
+        return None
+    return cr
 
 
 def build_evidence(
@@ -78,7 +135,8 @@ def build_evidence(
       - trusted_producer_ok: bool — a check run from the Reviews App on this
         exact head SHA exists
       - review_sha_match: bool — full 40-char head equality
-      - required_checks_pass: bool — all branch-protection checks success
+      - required_checks_pass: bool | None — all branch-protection checks
+        success; None when there is no rollup data at all (unknown, denied)
       - unresolved_critical_high: int | None — from the trusted run's output
         (None when missing → denied)
       - coverage_complete: bool — output coverage == "complete"
@@ -125,7 +183,9 @@ def build_evidence(
         in {"FAILURE", "TIMED_OUT", "CANCELLED", "ERROR"}
         or str(c.get("state") or "").upper() in {"FAILURE", "ERROR"}
     ]
-    required_pass = len(failing_required) == 0
+    # Fail closed: an empty rollup is NO data (unknown -> None, matching
+    # merge_authority's treatment of unknown findings), never a pass.
+    required_pass = (len(failing_required) == 0) if rollup else None
 
     # --- Installation auto_merge (nullable inheritance) --------------------
     inst_auto_merge_raw = pr_data.get("installation_auto_merge")

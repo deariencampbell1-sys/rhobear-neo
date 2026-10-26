@@ -216,3 +216,98 @@ def test_run_agent_env_is_scrubbed(monkeypatch):
     assert set(env) == _ALLOWED_AGENT_ENV
     for forbidden in _FORBIDDEN_AGENT_ENV:
         assert forbidden not in env
+
+
+# ---------------------------------------------------------------------------
+# W1-13-r1 Defect 2 — serve() must fail closed by default
+# ---------------------------------------------------------------------------
+
+class _RecordingServer:
+    """Stand-in for ThreadingHTTPServer: records the configured server and
+    returns from serve_forever immediately."""
+
+    instances: list = []
+
+    def __init__(self, addr, handler_cls):
+        self.addr = addr
+        self.handler_cls = handler_cls
+        _RecordingServer.instances.append(self)
+
+    def serve_forever(self):
+        pass
+
+
+class _RecordingService:
+    """Stand-in for AdvisorService: records construction."""
+
+    instances: list = []
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        _RecordingService.instances.append(self)
+
+
+def test_serve_without_enabled_kwarg_attaches_no_advisor_service():
+    """The fail-closed default: serve() called WITHOUT the keyword must start
+    with the advise path closed — no AdvisorService is attached.  Only main()
+    (or an explicit enabled=True) may turn it on."""
+    import advisor.server as advisor_server
+    _RecordingServer.instances.clear()
+    _RecordingService.instances.clear()
+    with patch.object(advisor_server, "ThreadingHTTPServer", _RecordingServer), \
+         patch.object(advisor_server, "AdvisorService", _RecordingService):
+        advisor_server.serve(bind_host="127.0.0.1", bind_port=0,
+                             advisor_token="t")
+    assert len(_RecordingServer.instances) == 1, "serve() must start the server"
+    srv = _RecordingServer.instances[0]
+    assert srv.advisor_service is None, "no AdvisorService may be attached by default"
+    assert getattr(srv, "advisor_enabled", True) is False
+    assert _RecordingService.instances == [], "AdvisorService must not even be constructed"
+
+
+def test_serve_explicitly_enabled_attaches_the_service():
+    """An explicit enabled=True (and only that) opens the advise path."""
+    import advisor.server as advisor_server
+    _RecordingServer.instances.clear()
+    _RecordingService.instances.clear()
+    with patch.object(advisor_server, "ThreadingHTTPServer", _RecordingServer), \
+         patch.object(advisor_server, "AdvisorService", _RecordingService):
+        advisor_server.serve(bind_host="127.0.0.1", bind_port=0,
+                             advisor_token="t", enabled=True)
+    srv = _RecordingServer.instances[0]
+    assert srv.advisor_service is not None
+    assert getattr(srv, "advisor_enabled", False) is True
+    assert len(_RecordingService.instances) == 1
+
+
+# ---------------------------------------------------------------------------
+# W1-13-r2 Defect 3 — main() is the ONLY opener, and only via the env var
+# ---------------------------------------------------------------------------
+
+class TestMainOpensOnlyViaTheEnvVar:
+    """serve()'s fail-closed default (enabled=False) is a production behaviour
+    change UNLESS main() is proven to be the only opener and to pass
+    `enabled=` explicitly from NEO_ADVISOR_ENABLED: set to 1 ->
+    serve(enabled=True); unset -> serve(enabled=False)."""
+
+    def _drive(self, monkeypatch):
+        import advisor.server as advisor_server
+        monkeypatch.delenv("NEO_ADVISOR_BIND_HOST", raising=False)
+        monkeypatch.delenv("NEO_ADVISOR_BIND_PORT", raising=False)
+        calls = []
+        monkeypatch.setattr(advisor_server, "serve",
+                            lambda **kw: calls.append(kw))
+        advisor_server.main()
+        return calls
+
+    def test_env_set_reaches_serve_enabled_true(self, monkeypatch):
+        monkeypatch.setenv("NEO_ADVISOR_ENABLED", "1")
+        monkeypatch.setenv("NEO_ADVISOR_TOKEN", "tok")
+        calls = self._drive(monkeypatch)
+        assert [kw["enabled"] for kw in calls] == [True]
+
+    def test_env_unset_reaches_serve_enabled_false(self, monkeypatch):
+        monkeypatch.delenv("NEO_ADVISOR_ENABLED", raising=False)
+        monkeypatch.delenv("NEO_ADVISOR_TOKEN", raising=False)
+        calls = self._drive(monkeypatch)
+        assert [kw["enabled"] for kw in calls] == [False]

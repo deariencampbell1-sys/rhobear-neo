@@ -663,6 +663,7 @@ class TestWorkerWiring:
                 data = {"total_count": 1, "check_runs": [{
                     "name": "rhobear-reviews", "head_sha": SHA1,
                     "app": {"id": 12345, "slug": "rhobear-reviews"},
+                    "status": "completed",
                     "conclusion": "success",
                     "output": {"summary": '{"unresolved_critical_high": 0, "coverage": "complete"}'},
                 }]}
@@ -723,6 +724,7 @@ class TestWorkerWiring:
                 runs.append({
                     "name": "rhobear-reviews", "head_sha": SHA1,
                     "app": {"id": 12345, "slug": "rhobear-reviews"},
+                    "status": "completed",
                     "conclusion": "success",
                     "output": {"summary":
                                '{"unresolved_critical_high": 0, "coverage": "complete"}'},

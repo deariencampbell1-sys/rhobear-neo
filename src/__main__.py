@@ -19,9 +19,18 @@ from __future__ import annotations
 
 import logging
 import os
-import threading
+import threading as _threading
 import time
+import types
 import concurrent.futures
+
+# W1-13-r2 defect 7 — module-local threading alias: this module builds its
+# wake-recovery thread through THIS `threading` namespace, so tests patch
+# `src.__main__.threading.Thread` without patching the global `threading`
+# module (a global patch would hijack every thread any other fixture or
+# library starts while such a test runs).  Add members here only as this
+# module starts using them.
+threading = types.SimpleNamespace(Thread=_threading.Thread)
 
 from . import config as _config
 from .github_app import github_app_for

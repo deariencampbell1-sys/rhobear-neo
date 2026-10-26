@@ -125,9 +125,33 @@ def merge(
         raise MergeDenied(f"PR is not open (state={state})")
 
     # --- Step 3: Verify evidence supports the merge ------------------------
-    # The caller should have already checked evidence.  We double-check here
-    # as a safety net.
-    if not evidence.get("ok"):
+    # Safety net (W1-13-r1 defect 6): run the SAME merge_authority gate the
+    # rest of Neo uses, so the worker's gate and merge() can never disagree —
+    # any denial surfaces as MergeDenied carrying the gate's reason.  Every
+    # production evidence bundle (build_evidence) carries the gate's decision
+    # fields and is gated in full here.  Evidence carrying NONE of them (the
+    # legacy {"ok", shas} shape contract-pinned in tests/test_merge_authority
+    # for the mechanics of this function) has no findings to consult at this
+    # layer and falls back to the original ok check.
+    from . import review_evidence as _review_ev
+    _gate_fields = ("trusted_producer_ok", "review_sha_match",
+                    "required_checks_pass", "unresolved_critical_high",
+                    "coverage_complete", "auto_merge")
+    if any(k in evidence for k in _gate_fields):
+        granted, reason = _review_ev.merge_authority(evidence)
+        # Belt (W1-13 defect 1): `ok` is checked HERE, in front of the gate —
+        # `not ok or not granted` denies.  merge_authority subsumes `ok`
+        # (its first condition denies an ok=False bundle), so the gate branch
+        # is transitively closed today; the belt stays because `ok` encodes
+        # evidence completeness the six gate fields do not ("evidence
+        # retrieval partially failed but the fetched fields look green"), and
+        # the merge path must fail closed on it even if the gate's answer ever
+        # drifts.  A gate that grants must never override ok=False.
+        if not evidence.get("ok"):
+            raise MergeDenied(f"evidence unavailable ({evidence.get('reason', 'unknown')})")
+        if not granted:
+            raise MergeDenied(f"merge authority denied: {reason}")
+    elif not evidence.get("ok"):
         raise MergeDenied(f"evidence unavailable ({evidence.get('reason', 'unknown')})")
 
     # --- Step 4: Execute the merge -----------------------------------------

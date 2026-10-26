@@ -168,6 +168,7 @@ def _check_run(sha: str, app_id: str = TRUSTED_APP, summary: str | None = None,
         "name": "rhobear-reviews",
         "head_sha": sha,
         "app": {"id": app_id, "slug": "rhobear-reviews"},
+        "status": "completed",
         "conclusion": conclusion,
         "output": {"summary": summary},
     }

@@ -633,13 +633,14 @@ def serve(
     advisor_queue_max: int = 3,
     advisor_timeout: int = 1200,
     origin_url: str | None = None,
-    enabled: bool = True,
+    enabled: bool = False,
 ) -> None:
     """Start the advisor HTTP server (ThreadingHTTPServer + AdvisorService).
 
-    `enabled=False` serves with the advise path CLOSED (main()'s fail-closed
-    default): the service still answers, but no request can reach the
-    advisor machinery."""
+    Fails closed: `enabled` defaults to False and serves with the advise path
+    CLOSED — no AdvisorService is attached and no request can reach the
+    advisor machinery.  Only main() (NEO_ADVISOR_ENABLED=1) or an explicit
+    `enabled=True` opens it; the advisor path is never entered implicitly."""
     server = ThreadingHTTPServer((bind_host, bind_port), AdvisorRequestHandler)
     server.advisor_token = advisor_token
     server.advisor_enabled = enabled
