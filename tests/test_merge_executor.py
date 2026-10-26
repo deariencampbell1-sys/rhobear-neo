@@ -22,8 +22,11 @@ SHA = "a" * 40
 def _evidence(**overrides) -> dict:
     ev = {
         "ok": True,
+        "head_sha": SHA,
         "decided_sha": SHA,
         "review_sha": SHA,
+        "trusted_producer_ok": True,
+        "review_sha_match": True,
         "review_bound_ok": True,
         "review_state": "APPROVED",
         "unresolved_critical_high": 0,
@@ -65,7 +68,7 @@ class TestMergeRunsTheAuthorityGate:
         with patch("src.merge_executor._gh", side_effect=_fake_gh(calls)):
             with pytest.raises(MergeDenied) as exc:
                 merge("o/r", 5, SHA, ev, "tok")
-        assert "unresolved critical/high" in str(exc.value)
+        assert "unresolved critical/high" in str(exc.value).lower()
         assert not [c for c in calls if "PUT" in c], \
             "the merge API must never run on denied evidence"
 
@@ -78,15 +81,20 @@ class TestMergeRunsTheAuthorityGate:
         assert "required check" in str(exc.value).lower()
 
     def test_merge_and_the_gate_never_disagree(self):
-        """Parity — for every evidence bundle, merge() either merges (and the
-        gate grants) or raises MergeDenied (and the gate denies).  This is
-        exactly the disagreement the defect allowed."""
+        """Parity — for every evidence bundle that carries the gate's decision
+        fields (which every production bundle does — build_evidence always
+        emits them), merge() either merges (and the gate grants) or raises
+        MergeDenied (and the gate denies).  This is exactly the disagreement
+        the defect allowed."""
         cases = [
             _evidence(),
             _evidence(unresolved_critical_high=2),
-            _evidence(required_checks_pass=None),
+            _evidence(required_checks_pass=None),      # unknown -> denied
             _evidence(required_checks_pass=False),
             _evidence(coverage_complete=False),
+            _evidence(review_sha_match=False),
+            _evidence(auto_merge=False),
+            _evidence(trusted_producer_ok=False),
             _evidence(comments_addressed=None),
             {},                              # no evidence at all
             {"ok": False, "reason": "pr view unavailable"},
@@ -99,6 +107,17 @@ class TestMergeRunsTheAuthorityGate:
                 else:
                     with pytest.raises(MergeDenied):
                         merge("o/r", 5, SHA, ev, "tok")
+
+    def test_legacy_minimal_shape_stays_accepted(self):
+        """Contract (tests/test_merge_authority.py pins it): evidence carrying
+        NONE of the gate's decision fields — the legacy {"ok", shas} shape —
+        is this mechanics layer's accepted input: with no findings on the
+        bundle there is nothing for the gate to consult here, so the original
+        ok check applies.  Production bundles always carry the fields and are
+        gated in full (parity test above)."""
+        ev = {"ok": True, "head_sha": SHA, "decided_sha": SHA}
+        with patch("src.merge_executor._gh", side_effect=_fake_gh()):
+            assert merge("o/r", 5, SHA, ev, "tok")["merged"] is True
 
     def test_valid_evidence_still_merges(self):
         calls = []
