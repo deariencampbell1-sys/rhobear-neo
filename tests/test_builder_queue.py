@@ -84,3 +84,41 @@ def test_dry_run_names_the_lane_skip(monkeypatch, caplog):
     dry = [r.getMessage() for r in caplog.records if r.getMessage().startswith("dry-run:")]
     assert any("would SKIP (lane branch)" in m and "l8b/mask-fix" in m for m in dry), dry
     assert any("would dispatch" in m and "other/topic" in m for m in dry), dry
+
+def test_lane_detection_parses_the_real_pr_state_shape():
+    """Defect 8 (MEDIUM): the lane skip parsed pr_state's LAST tab field — a
+    contract only the mocks asserted, so a format change silently disabled
+    the skip and Builder started pushing to lane branches.  Parse with the
+    documented delimiter + a length check, on the REAL return shape pr_state
+    produces (captured through its own gh call — not a hand-rolled string)."""
+    from src.neo_builder import parse_pr_state, is_lane_branch
+
+    def fake_gh(token, *args, **kw):
+        # Exactly what GitHub returns for pr_state's jq "[.state, .head.ref] | @tsv".
+        return 0, "OPEN\tl8b/mask-fix\n"
+
+    with mock.patch.object(neo_builder, "gh", side_effect=fake_gh):
+        captured = neo_builder.pr_state("tok", "acme/a", 5)
+    parsed = parse_pr_state(captured)
+    assert parsed is not None, captured
+    state, head_ref = parsed
+    assert (state, head_ref) == ("OPEN", "l8b/mask-fix"), parsed
+    assert is_lane_branch(head_ref)
+
+
+def test_a_changed_pr_state_shape_never_silently_disables_the_lane_skip():
+    """A pr_state line whose shape is no longer "<state> TAB <head ref>" is
+    UNPARSEABLE: the job stays running (fail closed) and no worktree is ever
+    prepared — Builder must never take a lane branch because the delimiter or
+    the field count changed."""
+    jobs = mock.MagicMock()
+    row = {"id": 9, "repo": "acme/a", "pr_number": 5, "head_sha": SHA,
+           "builder_round": 1, "attempt": 1, "worker_token": "w1", "payload": {}}
+    for drifted in ("state=OPEN head=l8b/mask-fix",
+                    "OPEN\tl8b/mask-fix\textra"):
+        with mock.patch.object(neo_builder, "repo_token", return_value="tok"), \
+             mock.patch.object(neo_builder, "pr_state", return_value=drifted), \
+             mock.patch.object(neo_builder, "prepare_worktree") as prep:
+            neo_builder.dispatch_one(Config(), jobs, row)
+        prep.assert_not_called()
+        jobs.resolve.assert_not_called()   # stays running — never a silent dispatch
