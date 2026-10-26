@@ -219,3 +219,35 @@ class TestEmptyRollupFailsClosed:
         ])
         assert ev["unresolved_critical_high"] is None
         assert granted is False
+
+
+# ---------------------------------------------------------------------------
+# W1-13-r2 defect 10 — run selection must deny, never raise, and order real
+# instants
+# ---------------------------------------------------------------------------
+
+class TestTrustedRunSelectionIsRobust:
+    def test_malformed_id_denies_rather_than_raising(self):
+        """A non-numeric run `id` must never turn the evidence path into a
+        ValueError: the newest (failing) run still decides and the answer is a
+        denial."""
+        ev, (granted, reason) = _authority([
+            _run(status="completed", conclusion="success",
+                 completed_at="2026-10-25T20:00:00Z", run_id=1),
+            _run(status="completed", conclusion="failure",
+                 completed_at="2026-10-25T22:00:00Z", run_id="not-a-number"),
+        ])
+        assert granted is False
+
+    def test_z_and_offset_timestamps_order_by_instant(self):
+        """Mixed `Z` / `+00:00` completed_at values order by INSTANT (then
+        id) — string comparison sees '+' < 'Z' and calls the +00:00 run older
+        than a Z run at the same instant, picking the wrong newest."""
+        old = _run(summary='{"unresolved_critical_high": 0, "coverage": "complete"}',
+                   completed_at="2026-10-25T22:00:00Z", run_id=1)
+        new = _run(summary='{"unresolved_critical_high": 2, "coverage": "complete"}',
+                   completed_at="2026-10-25T22:00:00+00:00", run_id=2)
+        for listing in ([old, new], [new, old]):
+            ev, (granted, reason) = _authority(listing)
+            assert ev["unresolved_critical_high"] == 2, listing
+            assert granted is False
