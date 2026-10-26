@@ -278,3 +278,36 @@ def test_serve_explicitly_enabled_attaches_the_service():
     assert srv.advisor_service is not None
     assert getattr(srv, "advisor_enabled", False) is True
     assert len(_RecordingService.instances) == 1
+
+
+# ---------------------------------------------------------------------------
+# W1-13-r2 Defect 3 — main() is the ONLY opener, and only via the env var
+# ---------------------------------------------------------------------------
+
+class TestMainOpensOnlyViaTheEnvVar:
+    """serve()'s fail-closed default (enabled=False) is a production behaviour
+    change UNLESS main() is proven to be the only opener and to pass
+    `enabled=` explicitly from NEO_ADVISOR_ENABLED: set to 1 ->
+    serve(enabled=True); unset -> serve(enabled=False)."""
+
+    def _drive(self, monkeypatch):
+        import advisor.server as advisor_server
+        monkeypatch.delenv("NEO_ADVISOR_BIND_HOST", raising=False)
+        monkeypatch.delenv("NEO_ADVISOR_BIND_PORT", raising=False)
+        calls = []
+        monkeypatch.setattr(advisor_server, "serve",
+                            lambda **kw: calls.append(kw))
+        advisor_server.main()
+        return calls
+
+    def test_env_set_reaches_serve_enabled_true(self, monkeypatch):
+        monkeypatch.setenv("NEO_ADVISOR_ENABLED", "1")
+        monkeypatch.setenv("NEO_ADVISOR_TOKEN", "tok")
+        calls = self._drive(monkeypatch)
+        assert [kw["enabled"] for kw in calls] == [True]
+
+    def test_env_unset_reaches_serve_enabled_false(self, monkeypatch):
+        monkeypatch.delenv("NEO_ADVISOR_ENABLED", raising=False)
+        monkeypatch.delenv("NEO_ADVISOR_TOKEN", raising=False)
+        calls = self._drive(monkeypatch)
+        assert [kw["enabled"] for kw in calls] == [False]
