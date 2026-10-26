@@ -1002,7 +1002,8 @@ class TestRoundCapAtClaim:
         cfg.deepseek_timeout = 30
         jobs = MagicMock(spec=Jobs)
         over_cap = {"id": 10, "repo": "o/r", "pr_number": 5,
-                    "head_sha": "a" * 40, "builder_round": 3, "attempt": 3}
+                    "head_sha": "a" * 40, "builder_round": 3, "attempt": 3,
+                    "worker_token": "wtok"}
         jobs.claim_queued.side_effect = [over_cap, None]
         jobs.recover_expired.return_value = []
         monkeypatch.setattr(builder, "Config", lambda: cfg)
@@ -1012,8 +1013,27 @@ class TestRoundCapAtClaim:
         with caplog.at_level(logging.INFO):
             builder.main()
         jobs.park.assert_any_call(
-            10, reason="max builder rounds (2) reached (round 3)")
+            10, worker_token="wtok",
+            reason="max builder rounds (2) reached (round 3)")
         assert jobs.claim_queued.call_count == 2  # over-cap row + empty
+        assert not jobs.resolve.called
+
+    def test_dispatch_one_round_cap_park_presents_the_claim_token(self):
+        """dispatch_one's own round-cap gate parks the row it was claimed with:
+        the park presents the claimant's worker_token (the same token
+        claim_queued minted) and the "reached" reason.  A bare park() refuses
+        the row's LIVE lease and the round sits running until lease expiry."""
+        import src.neo_builder as builder
+        cfg = MagicMock()
+        cfg.max_builder_rounds = 2
+        jobs = MagicMock(spec=Jobs)
+        row = {"id": 10, "repo": "o/r", "pr_number": 5, "head_sha": "a" * 40,
+               "builder_round": 3, "attempt": 3, "worker_token": "wtok",
+               "payload": "{}"}
+        builder.dispatch_one(cfg, jobs, row)
+        jobs.park.assert_called_once()
+        assert jobs.park.call_args.kwargs["worker_token"] == "wtok"
+        assert "reached" in jobs.park.call_args.kwargs["reason"]
         assert not jobs.resolve.called
 
     def test_main_never_dispatches_second_round_of_inflight_pr(self, monkeypatch, caplog):

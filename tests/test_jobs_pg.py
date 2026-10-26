@@ -433,6 +433,38 @@ class TestNewestWins:
 
 
 # ---------------------------------------------------------------------------
+# W1-13-r2 defect 2 — the round cap must park on the row's OWN claim token
+# ---------------------------------------------------------------------------
+
+class TestRoundCapParksOnALiveLease:
+    def test_round_capped_job_parks_with_its_claim_token_before_lease_expiry(self, db):
+        """A round-capped builder job parks IMMEDIATELY with the "reached"
+        reason and the claimant's own worker_token — while its lease is still
+        LIVE (claimed with 600s, no lease expiry involved).  A bare park()
+        refuses a row under a live lease, so without the token the round would
+        sit `running` until lease recovery and park much later with the
+        misleading "lease expired N/N times" reason."""
+        from src.neo_builder import dispatch_one
+        cfg = _cfg()
+        cfg.max_builder_rounds = 2
+        row_id = db.create_builder("o/r", 5, SHA1, 3)   # round 3 > cap 2
+        row = db.claim_queued("builder", lease_secs=600)
+        assert row is not None and row["id"] == row_id
+        assert row["worker_token"], "claim must mint a worker_token"
+        with psycopg.connect(DSN, autocommit=True) as c:
+            live = c.execute(
+                "SELECT lease_expires > now() FROM neo_jobs WHERE id=%s",
+                (row_id,)).fetchone()[0]
+        assert live is True, "the lease must be live when the cap fires"
+        dispatch_one(cfg, db, row)   # parks before any GitHub call
+        out = db.get(row_id)
+        assert out["state"] == "done" and out["outcome"] == "parked"
+        reason = (out.get("payload") or {}).get("reason", "")
+        assert "reached" in reason, reason
+        assert "lease expired" not in reason, reason
+
+
+# ---------------------------------------------------------------------------
 # G-8  transient failure leaves the job running; lease recovery re-queues it
 # ---------------------------------------------------------------------------
 
