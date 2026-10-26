@@ -155,7 +155,175 @@ def _is_trusted(context: str, trusted: tuple[str, ...]) -> bool:
     return any(context == c or context.startswith(c) for c in trusted)
 
 
-def _review_evidence(token: str, cfg: Config, repo: str, pr: int, sha: str) -> dict:
+# --- W1-07-r1: the two greens on ONE head SHA (the merge rule (b)-(d)) -----
+# Board `merge-authority` v7 / `trusted` / `verdicts`:
+#   green 1: Apollo ACCEPT on the head commit — always required; a commit
+#            status or check-run success is never enough and COMMENTED is not
+#            approval;
+#   green 2: the repo's own merge authority — the architect's approval bound
+#            to the exact head, OR an enabled trusted reviewer's green.
+#            Either one counts;
+#   a trusted reviewer that is red (or requesting changes) always blocks.
+# Every fact below is bound to the head SHA: any new push resets both greens.
+
+ARCHITECT_ALWAYS_REPOS = (
+    "deariencampbell1-sys/rhobear-reviews-app",
+    "deariencampbell1-sys/rhobear-neo",
+    "deariencampbell1-sys/rhobear-verifier",
+)
+"""The three lane repos where the architect source is always on (the board:
+'on other repos only when that install has it on')."""
+
+
+def _review_oid(r: dict) -> str:
+    return str((r.get("commit") or {}).get("oid")
+               or r.get("commit_id") or r.get("commitId") or "")
+
+
+def _review_author(r: dict) -> str:
+    return str((r.get("author") or {}).get("login") or r.get("author_login") or "")
+
+
+def _green_fields(cfg: Config, repo: str, sha: str, reviews: list, statuses: list,
+                  rollup: list, enabled_sources: tuple = ()) -> dict:
+    """The two greens + the trusted red for ONE head SHA. Fails closed.
+
+    green 1 is Apollo's review state on `sha` (the newest one wins); green 2 is
+    the architect's success status on `sha` from the owner's account, or the
+    newest signal of any ENABLED trusted reviewer on `sha` (their status,
+    check run, or review — counted once per reviewer).  A reviewer on no
+    trusted list (including the PR author) is ignored entirely.
+    """
+    from . import trusted_reviewers as tr
+    from .webhook_server import is_architect_context
+
+    owner = repo.split("/", 1)[0]
+    owner_logins = {owner.lower(),
+                    str(getattr(cfg, "owner_install_id", "") or "").lower(),
+                    DEFAULT_OWNER_INSTALL_ID.lower()}
+    contexts = _trusted_contexts(cfg)
+    apollo = contexts[0] if contexts else ""
+    out: dict = {"trusted_red": [], "trusted_seen": []}
+
+    # --- green 1: Apollo ACCEPT on this exact head (always required) -------
+    chosen = None
+    for r in reviews or []:                       # oldest first — newest wins
+        if _review_oid(r) != sha:                 # bound to this head only
+            continue
+        author = _review_author(r)
+        if author and not tr.source_matches(apollo, author):
+            continue                              # any other account is ignored
+        chosen = r
+    if chosen is None:
+        out.update(green1_ok=False, green1_reason="no review by Apollo on this exact head",
+                   green1_label="Apollo ACCEPT", green1_url="", green1_at="")
+    else:
+        state = str(chosen.get("state") or "").upper()
+        accepted = state in ("ACCEPT", "APPROVED")
+        out.update(green1_ok=accepted,
+                   green1_reason="" if accepted else (state or "no verdict state"),
+                   green1_label="Apollo ACCEPT",
+                   green1_url=str(chosen.get("html_url") or ""),
+                   green1_at=str(chosen.get("submitted_at") or ""))
+
+    # --- green 2a: the architect's approval on this exact head -------------
+    arch = next((s for s in (statuses or [])
+                 if is_architect_context(str(s.get("context") or ""))), None)
+    architect_on = repo in ARCHITECT_ALWAYS_REPOS or any(
+        str(src or "").strip().lower().startswith("architect")
+        for src in enabled_sources)
+    if (architect_on and arch is not None
+            and str(arch.get("state") or "").lower() == "success"
+            and str((arch.get("creator") or {}).get("login") or "").lower() in owner_logins):
+        out.update(green2_ok=True, green2_kind="architect",
+                   green2_label="Zeus ACCEPT",
+                   green2_url=str(arch.get("target_url") or ""),
+                   green2_at=str(arch.get("created_at") or ""), green2_reason="")
+
+    # --- green 2b: an enabled trusted reviewer's green (either counts) -----
+    if not out.get("green2_ok"):
+        for src in enabled_sources:
+            st = next((s for s in (statuses or [])
+                       if tr.source_matches(src, str(s.get("context") or ""))), None)
+            rv = next((r for r in reversed(reviews or [])
+                       if _review_oid(r) == sha and _review_author(r)
+                       and tr.source_matches(src, _review_author(r))), None)
+            ck = next((c for c in (rollup or [])
+                       if tr.source_matches(src, str(c.get("context") or c.get("name") or ""))), None)
+            signals = []
+            if st is not None:
+                signals.append((str(st.get("context") or ""),
+                                str(st.get("state") or "").lower(), "status",
+                                st.get("target_url") or "", st.get("created_at") or ""))
+            if ck is not None:
+                signals.append((str(ck.get("context") or ck.get("name") or ""),
+                                str(ck.get("conclusion") or ck.get("state") or "").lower(),
+                                "check", ck.get("detailsUrl") or "",
+                                ck.get("completedAt") or ck.get("createdAt") or ""))
+            if rv is not None:
+                signals.append((_review_author(rv), str(rv.get("state") or "").lower(),
+                                "review", rv.get("html_url") or "",
+                                rv.get("submitted_at") or ""))
+            if not signals:
+                continue
+            # Red stands (a REQUEST CHANGES or a failing run blocks until it is
+            # re-run); the newest status of a context decides (defect 3).
+            red = [s for s in signals
+                   if s[1] in ("failure", "error", "cancelled", "timed_out",
+                               "changes_requested", "request_changes", "changes request")]
+            green = [s for s in signals if s[1] in ("success", "accept", "accepted", "approved")]
+            pick = red[0] if red else (green[0] if green else signals[0])
+            out["trusted_seen"].append({"source": src, "match": pick[0],
+                                        "state": pick[1], "login": pick[0]})
+            if red:
+                label, state = red[0][0], red[0][1]
+                out["trusted_red"].append(
+                    f"{label} (" + ("requested changes" if "changes" in state or
+                                   "request" in state else state) + ")")
+            elif green:
+                match, _, kind, url, at = green[0]
+                word = "accepted" if kind == "review" else "passed"
+                out.update(green2_ok=True, green2_kind="trusted",
+                           green2_label=f"{match} {word} (trusted)",
+                           green2_url=str(url or ""), green2_at=str(at or ""),
+                           green2_reason="")
+                break
+
+    if not out.get("green2_ok"):
+        out.update(green2_ok=False, green2_kind="", green2_label="", green2_url="",
+                   green2_at="", green2_reason=(
+                       "no architect approval (architect/* status success set from the "
+                       "owner's account) on this exact head and no enabled trusted "
+                       "reviewer green on this exact head"))
+
+    # --- CI summary for the merge comment (one source: GitHub's rollup) ----
+    out["ci_total"] = len(rollup or [])
+    out["ci_green"] = sum(1 for c in (rollup or [])
+                          if str(c.get("conclusion") or "").upper() in ("SUCCESS", "NEUTRAL")
+                          or str(c.get("state") or "").upper() == "SUCCESS")
+    return out
+
+
+def _enabled_reviewers(cfg: Config, state, repo: str) -> tuple[str, ...]:
+    """The customer's enabled trusted reviewers for this repo.
+
+    Reads the trusted_reviewers table through the state's DSN (install-scoped;
+    a repo-exact row overrides the '*' wildcard).  Fail closed: a database
+    that cannot be read means no outside reviewer counts (green 2 then needs
+    the architect)."""
+    dsn = getattr(state, "dsn", "")
+    if not isinstance(dsn, str) or not dsn:
+        return ()
+    try:
+        from . import trusted_reviewers
+        return trusted_reviewers.enabled_sources(dsn, repo.split("/", 1)[0], repo)
+    except Exception:  # noqa: BLE001 — fail closed, never strand the wake
+        log.exception("trusted_reviewers read failed — no outside reviewer counts")
+        return ()
+
+
+def _review_evidence(token: str, cfg: Config, repo: str, pr: int, sha: str,
+                     enabled_sources: tuple = ()) -> dict:
     """Machine-readable review evidence bound to ONE commit, not to the PR.
 
     A result produced for commit A may authorize only commit A.  The trusted
@@ -225,10 +393,12 @@ def _review_evidence(token: str, cfg: Config, repo: str, pr: int, sha: str) -> d
     # The reviewer's gate, read straight off the commit (context-based legacy).
     trusted = _trusted_contexts(cfg)
     trusted_states: list[str] = []
+    statuses: list = []
     try:
         rc, raw_status = _gh(token, "api", f"repos/{repo}/commits/{sha}/status", timeout=30)
         if rc == 0:
-            for item in (json.loads(raw_status).get("statuses") or []):
+            statuses = json.loads(raw_status).get("statuses") or []
+        for item in statuses:
                 if _is_trusted(str(item.get("context") or ""), trusted):
                     trusted_states.append(str(item.get("state") or "").lower())
     except Exception as exc:  # noqa: BLE001
@@ -261,6 +431,8 @@ def _review_evidence(token: str, cfg: Config, repo: str, pr: int, sha: str) -> d
     ev["rollup_green"] = all_success
     ev["head_ref"] = head_ref
     ev["reviews"] = reviews
+    # W1-07-r1: the two greens + trusted red for this exact head (the merge rule).
+    ev.update(_green_fields(cfg, repo, sha, reviews, statuses, rollup, enabled_sources))
     return ev
 
 
@@ -299,6 +471,15 @@ def merge_authority(install_auto_merge: bool, evidence: dict,
         return False, "head moved since the wake — stale evidence cannot authorize this SHA"
     if not evidence.get("review_bound_ok", True):
         return False, "the reviewed commit is not this head SHA"
+    # The merge rule (b)-(d): two greens on this exact head and no trusted
+    # reviewer red (board `merge-authority` v7).  Presence-gated like the
+    # W1-13 belt above: a bundle without the keys is older/patched evidence
+    # and keeps the legacy behaviour; production evidence always carries them.
+    if "green1_ok" in evidence or "green2_ok" in evidence or "trusted_red" in evidence:
+        from . import merge_executor as _merge_executor
+        ok, why = _merge_executor.two_green_gate(evidence)
+        if not ok:
+            return False, why
     if not evidence.get("trusted_green"):
         return False, "the trusted review status is not success on this exact head SHA"
     # Trusted producer = the Reviews App's check run on this exact head
@@ -643,7 +824,8 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict,
     install_auto_merge = resolve_auto_merge(inst.get("auto_merge"), cfg)
 
     # --- exact-SHA evidence (Phase A) --------------------------------------
-    evidence = _review_evidence(token, cfg, repo, pr, sha)
+    evidence = _review_evidence(token, cfg, repo, pr, sha,
+                                enabled_sources=_enabled_reviewers(cfg, state, repo))
     if evidence.get("ok") and evidence.get("head_sha") and evidence["head_sha"] != sha:
         state.record(repo, pr, sha, "stale_head", verdict="STALE",
                      detail={"context": wake.get("context"),
@@ -773,7 +955,19 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict,
             "coverage_complete": evidence.get("coverage_complete", False),
             "auto_merge": install_auto_merge,
         }
+        # The two greens travel with the bundle (kept present-only, so older
+        # patched evidence keeps its legacy shape) — merge() re-runs the same
+        # gate on it immediately before the merge API call (W1-07 step 5).
+        for _k in ("green1_ok", "green1_reason", "green1_label", "green1_url",
+                   "green1_at", "green2_ok", "green2_kind", "green2_label",
+                   "green2_url", "green2_at", "green2_reason", "trusted_red",
+                   "trusted_seen", "ci_total", "ci_green"):
+            if _k in evidence:
+                evidence_b2[_k] = evidence[_k]
         granted, reason = rev_ev.merge_authority(evidence_b2)
+        if granted and ("green1_ok" in evidence_b2 or "green2_ok" in evidence_b2):
+            from . import merge_executor as _merge_executor
+            granted, reason = _merge_executor.two_green_gate(evidence_b2)
 
         if granted and auto_merge and verdict_base in ("ACCEPT", "ACCEPT-MERGED"):
             # Call the deterministic merge executor.

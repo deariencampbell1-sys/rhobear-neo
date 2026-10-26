@@ -57,6 +57,56 @@ def _gh(token: str, *args: str, timeout: int = 30) -> tuple[int, str]:
     return p.returncode, (p.stdout or p.stderr).strip()
 
 
+#: W1-07-r1: the two greens + the trusted red (the merge rule (b)-(d)).
+_RULE_FIELDS = ("green1_ok", "green2_ok", "trusted_red")
+
+
+def two_green_gate(evidence: dict) -> tuple[bool, str]:
+    """The merge rule (b)-(d) on the exact head SHA. Fails closed.
+
+    (b) green 1 — Apollo's review state is ACCEPT on this head SHA: a commit
+    status or check-run success is never enough, COMMENTED is not approval;
+    (c) green 2 — the architect's approval bound to this head SHA, or an
+    enabled trusted reviewer's success on it (either counts); (d) no enabled
+    trusted reviewer is failing or requesting changes on it.  Every fact is
+    bound to the head SHA, so any new push resets all three.
+    """
+    problems: list[str] = []
+    if not evidence.get("green1_ok"):
+        problems.append("green 1 missing: Apollo's review is not ACCEPT on this "
+                        "exact head SHA (%s)" % (evidence.get("green1_reason")
+                                                 or "no review by Apollo on this head"))
+    red = [str(x) for x in (evidence.get("trusted_red") or [])]
+    if red:
+        problems.append("a trusted reviewer is red on this exact head: " + ", ".join(red))
+    if not evidence.get("green2_ok"):
+        problems.append("green 2 missing: " + (evidence.get("green2_reason")
+                        or "no architect approval and no enabled trusted reviewer "
+                           "green on this exact head"))
+    return (not problems, "; ".join(problems) or "two greens on this exact head")
+
+
+def two_green_comment(evidence: dict) -> str:
+    """The one merge comment (board `verdicts` 02): the two greens with links
+    and the CI summary — "Two greens on a91d2e0 / 1: Apollo ACCEPT / 2: Zeus
+    ACCEPT / CI: 6 of 6 checks passed" — posted before the merge."""
+    head = str(evidence.get("head_sha") or evidence.get("decided_sha") or "")
+
+    def _line(n: int, label: str, url: str, at: str) -> str:
+        text = f"[{label}]({url})" if url else str(label)
+        when = f" · {str(at)[11:16]}" if at else ""
+        return f"{n}: {text}{when}"
+
+    return "\n".join([
+        f"Two greens on {head[:7]}",
+        _line(1, evidence.get("green1_label") or "Apollo ACCEPT",
+              str(evidence.get("green1_url") or ""), str(evidence.get("green1_at") or "")),
+        _line(2, evidence.get("green2_label") or "architect ACCEPT",
+              str(evidence.get("green2_url") or ""), str(evidence.get("green2_at") or "")),
+        f"CI: {evidence.get('ci_green', 0)} of {evidence.get('ci_total', 0)} checks passed",
+    ])
+
+
 def merge(
     repo: str,
     pr: int,
@@ -153,6 +203,22 @@ def merge(
             raise MergeDenied(f"merge authority denied: {reason}")
     elif not evidence.get("ok"):
         raise MergeDenied(f"evidence unavailable ({evidence.get('reason', 'unknown')})")
+
+    # W1-07-r1 steps 3/5: the two-green merge rule runs AGAIN immediately
+    # before the merge API call (a new push since the wake resets both greens
+    # and is denied here), and the one merge comment (the two greens with
+    # links + the CI summary) is posted first — then the merge.  A bundle
+    # without the rule's fields is the legacy {"ok", shas} mechanics shape
+    # contract-pinned in tests/test_merge_authority: nothing to consult here,
+    # so the W1-13 belt above applies unchanged.
+    if all(k in evidence for k in _RULE_FIELDS):
+        ok, why = two_green_gate(evidence)
+        if not ok:
+            raise MergeDenied(f"merge authority denied: {why}")
+        rc, out = _gh(token, "pr", "comment", str(pr), "-R", repo,
+                      "--body", two_green_comment(evidence), timeout=30)
+        if rc != 0:
+            raise MergeFailed(f"merge comment refused by GitHub: {out[:200]}")
 
     # --- Step 4: Execute the merge -----------------------------------------
     # REST merge API with sha=expected_sha: GitHub rejects with 422 if the
