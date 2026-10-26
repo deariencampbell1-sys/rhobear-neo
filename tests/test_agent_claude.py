@@ -2097,7 +2097,114 @@ def test_capability_name_is_scrubbed_at_the_sink() -> None:
     cfg.deepseek_max_tokens = 32000
     cfg.claude_bin = CLAUDE_BIN
     cfg.routegate_anthropic_url = "http://127.0.0.1:8645"
-    cfg.routegate_model = "--evil -e sh"         # mutated after validate()
+    for poisoned in ("--evil -e sh", "--evil"):  # mutated after validate()
+        cfg.routegate_model = poisoned
+        agent = ClaudeAgent.from_config(cfg, gh_token=GH_TOKEN)
+        assert agent.model == ROUTEGATE_MODEL, poisoned  # scrubbed at sink
 
-    agent = ClaudeAgent.from_config(cfg, gh_token=GH_TOKEN)
-    assert agent.model == ROUTEGATE_MODEL        # scrubbed at the sink
+
+def test_documented_gate_strings_both_work() -> None:
+    """[Apollo r6, HIGH] BOTH forms the docs hand an operator must turn the
+    gate on: the bare base (canonical) AND the `/v1/messages` endpoint form
+    the field comment used — following the documented instruction may never
+    silently disable the feature this PR exists to enable."""
+    for documented in ("http://127.0.0.1:8645",
+                       "http://127.0.0.1:8645/v1/messages"):
+        cfg = Config()
+        cfg.deepseek_base_url = BASE
+        cfg.deepseek_model = MODEL
+        cfg.deepseek_reasoning_effort = "max"
+        cfg.deepseek_max_tokens = 32000
+        cfg.claude_bin = sys.executable
+        cfg.routegate_anthropic_url = documented
+
+        cfg.validate()                     # must KEEP the gate enabled
+        assert cfg.routegate_anthropic_url == "http://127.0.0.1:8645", \
+            documented
+
+        agent = ClaudeAgent.from_config(cfg, gh_token=GH_TOKEN)
+        assert agent.gated, documented
+        assert agent.base_url == "http://127.0.0.1:8645", documented
+        assert agent.base_url + "/v1/messages" == \
+            "http://127.0.0.1:8645/v1/messages", documented
+
+
+def test_guard_error_never_echoes_credentials() -> None:
+    """[Apollo r6, LOW] A rejected URL with userinfo must not print the
+    credential into logs / escalation output."""
+    from src.agent_claude import _require_loopback_roulegate
+
+    with pytest.raises(AgentError) as excinfo:
+        _require_loopback_roulegate("http://user:sup3rs3cret@evil.example/"
+                                    "v1/messages")
+    msg = str(excinfo.value)
+    assert "sup3rs3cret" not in msg
+    assert "user" not in msg
+
+
+def test_malformed_cache_read_is_unknown_and_survives(caplog: Any) -> None:
+    """[Apollo r6, LOW] A non-integer `cache_read_input_tokens` must behave
+    like the estimated_cost branch: WARNING, key absent, run survives — a
+    ValueError escaping `except AgentError` would kill the run handler."""
+    import logging as _logging
+
+    agent = _make_agent()
+    proc = subprocess.CompletedProcess(
+        args=["claude"], returncode=0, stderr="",
+        stdout=json.dumps({
+            "type": "result", "subtype": "success", "is_error": False,
+            "result": "VERDICT: ACCEPT", "num_turns": 1,
+            "stop_reason": "end_turn", "permission_denials": [],
+            "usage": {"input_tokens": 11, "output_tokens": 5,
+                      "cache_read_input_tokens": "four"},
+        }))
+    with caplog.at_level(_logging.WARNING, logger="rhobear_neo.agent"):
+        usage, _verdict = agent._parse_output(proc)   # must not raise
+    assert "cached_input" not in usage
+    assert any("cache_read" in rec.getMessage() for rec in caplog.records)
+
+
+def test_get_attempts_maps_columns_without_pg() -> None:
+    """[Apollo r6, MEDIUM] The row → UsageAttempt column mapping (order-
+    sensitive zip over the cursor description) is exercised without a
+    database, so a misordered/forgotten field cannot ship green just because
+    the PG round-trip test is skipped in the default run."""
+    from src.usage import UsageStore
+
+    cols = ["job_id", "attempt_number", "route_idx", "provider", "model",
+            "uncached_input", "cached_input", "output_tokens",
+            "reasoning_tokens", "latency_ms", "outcome", "error_class",
+            "consumer", "pr_number", "head_sha", "builder_round",
+            "route_name", "cost_usd", "had_gh_token"]
+    row = (7, 1, 0, "routegate", "peak", 11, 4, 5, None, 812, "success", None,
+           "reviews:zeus/987654321", 44, "ab" * 20, 1, "peak", 0.0042, True)
+
+    class FakeCursor:
+        description = [(c,) for c in cols]
+
+        def fetchall(self):
+            return [row]
+
+    class FakeConn:
+        def execute(self, *args, **kwargs):
+            return FakeCursor()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    store = UsageStore("postgresql://never-used")
+    with patch.object(type(store), "_conn",
+                      lambda self: FakeConn()):
+        attempts = store.get_attempts(7)
+    attempt, = attempts
+    assert attempt.consumer == "reviews:zeus/987654321"
+    assert attempt.pr_number == 44
+    assert attempt.head_sha == "ab" * 20
+    assert attempt.builder_round == 1
+    assert attempt.route_name == "peak"
+    assert attempt.cost_usd == 0.0042
+    assert attempt.had_gh_token is True
+    assert attempt.total_input() == 15
