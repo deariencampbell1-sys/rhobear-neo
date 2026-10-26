@@ -235,3 +235,17 @@ def test_drift_status_wakes_the_lane_gate_but_never_the_agent():
     agent.assert_not_called()
     assert not any(c[:2] == ("pr", "merge") for c in calls)
     assert state.rows == []
+
+
+def test_review_bound_is_required_by_the_lane_gate():
+    """Defect 1: the gate's conditions dropped review_bound_ok — an ACCEPT on
+    an older commit passed the lane gate and merged. The reviewed commit must
+    be this head SHA, and the hold names it."""
+    state, calls = run([architect()], evidence_dict=evidence(review_bound_ok=False))
+    assert not any(c[:2] == ("pr", "merge") for c in calls)
+    assert state.rows[-1][3] == "lane_hold"
+    assert "reviewed commit" in state.rows[-1][5]["reason"]
+    # The same evidence, bound to the head, merges.
+    state, calls = run([architect()], evidence_dict=evidence(review_bound_ok=True))
+    assert any(c[:2] == ("pr", "merge") for c in calls)
+    assert state.rows[-1][3] == "merged"
