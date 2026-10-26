@@ -1589,3 +1589,52 @@ def test_validate_rejects_foreign_routegate_url() -> None:
     offbox.routegate_anthropic_url = "https://elsewhere.example/v1/messages"
     with pytest.raises(ValueError, match="routegate_anthropic_url"):
         offbox.validate()
+
+
+def test_roulegate_refuses_foreign_url() -> None:
+    """[Apollo HIGH/MEDIUM] The loopback guard is a security path: a
+    routegate_anthropic_url that is not the loopback gate must be refused
+    BOTH by from_config and by run_with_chain, so a cfg mutated after
+    validate() can never carry a brief off-box."""
+    cfg = Config()
+    cfg.deepseek_base_url = BASE
+    cfg.deepseek_model = MODEL
+    cfg.deepseek_reasoning_effort = "max"
+    cfg.deepseek_max_tokens = 32000
+    cfg.claude_bin = CLAUDE_BIN
+    cfg.routegate_anthropic_url = "https://evil.example/v1/messages"
+
+    with pytest.raises(AgentError, match="loopback"):
+        ClaudeAgent.from_config(cfg, gh_token=GH_TOKEN)
+
+    agent = _make_agent()
+    with pytest.raises(AgentError, match="loopback"):
+        agent.run_with_chain(
+            _zeus_brief(), [], cfg, GH_TOKEN,
+            usage_store=_FakeUsageStore(), job_id=1,
+        )
+
+
+def test_consumer_header_rejects_bad_install_id() -> None:
+    """[Apollo MEDIUM] The consumer embeds an install id that reaches a
+    header env var: a value with newlines/CRLF must never get there."""
+    cfg = Config()
+    cfg.deepseek_base_url = BASE
+    cfg.deepseek_model = MODEL
+    cfg.deepseek_reasoning_effort = "max"
+    cfg.deepseek_max_tokens = 32000
+    cfg.claude_bin = CLAUDE_BIN
+
+    bad = ClaudeAgent.from_config(
+        cfg, gh_token=GH_TOKEN, install_id="123\r\nX-Injected: 1")
+    assert bad.consumer == "reviews:zeus"
+    env = bad._build_env(str(tmp_env_dir := os.path.join(tempfile.gettempdir(),
+                                                          "neo-cfg-test")))
+    assert "\n" not in env["ANTHROPIC_CUSTOM_HEADERS"]
+    assert "\r" not in env["ANTHROPIC_CUSTOM_HEADERS"]
+
+    # A real install id still qualifies the consumer (L0's consumer shape).
+    good = ClaudeAgent.from_config(cfg, gh_token=GH_TOKEN, install_id="987654321")
+    assert good.consumer == "reviews:zeus/987654321"
+    assert good._build_env(str(tmp_env_dir))["X_RHOBEAR_CONSUMER"] == \
+        "reviews:zeus/987654321"

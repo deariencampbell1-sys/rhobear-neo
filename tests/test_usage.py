@@ -992,3 +992,68 @@ def test_attempt_consumer_carries_install_id(store):
     assert with_install.consumer == "reviews:zeus/987654321"
     # An already-qualified consumer is explicit — never rewritten.
     assert bare.consumer == "reviews:zeus/42"
+
+
+def test_brief_target_reads_the_real_brief():
+    """[Apollo MEDIUM] The target must come from a REAL brief, not a shape
+    the test invented: parse neo_protocol.build_brief's own output."""
+    from src.neo_protocol import build_brief
+    from src.usage import brief_target
+
+    head = "3c9e1aa" + "b" * 33
+    brief = build_brief(
+        repo="acme/widget", pr=44, head_sha=head,
+        reviewer_context="rhobear-reviews", reviewer_green=True,
+        auto_merge=False, builder_round=2, max_builder_rounds=5,
+        builder_model="glm-5.3-flash",
+    )
+    target = brief_target(brief)
+    assert target.pr_number == 44
+    assert target.head_sha == head          # full 40-hex, from the canon
+    assert target.builder_round == 2
+
+
+@requires_pg
+def test_attempt_target_prefers_job_row(store):
+    """[Apollo MEDIUM] The job row is authoritative: a brief-parsed target
+    never overrides the structured PR / head SHA / round of the job."""
+    import psycopg as _psycopg
+
+    with _psycopg.connect(DSN, autocommit=True) as c:
+        job_id = c.execute(
+            "INSERT INTO neo_jobs(kind, repo, pr_number, head_sha, "
+            "builder_round, payload) VALUES ('builder', 'acme/widget', 7, %s, "
+            "3, '{}') RETURNING id",
+            ("cd" * 40,),
+        ).fetchone()[0]
+
+    store.record_attempt(UsageAttempt(
+        job_id=job_id, attempt_number=1, route_idx=0,
+        provider="deepseek", model="deepseek-v4-flash",
+        outcome="success",
+        # brief-parse disagrees with the job row — the job row must win
+        pr_number=99, head_sha="ee" * 20, builder_round=0,
+    ))
+    row = store.get_attempts(job_id)[0]
+    assert row.pr_number == 7
+    assert row.head_sha == "cd" * 40
+    assert row.builder_round == 3
+
+
+def test_one_classifier_family_import_smoke():
+    """[Apollo LOW] The classifier moved to src.usage: every lane module must
+    still import, and no agent module may keep a second copy of the anchors."""
+    import importlib
+    import pkgutil
+
+    import src
+    import src.agent_claude as agent_mod
+
+    for mod in pkgutil.iter_modules(src.__path__):
+        importlib.import_module(f"src.{mod.name}")
+
+    assert not hasattr(agent_mod, "_status_code_from")
+    assert not hasattr(agent_mod, "_STATUS_CODE")
+    from src.usage import classify_error_text, status_code_from
+    assert callable(classify_error_text)
+    assert status_code_from("HTTP/1.1 503 down") == 503
