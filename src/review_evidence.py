@@ -108,7 +108,8 @@ def build_evidence(
       - trusted_producer_ok: bool — a check run from the Reviews App on this
         exact head SHA exists
       - review_sha_match: bool — full 40-char head equality
-      - required_checks_pass: bool — all branch-protection checks success
+      - required_checks_pass: bool | None — all branch-protection checks
+        success; None when there is no rollup data at all (unknown, denied)
       - unresolved_critical_high: int | None — from the trusted run's output
         (None when missing → denied)
       - coverage_complete: bool — output coverage == "complete"
@@ -155,7 +156,9 @@ def build_evidence(
         in {"FAILURE", "TIMED_OUT", "CANCELLED", "ERROR"}
         or str(c.get("state") or "").upper() in {"FAILURE", "ERROR"}
     ]
-    required_pass = len(failing_required) == 0
+    # Fail closed: an empty rollup is NO data (unknown -> None, matching
+    # merge_authority's treatment of unknown findings), never a pass.
+    required_pass = (len(failing_required) == 0) if rollup else None
 
     # --- Installation auto_merge (nullable inheritance) --------------------
     inst_auto_merge_raw = pr_data.get("installation_auto_merge")
