@@ -275,3 +275,26 @@ def test_architect_prefix_match_is_case_insensitive():
     assert d.dispatch("status", {**payload, "context": "ci/random"}).code == 204
     assert webhook_server.is_architect_context("Architect/L3-Kit")
     assert webhook_server.is_drift_context("L0/DRIFT")
+
+
+def test_lane_gate_fails_closed_with_a_lane_hold_when_the_evidence_read_breaks():
+    """Edge 5: if the evidence read itself raises (broken gh, an arity slip),
+    the lane gate must fail closed — a lane_hold naming the break — never
+    merge, and never let the error escape and kill the lane wake."""
+    state = FakeState()
+    gh, calls = fake_gh([architect()])
+    cfg = dataclasses.replace(Config(), lane_merge=True)
+    ev = evidence()
+    with mock.patch.object(neo_worker, "_gh", gh), \
+         mock.patch.object(neo_worker, "repo_token", return_value="tok"), \
+         mock.patch.object(neo_worker, "resolve_pr", return_value=51), \
+         mock.patch.object(neo_worker, "_review_evidence",
+                           side_effect=[ev, TypeError("got an unexpected keyword")]), \
+         mock.patch.object(neo_worker.ClaudeAgent, "from_config") as agent:
+        neo_worker.run_neo(cfg, state, mock.MagicMock(),
+                           {"job_id": 1, "repo": REPO, "sha": HEAD, "green": True,
+                            "context": "rhobear-reviews"})
+    agent.assert_not_called()
+    assert not any(c[:2] == ("pr", "merge") for c in calls)
+    assert state.rows[-1][3] == "lane_hold"
+    assert "evidence" in state.rows[-1][5]["reason"]
