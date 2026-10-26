@@ -1550,21 +1550,29 @@ def test_from_config_without_gh_token(caplog: Any) -> None:
 
 
 def test_neo_max_builder_rounds_default_is_2() -> None:
-    """The SOURCE default for NEO_MAX_BUILDER_ROUNDS is 2 (the owner's rule).
-    The runtime clamp to bounces_before_escalation is a separate, later safety
-    net — the env reader itself must default to 2."""
-    import inspect
-    import re
-
+    """Behavioural, not source-text: the env reader's default for
+    NEO_MAX_BUILDER_ROUNDS is the owner's rule (2), proved by constructing a
+    Config whose clamp floor allows it — a source default of 5 would produce
+    5 here.  The base's clamp is documented alongside: with the shipped
+    floor (5) the EFFECTIVE default stays 5, and tests on main pin that
+    clamp (this lane does not redesign it — see the PR's QUESTION)."""
     import src.config as config_mod
 
     assert config_mod.MAX_BUILDER_ROUNDS_DEFAULT == 2
-    source = inspect.getsource(config_mod)
-    assert re.search(
-        r'_get_int\(\s*"NEO_MAX_BUILDER_ROUNDS",\s*'
-        r'MAX_BUILDER_ROUNDS_DEFAULT\s*\)',
-        source,
-    ), "the env reader must fall back to MAX_BUILDER_ROUNDS_DEFAULT (2)"
+
+    with patch.dict(os.environ, {"NEO_BOUNCES_BEFORE_ESCALATION": "2"},
+                    clear=True):
+        unclamped = config_mod.Config()
+    assert unclamped.max_builder_rounds == 2, (
+        "the env default must be 2 when the clamp floor permits it"
+    )
+
+    with patch.dict(os.environ, {}, clear=True):
+        clamped = config_mod.Config()
+    assert clamped.max_builder_rounds == clamped.bounces_before_escalation == 5, (
+        "the base's clamp (not this lane's to change) still lifts the "
+        "effective default to bounces_before_escalation"
+    )
 
 
 def test_validate_rejects_foreign_routegate_url() -> None:

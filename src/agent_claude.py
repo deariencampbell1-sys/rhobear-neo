@@ -30,6 +30,7 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
 import time
 
 from .config import Config
@@ -47,19 +48,39 @@ log = logging.getLogger("rhobear_neo.agent")
 # bytes" must not classify as 400.
 
 # Warn once per process when from_config() gets no gh_token (a missing
-# identity is a warning, never a crash — see from_config).
+# identity is a warning, never a crash — see from_config).  Guarded by a lock
+# so concurrent from_config calls cannot double-warn.
 _GH_TOKEN_WARNED = False
+_GH_TOKEN_WARN_LOCK = threading.Lock()
 
 
 def _warn_missing_gh_token() -> None:
     global _GH_TOKEN_WARNED
-    if _GH_TOKEN_WARNED:
-        return
-    _GH_TOKEN_WARNED = True
+    with _GH_TOKEN_WARN_LOCK:
+        if _GH_TOKEN_WARNED:
+            return
+        _GH_TOKEN_WARNED = True
     log.warning(
         "ClaudeAgent.from_config() called without gh_token — the CLI runs "
         "with no GH_TOKEN; no personal token may become a silent identity"
     )
+
+
+def _require_loopback_roulegate(url: str) -> str:
+    """Fail-closed: only the loopback RouteGate may receive a brief.
+
+    validate() whitelists the exact URLs, but a cfg can be mutated after it —
+    so both construction paths (from_config and _for_roulegate) re-check here
+    and refuse anything that would route a brief (and its repo context)
+    off-box.  Returns the normalised URL.
+    """
+    clean = (url or "").strip().rstrip("/")
+    if not clean.startswith("http://127.0.0.1:"):
+        raise AgentError(
+            f"routegate_anthropic_url must be the loopback RouteGate, "
+            f"got {url!r}"
+        )
+    return clean
 
 
 # Canonical Neo verdicts — anything else is rejected.
@@ -185,8 +206,10 @@ class ClaudeAgent:
         if routegate_url:
             # Gated: RouteGate needs no provider credential, and the model is
             # the gate's capability name (route-policy.yaml), not a provider ID.
+            # Loopback is re-checked here, not only in validate(): a cfg
+            # mutated after startup must not carry a brief off-box.
+            base_url = _require_loopback_roulegate(routegate_url)
             api_key = "routegate-loopback"
-            base_url = routegate_url
             model = cfg.routegate_model
         else:
             api_key = cfg.deepseek_key
@@ -255,17 +278,13 @@ class ClaudeAgent:
         """ClaudeAgent pointed at RouteGate's Anthropic wire (brief steps 1+2).
 
         Fail-closed: only the loopback gate may receive a brief — a foreign
-        URL is refused here even when validate() was bypassed upstream.
-        RouteGate needs no provider credential (loopback probe: 200 with no
-        auth); the non-secret placeholder satisfies Claude Code's own key
-        check while the real attribution travels as the consumer header.
+        URL is refused here even when validate() was bypassed upstream
+        (shared guard with from_config).  RouteGate needs no provider
+        credential (loopback probe: 200 with no auth); the non-secret
+        placeholder satisfies Claude Code's own key check while the real
+        attribution travels as the consumer header.
         """
-        url = (base_url or "").strip().rstrip("/")
-        if not url.startswith("http://127.0.0.1:"):
-            raise AgentError(
-                f"routegate_anthropic_url must be the loopback RouteGate, "
-                f"got {base_url!r}"
-            )
+        url = _require_loopback_roulegate(base_url)
         return ClaudeAgent(
             claude_bin=cfg.claude_bin,
             api_key="routegate-loopback",

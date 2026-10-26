@@ -45,6 +45,10 @@ ROUTEGATE_ANTHROPIC_URL = "http://127.0.0.1:8645/v1/messages"
 # (route-policy.yaml); also the route name recorded on gated attempts.
 ROUTEGATE_MODEL = "peak"
 
+# An install id may only be what GitHub sends: digits/word chars/dashes.
+# Anything else never reaches a header (see Config.zeus_consumer).
+_INSTALL_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
 
 def _get(name: str, default: str = "") -> str:
     return (os.environ.get(name) or default).strip()
@@ -139,6 +143,10 @@ class Config:
     routegate_anthropic_url: str = field(default_factory=lambda: _get(
         "NEO_ROUTEGATE_ANTHROPIC_URL", ""))
     # RouteGate capability name — also the route name metered on gated attempts.
+    # OPERATIONAL NOTE: once NEO_ROUTEGATE_ANTHROPIC_URL is set, RouteGate is a
+    # hard dependency for Zeus triage (one gated attempt; the gate owns
+    # failover).  A provider fallback outside the gate would be drift per the
+    # brief, so the owner accepts that dependency before flipping the env var.
     routegate_model: str = field(default_factory=lambda: _get(
         "NEO_ROUTEGATE_MODEL", ROUTEGATE_MODEL))
 
@@ -253,9 +261,20 @@ class Config:
 
             reviews:zeus/<install_id>   when the caller knows the install
             reviews:zeus                when it does not (never invented)
+
+        The id is validated before it is embedded: it goes into a header env
+        var, so a value with newlines/CRLF or anything GitHub would never
+        send is dropped (bare lane default, warning without the value) rather
+        than interpolated.
         """
         install_id = (install_id or "").strip()
-        return f"reviews:zeus/{install_id}" if install_id else "reviews:zeus"
+        if not install_id:
+            return "reviews:zeus"
+        if not _INSTALL_ID_RE.fullmatch(install_id):
+            log.warning("invalid install id for consumer attribution — "
+                        "using the bare lane default")
+            return "reviews:zeus"
+        return f"reviews:zeus/{install_id}"
 
     def __post_init__(self) -> None:
         # Clamp the round limit up to the escalation floor at construction, so

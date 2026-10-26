@@ -213,26 +213,28 @@ class UsageStore:
             and gains the install id (`reviews:zeus/<install_id>`, L0's
             consumer shape) from the owning job's payload when the caller did
             not already name one.
-          - PR / head SHA / builder round fall back to the owning job row when
-            the caller did not carry them (the builder lane records its
-            attempts without a target).  The job row is authoritative; when
-            neither side knows, the column stays NULL — never guessed.
+          - the owning job row is AUTHORITATIVE for PR / head SHA / builder
+            round; caller-supplied (brief-parsed) values only fill what the
+            row does not know.  When neither side knows, the column stays
+            NULL — never guessed.
+
+        One connection for lookup + insert: the job lookup shares the INSERT's
+        connection (metering is a hot path; a second connect per attempt is
+        churn we do not need).
         """
         consumer = (attempt.consumer or "").strip() or DEFAULT_CONSUMER
-        pr_number = attempt.pr_number
-        head_sha = attempt.head_sha
-        builder_round = attempt.builder_round
-        job_pr, job_sha, job_round, install_id = self._job_target(
-            attempt.job_id)
-        pr_number = pr_number if pr_number is not None else job_pr
-        head_sha = head_sha if head_sha is not None else job_sha
-        builder_round = builder_round if builder_round is not None else job_round
-        if install_id and "/" not in consumer:
-            # Bare lane default → the L0 consumer shape reviews:zeus/<install>.
-            # An already-qualified consumer (a caller that knew the install)
-            # is never rewritten.
-            consumer = f"{consumer}/{install_id}"
         with self._conn() as c:
+            job_pr, job_sha, job_round, install_id = self._job_target(
+                c, attempt.job_id)
+            if install_id and "/" not in consumer:
+                # Bare lane default → the L0 consumer shape reviews:zeus/<install>.
+                # An already-qualified consumer (a caller that knew the
+                # install) is never rewritten.
+                consumer = f"{consumer}/{install_id}"
+            pr_number = job_pr if job_pr is not None else attempt.pr_number
+            head_sha = job_sha if job_sha is not None else attempt.head_sha
+            builder_round = (job_round if job_round is not None
+                             else attempt.builder_round)
             cur = c.execute(
                 "INSERT INTO neo_usage "
                 "(job_id, attempt_number, route_idx, provider, model, "
@@ -255,10 +257,11 @@ class UsageStore:
             return cur.fetchone() is not None
 
     def _job_target(
-        self, job_id: int | None,
+        self, c, job_id: int | None,
     ) -> tuple[int | None, str | None, int | None, str | None]:
         """(pr_number, head_sha, builder_round, install_id) of the owning job
-        row — the authoritative target and consumer suffix for an attempt.
+        row — the authoritative target and consumer suffix for an attempt,
+        read on the caller's open connection.
 
         Best effort only: usage recording must never fail because the jobs
         table (owned by src/jobs.py, created by its own schema) is absent or
@@ -267,13 +270,12 @@ class UsageStore:
         if job_id is None:
             return None, None, None, None
         try:
-            with self._conn() as c:
-                row = c.execute(
-                    "SELECT pr_number, head_sha, builder_round, "
-                    "       payload->>'installation_id' "
-                    "FROM neo_jobs WHERE id = %s",
-                    (job_id,),
-                ).fetchone()
+            row = c.execute(
+                "SELECT pr_number, head_sha, builder_round, "
+                "       payload->>'installation_id' "
+                "FROM neo_jobs WHERE id = %s",
+                (job_id,),
+            ).fetchone()
         except Exception:  # noqa: BLE001 — metering must never raise here
             log.debug("job target lookup failed for job %s", job_id,
                       exc_info=True)
@@ -460,8 +462,13 @@ def is_fallthrough(status_code: int | None, timeout_before_first_token: bool = F
 
 # ── Brief target (what an attempt served) ──────────────────────────────────────
 
-_BRIEF_TARGET_PR = re.compile(r"TARGET:\s*PR\s*#(\d+)\b", re.IGNORECASE)
-_BRIEF_TARGET_SHA = re.compile(r"commits/([0-9a-f]{40})/status")
+_BRIEF_TARGET_PR = re.compile(r"TARGET:\s*PR\s*#(\d+)", re.IGNORECASE)
+# The full 40-hex head SHA appears in the real brief twice: the canon status
+# call (`gh api repos/…/commits/<sha>/status`) and the checkout line
+# (`git checkout <sha>`).  Only those two contexts are matched — a bare
+# 40-hex elsewhere is not evidence of a target.
+_BRIEF_TARGET_SHA = re.compile(
+    r"(?:commits/|checkout\s+)([0-9A-Fa-f]{40})")
 _BRIEF_BUILDER_ROUND = re.compile(r"spent\s+(\d+)/(\d+)\s+builder rounds",
                                   re.IGNORECASE)
 
