@@ -553,9 +553,16 @@ def run_lane_gate(token: str, cfg: Config, state: NeoState, repo: str, pr: int, 
         statuses = json.loads(raw) if rc == 0 else []
     except (TypeError, ValueError):
         statuses = []
-    ok, reason = lane_merge_authority(bool(getattr(cfg, "lane_merge", False)), evidence, lane,
-                                      statuses if isinstance(statuses, list) else [], reviews, org,
-                                      require_drift=getattr(cfg, "lane_require_drift", False) is True)
+    # Defect 1: the gate's conditions dropped review_bound_ok — an ACCEPT on an
+    # older commit passed. The reviewed commit must be this head SHA (belt
+    # semantics as in merge_authority: a bundle without the key is legacy
+    # evidence and keeps its behaviour).
+    if not evidence.get("review_bound_ok", True):
+        ok, reason = False, "lane gate: the reviewed commit is not this head SHA"
+    else:
+        ok, reason = lane_merge_authority(bool(getattr(cfg, "lane_merge", False)), evidence, lane,
+                                          statuses if isinstance(statuses, list) else [], reviews, org,
+                                          require_drift=getattr(cfg, "lane_require_drift", False) is True)
     log.info("%s#%s@%s lane=%s merge authority=%s (%s)", repo, pr, sha[:8], lane, ok, reason)
     if ok:
         rc, out = _gh(token, "pr", "merge", str(pr), "-R", repo, "--squash",

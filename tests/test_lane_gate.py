@@ -142,7 +142,9 @@ def test_lane_gate_reads_evidence_through_the_real_collector():
     """Defect 2 (arity): run_lane_gate's calls must match THIS line's shapes —
     `_gh(token, …)` and `_review_evidence(token, cfg, …)`.  This test patches
     only `_gh` (the network) and runs the real evidence collector through the
-    lane gate: a `_gh(cfg, …)`-shaped call would TypeError here, not merge."""
+    lane gate: a `_gh(cfg, …)`-shaped call would TypeError here, not merge.
+    The fixture carries the green producer run for the head so the gate's
+    review_bound_ok condition (defect 1) is satisfied by this evidence."""
     state = FakeState()
     statuses = [architect(lane="l8b"),
                 {"context": "rhobear-reviews", "state": "success"}]
@@ -152,7 +154,12 @@ def test_lane_gate_reads_evidence_through_the_real_collector():
             return 0, json.dumps({"headRefOid": HEAD, "headRefName": "l8b/fix-usb-macros",
                                   "reviews": [], "statusCheckRollup": []})
         if args[0] == "api" and "/check-runs" in args[1]:
-            return 0, json.dumps({"total_count": 0, "check_runs": []})
+            return 0, json.dumps({"total_count": 1, "check_runs": [
+                {"id": 1, "name": "rhobear-reviews", "app": {"id": 17265050},
+                 "head_sha": HEAD, "status": "completed", "conclusion": "success",
+                 "completed_at": "2026-10-26T11:50:00Z",
+                 "output": {"summary":
+                            '{"unresolved_critical_high": 0, "coverage": "complete"}'}}]})
         if args[0] == "api" and args[1].endswith("/statuses?per_page=100"):
             return 0, json.dumps(statuses)
         if args[0] == "api" and args[1].endswith("/status"):
