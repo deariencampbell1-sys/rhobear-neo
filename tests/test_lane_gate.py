@@ -256,3 +256,22 @@ def test_review_bound_is_required_by_the_lane_gate():
     state, calls = run([architect()], evidence_dict=evidence(review_bound_ok=True))
     assert any(c[:2] == ("pr", "merge") for c in calls)
     assert state.rows[-1][3] == "merged"
+
+
+def test_architect_prefix_match_is_case_insensitive():
+    """Defect 4: the webhook dispatch matched the architect/ prefix
+    case-sensitively — "Architect/L3-Kit" was dropped as untrusted and the
+    lane gate never woke. One case-insensitive normaliser, shared by the
+    dispatch and the worker's wake routing."""
+    from src import webhook_server
+
+    wakes = []
+    cfg = mock.Mock(repo_allowlist=(REPO,), trusted_review_contexts=("rhobear-reviews",))
+    d = NeoDispatcher(cfg, wakes.append)
+    payload = {"repository": {"full_name": REPO}, "sha": HEAD, "state": "success"}
+    assert d.dispatch("status", {**payload, "context": "Architect/L3-Kit"}).code == 200
+    assert d.dispatch("status", {**payload, "context": "L0/Drift"}).code == 200
+    assert [w["context"] for w in wakes] == ["Architect/L3-Kit", "L0/Drift"]
+    assert d.dispatch("status", {**payload, "context": "ci/random"}).code == 204
+    assert webhook_server.is_architect_context("Architect/L3-Kit")
+    assert webhook_server.is_drift_context("L0/DRIFT")
