@@ -48,16 +48,14 @@ def _parse_evidence_summary(summary: str) -> dict | None:
 def _check_run_completed(cr: dict) -> bool:
     """True only for a check run that actually COMPLETED.
 
-    `status` must be "completed" (a queued/in_progress/pending run is not
-    evidence).  GitHub's check-run schema always includes `status`, and a
-    `conclusion` exists only on completed runs: a run carrying a conclusion
-    but no `status` (pinned test fixtures) is therefore treated as completed.
-    A run with neither is never evidence.
+    The production predicate is exact: `status == "completed"`.  A
+    queued/in_progress/pending run is not evidence, and a payload carrying a
+    `conclusion` but no `status` is NOT completed either (W1-13-r2 defect 4:
+    GitHub's check-run schema always includes `status`; the pinned fixtures
+    that omitted it were wrong and have been fixed — the predicate never
+    bends to test data).
     """
-    status = cr.get("status")
-    if status is not None:
-        return str(status) == "completed"
-    return cr.get("conclusion") is not None
+    return str(cr.get("status") or "") == "completed"
 
 
 def _trusted_check_run(check_runs: list, app_id: str, sha: str) -> dict | None:
