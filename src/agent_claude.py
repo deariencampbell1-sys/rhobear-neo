@@ -33,7 +33,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, unquote
 
 from .config import Config, ROUTEGATE_PORT
 from .usage import (
@@ -110,8 +110,9 @@ def _require_loopback_roulegate(url: str) -> str:
     Parsed, not prefixed: a prefix check lets
     `http://127.0.0.1:8645@evil.example/...` (userinfo) or an arbitrary
     loopback port through, so this requires scheme http, host exactly
-    127.0.0.1, no userinfo, RouteGate's port, and a path under /v1 with no
-    `..` hop.  validate() whitelists the exact URLs, but a cfg can be
+    127.0.0.1, no userinfo, RouteGate's port, and a DECODED path under /v1
+    with no `..` hop (percent-encoded dot segments like %2e%2e decode before
+    the check — urlsplit alone does not decode).  validate() whitelists the exact URLs, but a cfg can be
     mutated after it — so both construction paths (from_config and
     _for_roulegate) re-check here and refuse anything that would route a
     brief (and its repo context) off-box.  Returns the normalised URL.
@@ -119,7 +120,8 @@ def _require_loopback_roulegate(url: str) -> str:
     clean = (url or "").strip().rstrip("/")
     parts = urlsplit(clean)
     path = parts.path or ""
-    normalised = posixpath.normpath(path or "/")
+    decoded = unquote(path)          # %2e%2e is '..' after decoding
+    normalised = posixpath.normpath(decoded or "/")
     try:
         port = parts.port
     except ValueError:  # unparseable port → not the gate
@@ -129,7 +131,7 @@ def _require_loopback_roulegate(url: str) -> str:
             or parts.username is not None
             or parts.password is not None
             or port != ROUTEGATE_LOOPBACK_PORT
-            or ".." in path
+            or ".." in decoded
             or not (normalised == "/v1"
                     or normalised.startswith("/v1/"))):
         raise AgentError(
@@ -441,16 +443,23 @@ class ClaudeAgent:
         route_idx/route are the winning route (None if all failed).
         """
         target = brief_target(brief)
-        consumer = self._wire_consumer(usage_store, job_id)
         rg_url = str(getattr(cfg, "routegate_anthropic_url", "") or "").strip()
         if rg_url:
+            # Resolve the QUALIFIED consumer only on the gated branch — the
+            # header exists only there, and the direct chain's rows are
+            # upgraded by the store anyway (no wasted connection).
             return self._run_roulegate(
                 brief, cfg, rg_url, gh_token, usage_store=usage_store,
                 job_id=job_id, attempt_number=attempt_number, target=target,
-                consumer=consumer)
+                consumer=self._wire_consumer(usage_store, job_id))
 
         start_time = time.monotonic()
-        attribution = self._attribution(target, consumer)
+        attribution = {
+            **self._attribution(target, self.consumer),
+            # A run without GitHub identity is visible in METERING, not just
+            # in a boot log (Apollo r4): every row says whether it had one.
+            "had_gh_token": bool(self.gh_token),
+        }
 
         for idx, route in available_routes:
             # Skip routes Claude Code can't serve (no Anthropic-wire endpoint).
@@ -481,7 +490,7 @@ class ClaudeAgent:
                 continue
 
             route_agent = self._for_route(cfg, route, gh_token, base_url,
-                                          consumer=consumer)
+                                          consumer=self.consumer)
 
             with tempfile.TemporaryDirectory(prefix="neo-work-") as work_dir:
                 with tempfile.TemporaryDirectory(prefix="neo-config-") as config_dir:
@@ -562,7 +571,13 @@ class ClaudeAgent:
         attribution = {
             **self._attribution(target, consumer),
             "route_name": cfg.routegate_model,
+            "had_gh_token": bool(self.gh_token),
         }
+        # route_idx 0: the gate occupies the first chain slot.  The unique
+        # key (job_id, attempt_number, route_idx) then provides idempotency:
+        # jobs.py advances `attempt` per retry, so a fresh attempt always
+        # lands a fresh row, while a replayed attempt_number dedupes instead
+        # of double-metering (same semantics as the direct chain's route 0).
         with tempfile.TemporaryDirectory(prefix="neo-work-") as work_dir:
             with tempfile.TemporaryDirectory(prefix="neo-config-") as config_dir:
                 route_start = time.monotonic()

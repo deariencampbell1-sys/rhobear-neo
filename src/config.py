@@ -41,6 +41,10 @@ MAX_BUILDER_ROUNDS_DEFAULT = 2
 # values below pass validate().
 ROUTEGATE_PORT = 8645
 ROUTEGATE_BASE_URL = f"http://127.0.0.1:{ROUTEGATE_PORT}/v1"
+# The exact loopback Anthropic endpoint RouteGate serves (once L2 exposes it).
+# NOTE: this is the ALLOW-LIST value `routegate_anthropic_url` is checked
+# against — NOT the field's default (the field defaults to empty: the gate
+# stays off until L2 serves the wire and the owner flips the switch).
 ROUTEGATE_ANTHROPIC_URL = f"http://127.0.0.1:{ROUTEGATE_PORT}/v1/messages"
 # The RouteGate capability that serves peak-hours/cost-aware routing
 # (route-policy.yaml); also the route name recorded on gated attempts.
@@ -294,7 +298,6 @@ class Config:
         same way.
         """
         return zeus_consumer_for((install_id or "").strip())
-        return f"reviews:zeus/{install_id}"
 
     def __post_init__(self) -> None:
         # Clamp the round limit up to the escalation floor at construction, so
@@ -359,18 +362,21 @@ class Config:
 
         Raises ValueError (safe to log — no secrets) on any violation.
 
-        RouteGate endpoints: the Anthropic wire URL (which carries briefs) is
-        validated fail-closed — only the loopback gate passes, so a
-        stale/foreign URL can never point Zeus's briefs (and their context)
-        off-box.  The other two RouteGate knobs warn-and-default (see below).
+        RouteGate endpoints: the Anthropic wire URL (which would carry
+        briefs) is validated fail-closed by DISCARDING anything that is not
+        the allow-listed loopback endpoint — the gate then stays off and the
+        sanctioned direct chain runs, so a stale/foreign URL can neither point
+        Zeus's briefs off-box nor crash-loop the services (the agent's parsed
+        loopback guard is the second layer).  The other two RouteGate knobs warn-and-default (see below).
         """
         # --- RouteGate -------------------------------------------------
-        # Brief containment (anthropic URL) stays fail-closed: only the
-        # loopback gate may hold Zeus's briefs.  The capability NAME and the
-        # OpenAI-shape base URL (no brief traffic in this lane) are
-        # operational knobs: a typo warns and defaults instead of
-        # crash-looping both services (Apollo r3 — this codebase already
-        # burned on a validate() raise that kept services down).
+        # Brief containment is enforced at TWO layers: here a malformed
+        # anthropic URL is discarded (never fatal, never used), and the agent
+        # refuses any non-loopback URL it is handed at construction and again
+        # at use.  `routegate_base_url` (brief-mandated config surface, read
+        # here; reserved for the OpenAI-shape probe — no brief traffic ever
+        # rides it) and the capability NAME warn-and-default, so a typo never
+        # takes both services down (Apollo r3/r4 — burn history above).
         if self.routegate_base_url.rstrip("/") != ROUTEGATE_BASE_URL:
             log.warning("routegate_base_url %r is not the loopback gate — "
                         "defaulting to %s",
@@ -378,12 +384,19 @@ class Config:
             self.routegate_base_url = ROUTEGATE_BASE_URL
         rg_anthropic = self.routegate_anthropic_url.strip().rstrip("/")
         if rg_anthropic and rg_anthropic != ROUTEGATE_ANTHROPIC_URL:
-            raise ValueError(
-                f"routegate_anthropic_url must be RouteGate's Anthropic "
-                f"endpoint on the loopback ({ROUTEGATE_ANTHROPIC_URL}) or "
-                f"empty while L2 serves no Anthropic wire, got "
-                f"{self.routegate_anthropic_url!r}"
-            )
+            # Not the allow-listed endpoint: DISCARD it (gate off, the direct
+            # chain stands) instead of raising.  Raising would crash-loop both
+            # services on a typo — the exact failure this codebase already
+            # burned on — while containment never depended on the raise:
+            # a discarded URL carries nothing, and the agent re-parses
+            # whatever URL it is handed against the loopback guard at use
+            # time anyway (defense in depth, fail-closed at the sink).
+            log.warning("routegate_anthropic_url %r is not RouteGate's "
+                        "Anthropic endpoint (%s) — disabling the gate, "
+                        "running direct",
+                        self.routegate_anthropic_url,
+                        ROUTEGATE_ANTHROPIC_URL)
+            self.routegate_anthropic_url = ""
         if self.routegate_model.strip() != ROUTEGATE_MODEL:
             log.warning("routegate_model %r is not the RouteGate capability "
                         "— defaulting to %r",

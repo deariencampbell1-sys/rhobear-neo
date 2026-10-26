@@ -77,6 +77,7 @@ CREATE TABLE IF NOT EXISTS neo_usage (
     builder_round   INTEGER,                    -- builder round (None = unknown / never)
     route_name      TEXT,                       -- RouteGate capability when gated ('peak')
     cost_usd        DOUBLE PRECISION,           -- cost the response carried (None = not carried)
+    had_gh_token    BOOLEAN,                    -- the run had a GitHub identity (None = unknown)
     started_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     recorded_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -96,6 +97,7 @@ ALTER TABLE neo_usage ADD COLUMN IF NOT EXISTS head_sha TEXT;
 ALTER TABLE neo_usage ADD COLUMN IF NOT EXISTS builder_round INTEGER;
 ALTER TABLE neo_usage ADD COLUMN IF NOT EXISTS route_name TEXT;
 ALTER TABLE neo_usage ADD COLUMN IF NOT EXISTS cost_usd DOUBLE PRECISION;
+ALTER TABLE neo_usage ADD COLUMN IF NOT EXISTS had_gh_token BOOLEAN;
 """
 
 
@@ -183,6 +185,7 @@ class UsageAttempt:
     builder_round: int | None = None
     route_name: str | None = None      # RouteGate capability when gated ('peak')
     cost_usd: float | None = None      # only ever what the response carried
+    had_gh_token: bool | None = None   # the run carried a GitHub identity
 
     def total_input(self) -> int:
         return (self.uncached_input or 0) + (self.cached_input or 0)
@@ -252,9 +255,9 @@ class UsageStore:
                 " uncached_input, cached_input, output_tokens, reasoning_tokens, "
                 " latency_ms, outcome, error_class, "
                 " consumer, pr_number, head_sha, builder_round, "
-                " route_name, cost_usd) "
+                " route_name, cost_usd, had_gh_token) "
                 "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
-                "        %s, %s, %s, %s, %s, %s) "
+                "        %s, %s, %s, %s, %s, %s, %s) "
                 "ON CONFLICT (job_id, attempt_number, route_idx) DO NOTHING "
                 "RETURNING id",
                 (attempt.job_id, attempt.attempt_number, attempt.route_idx,
@@ -263,7 +266,8 @@ class UsageStore:
                  attempt.output_tokens, attempt.reasoning_tokens,
                  attempt.latency_ms, attempt.outcome, attempt.error_class,
                  consumer, pr_number, head_sha, builder_round,
-                 attempt.route_name, attempt.cost_usd),
+                 attempt.route_name, attempt.cost_usd,
+                 attempt.had_gh_token),
             )
             return cur.fetchone() is not None
 
@@ -344,7 +348,7 @@ class UsageStore:
                 "uncached_input, cached_input, output_tokens, reasoning_tokens, "
                 "latency_ms, outcome, error_class, "
                 "consumer, pr_number, head_sha, builder_round, "
-                "route_name, cost_usd "
+                "route_name, cost_usd, had_gh_token "
                 "FROM neo_usage WHERE job_id = %s "
                 "ORDER BY attempt_number, route_idx",
                 (job_id,),
