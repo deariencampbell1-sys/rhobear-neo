@@ -1112,12 +1112,34 @@ class TestStartupValidation:
         cfg.require().validate()  # should not raise
 
     def test_main_uses_validate_chain(self) -> None:
-        """main() must call .validate() — verify the chain is wired."""
+        """main() must drive `.require().validate()` FIRST — proved by
+        running it: a config whose validate() raises must take the process
+        down that chain and abort before any side effect (behavioural, per
+        Defect 6 — a source regex cannot tell a missing call from a
+        reformat)."""
         from src import __main__ as entrypoint
-        import inspect
-        source = inspect.getsource(entrypoint.main)
-        assert "require().validate()" in source, \
+
+        calls: list[str] = []
+
+        class ValidateBoom(RuntimeError):
+            pass
+
+        class _ConfigProbe:
+            def require(self):
+                calls.append("require")
+                return self
+
+            def validate(self):
+                calls.append("validate")
+                raise ValidateBoom("stop before side effects")
+
+        with patch.object(entrypoint._config, "load",
+                          lambda: _ConfigProbe()):
+            with pytest.raises(ValidateBoom):
+                entrypoint.main()
+        assert calls == ["require", "validate"], (
             "main() must call require().validate() before any side effect"
+        )
 
 
 # ===================================================================
@@ -1125,74 +1147,80 @@ class TestStartupValidation:
 # ===================================================================
 
 class TestProtocolCensus:
-    """neo_protocol.py must not contain stale DeepSeek-Pro, Pi, direct-HTTP,
-    Windows-home-path, OpenRouter-prefixed-model, or [1m]-suffix references.
-    The exact direct model ID `deepseek-v4-flash` (lowercase) is allowed —
-    only the stale/prefix/suffix forms are banned."""
+    """The stale-token census runs against what neo_protocol PUTS OUT at
+    runtime — the module's docstring and the brief build_brief() hands the
+    agent — not against the .py file's bytes.  Defect 6: a source-text
+    assertion breaks on any reformat and proves nothing about behaviour;
+    the shipped texts are what an operator or an agent can actually see.
+    tests/test_no_source_text_assertions.py enforces this tree-wide."""
 
     @staticmethod
-    def _protocol_source() -> str:
-        src_dir = os.path.join(os.path.dirname(__file__), "..", "src")
-        with open(os.path.join(src_dir, "neo_protocol.py")) as f:
-            return f.read()
+    def _runtime_texts() -> list[str]:
+        from src import neo_protocol
+        brief = neo_protocol.build_brief(
+            repo="o/r", pr=7, head_sha="a" * 40,
+            reviewer_context="apollo", reviewer_green=True,
+            auto_merge=False, builder_round=1, max_builder_rounds=5,
+            builder_model="deepseek-v4-flash")
+        return [neo_protocol.__doc__ or "", brief]
 
     def test_no_deepseek_pro_reference(self) -> None:
         """'DeepSeek-Pro' (capital D, capital S, capital P) is stale."""
-        src = self._protocol_source()
-        assert "DeepSeek-Pro" not in src, (
-            "neo_protocol.py must not mention DeepSeek-Pro"
-        )
+        for text in self._runtime_texts():
+            assert "DeepSeek-Pro" not in text, (
+                "neo_protocol must not mention DeepSeek-Pro"
+            )
 
     def test_no_headless_deepseek_reference(self) -> None:
         """'headless DeepSeek' with capital letters is the old agent description."""
-        src = self._protocol_source()
-        assert "headless DeepSeek" not in src, (
-            "neo_protocol.py must not mention 'headless DeepSeek'"
-        )
+        for text in self._runtime_texts():
+            assert "headless DeepSeek" not in text, (
+                "neo_protocol must not mention 'headless DeepSeek'"
+            )
 
     def test_no_pi_reference(self) -> None:
         """'Pi' (the old Pi protocol) is stale in the protocol text."""
-        src = self._protocol_source()
-        assert " Pi " not in src and "Pi\n" not in src, (
-            "neo_protocol.py must not reference Pi protocol"
-        )
+        for text in self._runtime_texts():
+            assert " Pi " not in text and "Pi\n" not in text, (
+                "neo_protocol must not reference Pi protocol"
+            )
 
     def test_no_direct_http_reference(self) -> None:
         """'direct' as in 'direct HTTP' or 'direct DeepSeek' is stale."""
-        src = self._protocol_source()
-        assert "direct " not in src, (
-            "neo_protocol.py must not describe direct-HTTP or direct-DeepSeek paths"
-        )
+        for text in self._runtime_texts():
+            assert "direct " not in text, (
+                "neo_protocol must not describe direct-HTTP or direct-DeepSeek paths"
+            )
 
     def test_no_prefixed_model_reference(self) -> None:
         """'deepseek/deepseek-v4-flash' (the OpenRouter slug) is stale — the
         protocol must name the exact unprefixed direct ID."""
-        src = self._protocol_source()
-        assert "deepseek/deepseek-v4-flash" not in src, (
-            "neo_protocol.py must not mention the prefixed OpenRouter model slug"
-        )
+        for text in self._runtime_texts():
+            assert "deepseek/deepseek-v4-flash" not in text, (
+                "neo_protocol must not mention the prefixed OpenRouter model slug"
+            )
 
     def test_no_context_suffix_reference(self) -> None:
         """'[1m]' (the OpenRouter CLI context hint) is stale — the direct
         route takes the bare model ID."""
-        src = self._protocol_source()
-        assert "[1m]" not in src, (
-            "neo_protocol.py must not mention the [1m] context suffix"
-        )
+        for text in self._runtime_texts():
+            assert "[1m]" not in text, (
+                "neo_protocol must not mention the [1m] context suffix"
+            )
 
     def test_no_windows_home_path(self) -> None:
         """Hardcoded Windows home paths (C:/Users/) must not appear."""
-        src = self._protocol_source()
-        assert "C:/Users/" not in src, (
-            "neo_protocol.py must not contain hardcoded Windows home paths"
-        )
+        for text in self._runtime_texts():
+            assert "C:/Users/" not in text, (
+                "neo_protocol must not contain hardcoded Windows home paths"
+            )
 
     def test_no_windows_path_reference(self) -> None:
         """'Windows' as a path reference is stale (VPS runtime)."""
-        src = self._protocol_source()
-        assert "Windows" not in src, (
-            "neo_protocol.py must not reference Windows paths"
-        )
+        for text in self._runtime_texts():
+            assert "Windows" not in text, (
+                "neo_protocol must not reference Windows paths"
+            )
 
 
 # ===================================================================
