@@ -2117,3 +2117,46 @@ def test_a_review_with_no_author_is_never_apollos():
         assert greens["green1_ok"] is False, (repr(author), greens)
         ok, reason = _authority(_bundle(greens))
         assert ok is False, (repr(author), reason)
+
+
+def test_created_at_instants_are_compared_as_instants_not_strings():
+    """Defect 7 (MEDIUM): the newest-status-per-context collector compared
+    created_at as strings, so mixed Z / +offset timestamps sorted
+    lexicographically wrong and the OLDER status could win.  Parse to aware
+    datetimes (Z -> +00:00) and compare those; a value that cannot be parsed
+    sorts LAST (never wins).  12:00+05:00 is 07:00Z — older than 10:00Z."""
+    from src import neo_worker
+
+    cfg = Config()
+    cfg.trusted_reviewer_app_id = "12345"
+    newer = {"context": "rhobear-reviews", "state": "success",
+             "created_at": "2026-10-26T10:00:00Z"}
+    older = {"context": "rhobear-reviews", "state": "failure",
+             "created_at": "2026-10-26T12:00:00+05:00"}
+    unparsable = {"context": "rhobear-reviews", "state": "failure",
+                  "created_at": "not-a-timestamp"}
+
+    def run(statuses):
+        def fake_gh(token, *args, timeout=30):
+            if args[:2] == ("pr", "view"):
+                return 0, json.dumps({"headRefOid": SHA1, "headRefName": "topic",
+                                      "reviews": [], "statusCheckRollup": []})
+            if args[0] == "api" and "/check-runs" in args[1]:
+                return 0, json.dumps({"total_count": 0, "check_runs": []})
+            if args[0] == "api" and args[1].endswith("/status"):
+                return 0, json.dumps({"total_count": len(statuses),
+                                      "statuses": statuses})
+            raise AssertionError(f"unexpected gh call {args}")
+
+        with patch("src.neo_worker._gh", side_effect=fake_gh):
+            return neo_worker._review_evidence("tok", cfg, "acme/a", 5, SHA1)
+
+    # Mixed timezones, both orders: the true newest (10:00Z) wins.
+    for statuses in ([newer, older], [older, newer]):
+        ev = run(statuses)
+        assert ev["trusted_states"] == ["success"], (statuses, ev["trusted_states"])
+
+    # An unparseable created_at sorts last and never wins, both orders.
+    for statuses in ([unparsable, newer], [newer, unparsable]):
+        ev = run(statuses)
+        assert ev["trusted_states"] == ["success"], (statuses, ev["trusted_states"])
