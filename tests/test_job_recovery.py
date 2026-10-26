@@ -1062,3 +1062,34 @@ class TestHeadReadBeforeRun:
         jobs.resolve.assert_not_called()
         jobs.retry.assert_not_called()
         agent_run.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# W1-13-r1 Defect 5 — guard: none of the three test modules may assert on
+# source text.  Substring assertions on module source pass on any refactor
+# that keeps the substring and fail on any rename that keeps the behaviour —
+# false confidence on exactly the recovery paths under test.
+# ---------------------------------------------------------------------------
+
+class TestNoSourceTextAssertions:
+    FILES = ("test_job_recovery.py", "test_builder_evidence.py", "test_baseline.py")
+
+    def test_no_test_module_asserts_on_source_text(self):
+        import re
+        from pathlib import Path
+        here = Path(__file__).parent
+        forbidden = (
+            r"open\(.*" + "__file__" + r"\).*read\(\)",
+            r"(?:src|source)\[" + r".*\.index\(",
+            r"inspect\." + r"getsource",
+            "__file__" + r"\)?.*read_text\(\)",
+        )
+        for name in self.FILES:
+            path = str(here / name)
+            text = open(path).read()
+            for pat in forbidden:
+                m = re.search(pat, text)
+                assert m is None, (
+                    f"{name} asserts on source text ({m.group(0)!r}) — "
+                    "drive the real function and assert on calls made instead"
+                )
