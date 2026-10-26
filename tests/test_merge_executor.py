@@ -124,3 +124,61 @@ class TestMergeRunsTheAuthorityGate:
         with patch("src.merge_executor._gh", side_effect=_fake_gh(calls)):
             out = merge("o/r", 5, SHA, _evidence(), "tok")
         assert out["merged"] is True and out["sha"] == SHA
+
+
+class TestOkAndGateMatrix:
+    """W1-13 defect 1 (HIGH) — the exact `ok` / gate cells merge() must pass.
+
+    Every ambiguous cell fails closed: `{}` (no evidence at all), `ok=False`
+    alone, `ok=False` with ALL SIX gate fields green (the HIGH's parity cell),
+    `ok=True` with a red gate field, and all-green (the only cell that merges).
+    """
+
+    @pytest.mark.parametrize("ev, merges", [
+        ({}, False),
+        ({"ok": False, "reason": "evidence read failed"}, False),
+        (_evidence(ok=False, reason="evidence retrieval partially failed"), False),
+        (_evidence(required_checks_pass=False), False),
+        (_evidence(), True),
+    ], ids=["empty", "ok-false-alone", "ok-false-green-fields",
+            "ok-true-red-field", "all-green"])
+    def test_every_cell_fails_closed(self, ev, merges):
+        calls = []
+        with patch("src.merge_executor._gh", side_effect=_fake_gh(calls)):
+            if merges:
+                assert merge("o/r", 5, SHA, ev, "tok")["merged"] is True
+            else:
+                with pytest.raises(MergeDenied):
+                    merge("o/r", 5, SHA, ev, "tok")
+                assert not [c for c in calls if "PUT" in c], \
+                    "denied evidence must never reach the merge API"
+
+
+class TestOkBeltIsLocal:
+    """The HIGH's mechanism, driven directly: `ok=False` with GREEN gate
+    fields must deny even when the gate itself GRANTS.
+
+    merge_authority subsumes `ok` today (its first condition denies an
+    ok=False bundle), so the live matrix above closes through the gate — but
+    the belt belongs HERE: `ok` encodes evidence completeness the six gate
+    fields do not, and merge() must fail closed on it even if the gate's
+    answer is wrong.  A gate that grants must never override `ok=False`.
+    """
+
+    def test_ok_false_denies_even_when_the_gate_grants(self):
+        ev = _evidence(ok=False, reason="evidence retrieval partially failed")
+        calls = []
+        with patch("src.review_evidence.merge_authority",
+                   return_value=(True, "granted")), \
+             patch("src.merge_executor._gh", side_effect=_fake_gh(calls)):
+            with pytest.raises(MergeDenied):
+                merge("o/r", 5, SHA, ev, "tok")
+        assert not [c for c in calls if "PUT" in c], \
+            "the merge API must never run for ok=False evidence"
+
+    def test_ok_true_and_gate_grant_still_merges(self):
+        ev = _evidence()
+        with patch("src.review_evidence.merge_authority",
+                   return_value=(True, "granted")), \
+             patch("src.merge_executor._gh", side_effect=_fake_gh()):
+            assert merge("o/r", 5, SHA, ev, "tok")["merged"] is True
