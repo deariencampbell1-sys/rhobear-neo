@@ -557,8 +557,14 @@ def run_lane_gate(token: str, cfg: Config, state: NeoState, repo: str, pr: int, 
         log.info("%s#%s@%s already merged by Neo — skip", repo, pr, sha[:8])
         return
     org = repo.split("/", 1)[0]
-    evidence = _review_evidence(token, cfg, repo, pr, sha)
-    rc, raw = _gh(token, "api", f"repos/{repo}/commits/{sha}/statuses?per_page=100", timeout=30)
+    try:
+        evidence = _review_evidence(token, cfg, repo, pr, sha)
+        rc, raw = _gh(token, "api", f"repos/{repo}/commits/{sha}/statuses?per_page=100", timeout=30)
+    except Exception as exc:  # noqa: BLE001 — edge 5: a broken read fails CLOSED
+        reason = f"lane gate: evidence read broke ({type(exc).__name__}) — fail closed"
+        state.record(repo, pr, sha, "lane_hold", verdict="HOLD",
+                     detail={"lane": lane, "reason": reason})
+        return
     try:
         statuses = json.loads(raw) if rc == 0 else []
     except (TypeError, ValueError):
