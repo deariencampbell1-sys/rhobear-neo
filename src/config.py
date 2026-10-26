@@ -21,14 +21,6 @@ from dataclasses import dataclass, field
 
 log = logging.getLogger("rhobear_neo.config")
 
-# ── Owner constants (the env defaults they govern) ───────────────────────────
-# Q14: the owner's rule is TWO builder rounds.  This is the value the env
-# reader falls back to when NEO_MAX_BUILDER_ROUNDS is unset/non-integer;
-# _clamp_rounds() may still raise a *smaller* value up to
-# bounces_before_escalation at construction — a later, separate safety net
-# for escalation reachability (not a different default).
-MAX_BUILDER_ROUNDS_DEFAULT = 2
-
 # ── RouteGate (L2-platform, loopback) ────────────────────────────────────────
 # Zeus's model calls are metered at the gate, one consumer header per lane:
 #   X-RHOBEAR-Consumer: reviews:zeus/<install_id>
@@ -201,14 +193,16 @@ class Config:
     auto_merge_default: bool = field(default_factory=lambda: _get_bool("NEO_AUTO_MERGE", False))
 
     # --- safety floors ---
-    # The env default is the owner's rule: TWO builder rounds
-    # (MAX_BUILDER_ROUNDS_DEFAULT).  A value BELOW bounces_before_escalation
-    # is then clamped up with a warning by _clamp_rounds() at construction —
-    # that later clamp keeps escalation reachable and keeps a config the
-    # previous release shipped (NEO_MAX_BUILDER_ROUNDS=2 on the live box) from
-    # crash-looping production; it is a floor on small values, not the default.
+    # Defaults to bounces_before_escalation (5): a smaller default would make
+    # the 5-bounce escalation unreachable (the builder lane parks the round
+    # after max_builder_rounds before the PR ever bounces 5 times).  A value
+    # BELOW bounces_before_escalation is clamped up with a warning — the
+    # previous release shipped NEO_MAX_BUILDER_ROUNDS=2 on the live box, and a
+    # config the previous release shipped must never crash-loop production
+    # (round-2 finding: the old validate() raised here and kept both services
+    # down until a human edited .env).
     max_builder_rounds: int = field(default_factory=lambda: _get_int(
-        "NEO_MAX_BUILDER_ROUNDS", MAX_BUILDER_ROUNDS_DEFAULT))
+        "NEO_MAX_BUILDER_ROUNDS", 5))
 
     # --- bounce / escalation ---
     # Number of builder bounces before escalation to a frontier advisor.

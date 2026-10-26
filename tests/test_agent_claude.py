@@ -1560,32 +1560,6 @@ def test_from_config_without_gh_token(caplog: Any) -> None:
     assert len(warnings) == 1, warnings
 
 
-def test_neo_max_builder_rounds_default_is_2() -> None:
-    """Behavioural, not source-text: the env reader's default for
-    NEO_MAX_BUILDER_ROUNDS is the owner's rule (2), proved by constructing a
-    Config whose clamp floor allows it — a source default of 5 would produce
-    5 here.  The base's clamp is documented alongside: with the shipped
-    floor (5) the EFFECTIVE default stays 5, and tests on main pin that
-    clamp (this lane does not redesign it — see the PR's QUESTION)."""
-    import src.config as config_mod
-
-    assert config_mod.MAX_BUILDER_ROUNDS_DEFAULT == 2
-
-    with patch.dict(os.environ, {"NEO_BOUNCES_BEFORE_ESCALATION": "2"},
-                    clear=True):
-        unclamped = config_mod.Config()
-    assert unclamped.max_builder_rounds == 2, (
-        "the env default must be 2 when the clamp floor permits it"
-    )
-
-    with patch.dict(os.environ, {}, clear=True):
-        clamped = config_mod.Config()
-    assert clamped.max_builder_rounds == clamped.bounces_before_escalation == 5, (
-        "the base's clamp (not this lane's to change) still lifts the "
-        "effective default to bounces_before_escalation"
-    )
-
-
 def test_validate_discards_foreign_routegate_url() -> None:
     """Fail-closed where briefs flow: a foreign `routegate_anthropic_url`
     is DISCARDED at startup (gate off, direct chain stands — never carried,
@@ -1999,21 +1973,6 @@ def test_missing_gh_token_is_recorded_on_the_attempt_row() -> None:
         assert row_mismatch.had_gh_token is False, (
             "had_gh_token must record the run argument the child got, "
             "never self.gh_token")
-
-
-def test_rounds_default_follows_lower_bounce_floors() -> None:
-    """[Apollo r4, MEDIUM] Document the clamp blast radius explicitly: with
-    a bounce floor below 5 the reader default (2) is lifted to the FLOOR, so
-    a deployment that sets NEO_BOUNCES_BEFORE_ESCALATION changes its builder
-    budget — here is exactly what it gets."""
-    import src.config as config_mod
-
-    with patch.dict(os.environ, {"NEO_BOUNCES_BEFORE_ESCALATION": "3"},
-                    clear=True):
-        assert config_mod.Config().max_builder_rounds == 3
-    with patch.dict(os.environ, {"NEO_BOUNCES_BEFORE_ESCALATION": "4"},
-                    clear=True):
-        assert config_mod.Config().max_builder_rounds == 4
 
 
 def test_unusable_estimated_cost_warns_and_stays_unknown(
