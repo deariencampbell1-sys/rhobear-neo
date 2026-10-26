@@ -394,13 +394,23 @@ def _review_evidence(token: str, cfg: Config, repo: str, pr: int, sha: str,
     trusted = _trusted_contexts(cfg)
     trusted_states: list[str] = []
     statuses: list = []
+    newest: dict[str, tuple[str, str]] = {}
     try:
         rc, raw_status = _gh(token, "api", f"repos/{repo}/commits/{sha}/status", timeout=30)
         if rc == 0:
             statuses = json.loads(raw_status).get("statuses") or []
         for item in statuses:
-                if _is_trusted(str(item.get("context") or ""), trusted):
-                    trusted_states.append(str(item.get("state") or "").lower())
+            # Defect 3: the newest status PER TRUSTED CONTEXT decides — a union
+            # of every status on the head kept a PR red forever after one
+            # failure that a later run re-drove to success.
+            context = str(item.get("context") or "")
+            if not _is_trusted(context, trusted):
+                continue
+            created = str(item.get("created_at") or "")
+            prior = newest.get(context)
+            if prior is None or created > prior[0]:
+                newest[context] = (created, str(item.get("state") or "").lower())
+        trusted_states = [state for _, state in newest.values()]
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"status read failed ({type(exc).__name__})",
                 "decided_sha": sha, "head_ref": head_ref}
