@@ -2020,9 +2020,18 @@ class TestParkRace:
         assert row["state"] == "done" and row["outcome"] == "parked"
 
     def test_park_race_retry_vs_claim_invariant(self, db):
-        """Stress the window: concurrent retry(at cap) vs claim.  Afterwards
-        exactly one world holds — the retry parked the row, or the claimant
-        owns a live run that resolves normally.  Never both."""
+        """Concurrent at-cap retry vs claim (W1-13-r2 defect 6): the claimant
+        can NEVER win, and the test asserts that world exactly.
+
+        claim() only takes state='queued' while the at-cap retry moves
+        running -> done/parked in ONE statement, so no interleaving lets both
+        live — expiring the lease before the race would not make claim()
+        eligible (the gate is the row's state, not its lease).  The r1 test's
+        `if out.get("claim") == job_id:` branch was therefore unreachable and
+        asserted the invariant in only one of its two worlds; the unreachable
+        branch is gone and the deterministic outcome is asserted under real
+        concurrency: the claim always gets nothing, the retry always parks.
+        """
         import threading
         for i in range(20):
             job_id = db.create_wake("o/r", f"{i:040x}", True, max_attempts=1)
@@ -2041,12 +2050,7 @@ class TestParkRace:
             t1 = threading.Thread(target=do_retry)
             t2 = threading.Thread(target=do_claim)
             t1.start(); t2.start(); t1.join(); t2.join()
-            if out.get("claim") == job_id:
-                # the claimant owns the row: it must not be parked under them
-                assert out.get("retry") == "?", out
-                row = db.get(job_id)
-                assert row["state"] == "running" and row["outcome"] is None, row
-                assert db.resolve(job_id, "done", worker_token="w2") is True
-            else:
-                assert out.get("retry") == "parked", out
-                assert db.get(job_id)["outcome"] == "parked"
+            assert out.get("claim") is None, out
+            assert out.get("retry") == "parked", out
+            row = db.get(job_id)
+            assert row["state"] == "done" and row["outcome"] == "parked", row
