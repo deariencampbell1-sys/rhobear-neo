@@ -23,7 +23,7 @@ import os
 import secrets
 import subprocess
 
-from .config import Config
+from .config import Config, DEFAULT_OWNER_INSTALL_ID
 from .jobs import Jobs
 from .neo_state import NeoState, verdict_color
 from .agent_claude import ClaudeAgent, AgentError
@@ -102,16 +102,24 @@ def credits_for(usage: dict | None, builder: bool) -> int:
 
 
 # --- metering: the owner workspace never meters ----------------------------
-# install_id = 'deariencampbell1-sys' (the owner workspace) and any install
-# whose `plan` is empty skip BOTH the credit gate and the debit. Customers
-# with a plan are gated on balance <= 0 (and told so on the PR) and debited.
-OWNER_INSTALL_ID = "deariencampbell1-sys"
+# The owner workspace install id (cfg.owner_install_id — NEO_OWNER_INSTALL_ID
+# in the environment, W1-13-r1 defect 7: configured, never hard-coded here)
+# and any install whose `plan` is empty skip BOTH the credit gate and the
+# debit. Customers with a plan are gated on balance <= 0 (and told so on the
+# PR) and debited.  OWNER_INSTALL_ID stays as the legacy single-argument
+# default (contract: tests/test_neo_protocol_metering.py imports it).
+OWNER_INSTALL_ID = DEFAULT_OWNER_INSTALL_ID
 
 
-def meters_credits(inst: dict) -> bool:
+def meters_credits(inst: dict, cfg: Config | None = None) -> bool:
     """True only for a paying customer install: a non-empty plan AND not the
-    owner workspace. The owner workspace never meters (owner, W1-02)."""
-    if str(inst.get("install_id") or "") == OWNER_INSTALL_ID:
+    owner workspace. The owner workspace never meters (owner, W1-02).
+
+    Which install IS the owner comes from ``cfg.owner_install_id``
+    (NEO_OWNER_INSTALL_ID).  Without a Config the legacy OWNER_INSTALL_ID
+    constant applies (the single-argument contract)."""
+    owner = getattr(cfg, "owner_install_id", None) or OWNER_INSTALL_ID
+    if str(inst.get("install_id") or "") == str(owner):
         return False
     return bool(inst.get("plan"))
 
@@ -523,7 +531,7 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict,
     # --- entitlement (per-install credit balance) ---------------------------
     org = repo.split("/", 1)[0]
     inst = state.install(org, org)          # dogfood: install keyed by org
-    if meters_credits(inst) and inst.get("credits_balance", 0) <= 0:
+    if meters_credits(inst, cfg) and inst.get("credits_balance", 0) <= 0:
         state.record(repo, pr, sha, "parked", verdict="PARKED",
                      detail={"reason": "out of credits — owner must top up"})
         _gh(token, "pr", "comment", str(pr), "-R", repo,
@@ -839,7 +847,7 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict,
     jobs.resolve(job_id, "done", worker_token=wtoken,
                  payload={"verdict": verdict, "phase": phase,
                           "credits": credits})
-    if meters_credits(inst):
+    if meters_credits(inst, cfg):
         state.debit(org, credits)
     log.info("%s#%s@%s verdict=%s phase=%s credits=%d (auto_merge=%s round=%d)",
              repo, pr, sha[:8], verdict or "?", phase, credits, auto_merge, rounds)
