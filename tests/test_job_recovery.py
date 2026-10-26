@@ -1498,10 +1498,16 @@ class TestOwnerInstallIdFromConfig:
         monkeypatch.setenv("NEO_OWNER_INSTALL_ID", "deploy-specific-owner")
         assert Config().owner_install_id == "deploy-specific-owner"
 
-    def test_owner_install_id_defaults_to_the_legacy_value(self):
-        from src.config import Config
+    def test_owner_install_id_defaults_to_the_legacy_value(self, monkeypatch):
+        from src.config import Config, DEFAULT_OWNER_INSTALL_ID
         from src.neo_worker import OWNER_INSTALL_ID
-        assert Config().owner_install_id == OWNER_INSTALL_ID
+        monkeypatch.delenv("NEO_OWNER_INSTALL_ID", raising=False)
+        # Assert against the LITERAL (W1-13-r2 defect 9) so drift in EITHER
+        # constant fails: the old assertion compared OWNER_INSTALL_ID to a
+        # Config default that is assigned from it — a constant against itself.
+        assert Config().owner_install_id == "deariencampbell1-sys"
+        assert DEFAULT_OWNER_INSTALL_ID == "deariencampbell1-sys"
+        assert OWNER_INSTALL_ID == "deariencampbell1-sys"
 
     def test_metering_follows_the_config_value(self, monkeypatch):
         from src.config import Config

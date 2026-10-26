@@ -911,7 +911,7 @@ class TestStaleHeadAndFence:
         assert "gh pr merge" not in block
         assert "[LOW]" in block and "a.py:0" in block and "**ID:** f1" in block
 
-    def test_credit_or_advisor_park_does_not_satisfy_recovery_gate(self):
+    def test_credit_or_advisor_park_does_not_satisfy_recovery_gate(self, monkeypatch):
         """A transient `parked` record (credit / advisor gate) must NOT satisfy
         the done_phase recovery gate and must not short-circuit the run — the
         agent still runs; a `builder_blocked` record DOES gate (job resolved
@@ -920,6 +920,9 @@ class TestStaleHeadAndFence:
         from src.jobs import Jobs
         from src.neo_worker import run_neo
 
+        # W1-13-r2 defect 9: this test builds a bare Config() — deployment env
+        # (NEO_OWNER_INSTALL_ID decides who is metered) must not leak in.
+        monkeypatch.delenv("NEO_OWNER_INSTALL_ID", raising=False)
         sha = "a" * 40
         cfg = Config()
         cfg.gh_token = "t"

@@ -7,11 +7,21 @@ Defect 4: build_evidence must fail closed on an empty rollup.
 """
 from __future__ import annotations
 
+import pytest
+
 from src.config import Config
 from src.review_evidence import build_evidence, merge_authority
 
 TRUSTED_APP = "12345"
 SHA = "a" * 40
+
+
+@pytest.fixture(autouse=True)
+def _owner_install_id_env_cleared(monkeypatch):
+    """W1-13-r2 defect 9: `_cfg()` builds a bare Config() — nothing in this
+    module may depend on deployment env.  NEO_OWNER_INSTALL_ID is deployment
+    state, not test input."""
+    monkeypatch.delenv("NEO_OWNER_INSTALL_ID", raising=False)
 
 
 def _cfg() -> Config:
