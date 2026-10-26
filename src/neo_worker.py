@@ -575,6 +575,14 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict,
         jev_context=jev.brief() + "\n" + evidence_brief(evidence, auto_merge, authority_reason),
     )
     # The agent gets the repo's installation token, never a personal one.
+    # [Apollo r6] A run without GitHub identity must be loud AT THE CALLER:
+    # ERROR-level here (the worker journal — which job ran unauthenticated),
+    # not only from_config's once-per-process line and `had_gh_token=False`
+    # on the metering rows.
+    if not token:
+        log.error("%s#%s@%s constructing triage agent with NO gh_token — "
+                  "the run proceeds unauthenticated (its attempt rows read "
+                  "had_gh_token=False)", repo, pr, sha[:8])
     agent = ClaudeAgent.from_config(cfg, gh_token=token)
     try:
         # Lease renewal: a static lease shorter than the agent run would let a

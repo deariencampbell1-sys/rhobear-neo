@@ -790,3 +790,504 @@ def test_divergent_classify_cli_fallthrough_is_deleted():
     divergent duplicate must be GONE."""
     import src.usage as usage
     assert not hasattr(usage, "classify_cli_fallthrough")
+
+
+# ===================================================================
+# W1-06 — RouteGate metering: per-attempt rows, anchored classification
+# ===================================================================
+
+class _FakeUsageStore:
+    """In-memory UsageStore stand-in (no Postgres): same idempotency rule
+    (unique on job_id + attempt_number + route_idx)."""
+
+    def __init__(self):
+        self.rows = []
+        self._keys = set()
+
+    def record_attempt(self, attempt):
+        key = (attempt.job_id, attempt.attempt_number, attempt.route_idx)
+        if key in self._keys:
+            return False
+        self._keys.add(key)
+        self.rows.append(attempt)
+        return True
+
+
+def test_attempt_is_metered():
+    """Edge 1 + 4: a 402 mid-attempt is ONE fallthrough row recorded with its
+    route name and an incremented attempt counter; two attempts in one run are
+    two rows; replaying a row never double counts."""
+    from src.agent_claude import ClaudeAgent
+
+    cfg = Config()
+    cfg.claude_bin = sys.executable
+    cfg.deepseek_base_url = "https://api.deepseek.com/anthropic"
+    cfg.deepseek_model = "deepseek-v4-flash"
+    cfg.deepseek_reasoning_effort = "max"
+    cfg.deepseek_max_tokens = 32000
+    cfg.neo_routes = "zai:glm-5.3-flash,deepseek:deepseek-v4-flash"
+
+    agent = ClaudeAgent(
+        claude_bin=sys.executable, api_key="k",
+        base_url="https://api.deepseek.com/anthropic",
+        model="deepseek-v4-flash", timeout=30, gh_token="t",
+    )
+    store = _FakeUsageStore()
+    head = "cd" * 20
+    brief = (
+        "TARGET: PR #44 in acme/widget at head " + head[:12] + "\n"
+        "gh api repos/acme/widget/commits/" + head + "/status\n"
+        "You have already spent 1/2 builder rounds on this PR.\n"
+    )
+
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        if len(calls) == 1:
+            # Route 1 (zai) — a provider 402 mid-attempt.
+            return subprocess.CompletedProcess(
+                args=["claude"], returncode=0, stderr="",
+                stdout=json.dumps({
+                    "type": "result", "is_error": True,
+                    "subtype": "error_during_execution",
+                    "api_error_status": "402",
+                }),
+            )
+        # Route 2 (deepseek) — success, no cost carried by the response.
+        return subprocess.CompletedProcess(
+            args=["claude"], returncode=0, stderr="",
+            stdout=json.dumps({
+                "type": "result", "subtype": "success", "is_error": False,
+                "result": "VERDICT: ACCEPT-READY",
+                "usage": {"input_tokens": 50, "output_tokens": 20},
+                "num_turns": 1, "stop_reason": "end_turn",
+                "permission_denials": [],
+            }),
+        )
+
+    with patch.dict(os.environ, {"ZAI_API_KEY": "k1",
+                                 "DEEPSEEK_API_KEY": "k2"}, clear=True):
+        avail = available_routes(resolve_route_chain(cfg.neo_routes))
+        with patch("src.agent_claude.subprocess.run", side_effect=fake_run):
+            usage, verdict, ridx, route = agent.run_with_chain(
+                brief, avail, cfg, "t",
+                usage_store=store, job_id=7,
+            )
+
+    assert verdict == "ACCEPT-READY"
+    assert ridx == 1
+    assert len(calls) == 2
+    # Attempt counter incremented: one row per attempt, in order.
+    assert [r.route_idx for r in store.rows] == [0, 1]
+
+    first, second = store.rows
+    # Edge 1: 402 → exactly one fallthrough, recorded with its route name.
+    assert first.outcome == "fallthrough"
+    assert first.error_class == "402"
+    assert (first.provider, first.model) == ("zai", "glm-5.3-flash")
+    assert first.route_name is None          # direct route — no RouteGate cap
+    assert first.consumer == "reviews:zeus"  # written with consumer reviews:zeus
+    assert first.pr_number == 44
+    assert first.head_sha == head
+    assert first.builder_round == 1
+    assert first.cost_usd is None            # unknown stays None
+    assert first.latency_ms is not None
+
+    # Edge 4: two attempts → two rows, the winner metered with tokens.
+    assert second.outcome == "success"
+    assert (second.provider, second.model) == ("deepseek", "deepseek-v4-flash")
+    assert second.uncached_input == 50
+    assert second.output_tokens == 20
+    assert second.cost_usd is None
+    assert second.pr_number == 44 and second.head_sha == head
+
+    # Idempotent per attempt: replaying the same row never double counts.
+    assert store.record_attempt(first) is False
+    assert len(store.rows) == 2
+
+
+def test_fallthrough_classification_not_substring():
+    """usage.classify_error_text is the text classifier for attempts and it
+    anchors on `api_error_status` / `HTTP <code>` shapes only: "cost 1500
+    tokens" contains "500" but must never classify as a 5xx."""
+    from src.usage import classify_error_text
+
+    fall, cls = classify_error_text("run burned cost 1500 tokens")
+    assert fall is False
+    assert cls != "5xx"
+
+    assert classify_error_text("HTTP 503 Service Unavailable") == (True, "5xx")
+    assert classify_error_text("402") == (True, "402")
+    assert classify_error_text("Error code: 402 — payment required") == (True, "402")
+    assert classify_error_text("status: 400 bad request") == (False, "400")
+    assert classify_error_text("read 400 bytes then 150 files") != (False, "400")
+
+    # Edge 3: a log line containing the word "error" in a normal message is
+    # not a status at all — no anchor, no fallthrough.
+    fall, _cls = classify_error_text("retrying after error, all tools available")
+    assert fall is False
+
+
+def test_stream_close_is_fallthrough():
+    """Edge 2: a stream that closes before any output is a fallthrough —
+    never a successful empty review."""
+    from src.agent_claude import ClaudeAgent, MissingResult
+
+    agent = ClaudeAgent.__new__(ClaudeAgent)
+    closed = subprocess.CompletedProcess(
+        args=["claude"], returncode=0, stdout="", stderr="")
+    fall, cls = agent._classify_agent_error(
+        MissingResult("no stdout from claude"), agent, proc=closed)
+    assert fall is True
+    assert cls == "stream_closed"
+
+    # A run that DID take turns but produced no verdict text still fails
+    # closed and is NOT a fallthrough — the model ran, don't silently retry.
+    ran = subprocess.CompletedProcess(
+        args=["claude"], returncode=0, stderr="",
+        stdout=json.dumps({
+            "type": "result", "subtype": "success", "is_error": False,
+            "result": "", "num_turns": 2, "stop_reason": "end_turn",
+        }),
+    )
+    fall2, cls2 = agent._classify_agent_error(
+        MissingResult("no result text from claude"), agent, proc=ran)
+    assert fall2 is False
+
+
+@requires_pg
+def test_attempt_consumer_carries_install_id(store):
+    """L0's consumer shape: a row for a job that knows its GitHub App
+    installation is written `reviews:zeus/<install_id>`; a job payload without
+    one keeps the bare lane default — never an invented id."""
+    from src.jobs import Jobs
+
+    Jobs(DSN).ensure_schema()
+    with psycopg.connect(DSN, autocommit=True) as c:
+        job_id = c.execute(
+            "INSERT INTO neo_jobs(kind, repo, head_sha, payload) "
+            "VALUES ('wake', 'acme/widget', %s, %s) RETURNING id",
+            ("ee" * 40, json.dumps({"installation_id": "987654321"})),
+        ).fetchone()[0]
+        bare_job_id = c.execute(
+            "INSERT INTO neo_jobs(kind, repo, head_sha, payload) "
+            "VALUES ('wake', 'acme/other', %s, '{}') RETURNING id",
+            ("ef" * 40,),
+        ).fetchone()[0]
+
+    store.record_attempt(UsageAttempt(
+        job_id=job_id, attempt_number=1, route_idx=0,
+        provider="deepseek", model="deepseek-v4-flash",
+        uncached_input=10, output_tokens=5, outcome="success",
+    ))
+    store.record_attempt(UsageAttempt(
+        job_id=bare_job_id, attempt_number=1, route_idx=0,
+        provider="deepseek", model="deepseek-v4-flash",
+        outcome="success", consumer="reviews:zeus/42",
+    ))
+
+    with_install, bare = store.get_attempts(job_id)[0], \
+        store.get_attempts(bare_job_id)[0]
+    assert with_install.consumer == "reviews:zeus/987654321"
+    # An already-qualified consumer is explicit — never rewritten.
+    assert bare.consumer == "reviews:zeus/42"
+
+
+def test_brief_target_reads_the_real_brief():
+    """[Apollo MEDIUM] The target must come from a REAL brief, not a shape
+    the test invented: parse neo_protocol.build_brief's own output."""
+    from src.neo_protocol import build_brief
+    from src.usage import brief_target
+
+    head = "3c9e1aa" + "b" * 33
+    brief = build_brief(
+        repo="acme/widget", pr=44, head_sha=head,
+        reviewer_context="rhobear-reviews", reviewer_green=True,
+        auto_merge=False, builder_round=2, max_builder_rounds=5,
+        builder_model="glm-5.3-flash",
+    )
+    target = brief_target(brief)
+    assert target.pr_number == 44
+    assert target.head_sha == head          # full 40-hex, from the canon
+    assert target.builder_round == 2
+
+
+@requires_pg
+def test_attempt_target_prefers_job_row(store):
+    """[Apollo MEDIUM] The job row is authoritative: a brief-parsed target
+    never overrides the structured PR / head SHA / round of the job."""
+    import psycopg as _psycopg
+
+    with _psycopg.connect(DSN, autocommit=True) as c:
+        job_id = c.execute(
+            "INSERT INTO neo_jobs(kind, repo, pr_number, head_sha, "
+            "builder_round, payload) VALUES ('builder', 'acme/widget', 7, %s, "
+            "3, '{}') RETURNING id",
+            ("cd" * 40,),
+        ).fetchone()[0]
+
+    store.record_attempt(UsageAttempt(
+        job_id=job_id, attempt_number=1, route_idx=0,
+        provider="deepseek", model="deepseek-v4-flash",
+        outcome="success",
+        # brief-parse disagrees with the job row — the job row must win
+        pr_number=99, head_sha="ee" * 20, builder_round=0,
+    ))
+    row = store.get_attempts(job_id)[0]
+    assert row.pr_number == 7
+    assert row.head_sha == "cd" * 40
+    assert row.builder_round == 3
+
+
+def test_one_classifier_family_import_smoke():
+    """[Apollo LOW] The classifier moved to src.usage: every lane module must
+    still import, and no agent module may keep a second copy of the anchors."""
+    import importlib
+    import pkgutil
+
+    import src
+    import src.agent_claude as agent_mod
+
+    for mod in pkgutil.iter_modules(src.__path__):
+        importlib.import_module(f"src.{mod.name}")
+
+    assert not hasattr(agent_mod, "_status_code_from")
+    assert not hasattr(agent_mod, "_STATUS_CODE")
+    from src.usage import classify_error_text, status_code_from
+    assert callable(classify_error_text)
+    assert status_code_from("HTTP/1.1 503 down") == 503
+
+
+# ---------------------------------------------------------------------------
+# W1-06 — Apollo round 2: wire header == stored row; job lookup can never
+# kill metering.
+# ---------------------------------------------------------------------------
+
+_GUESS_BRIEF = (
+    "TARGET: PR #44 in deariencampbell1-sys/rhobear-neo at head ababababab.\n"
+    "gh api repos/deariencampbell1-sys/rhobear-neo/commits/"
+    + "ab" * 20 + "/status\n"
+    "git fetch origin && git checkout " + "ab" * 20 + "\n"
+    "You have already spent 1/2 builder rounds on this PR.\n"
+)
+
+
+@requires_pg
+def test_header_and_row_consumer_match(store: UsageStore) -> None:
+    """[Apollo r2, MEDIUM] The consumer ON THE WIRE and the consumer IN THE
+    ROW must be the same value: install-qualified from the owning job's
+    payload, captured from the env the gated subprocess really runs with."""
+    from src.agent_claude import ClaudeAgent
+
+    assert DSN
+    with psycopg.connect(DSN, autocommit=True) as c:
+        job_id = c.execute(
+            "INSERT INTO neo_jobs (kind, repo, head_sha, payload) "
+            "VALUES ('wake', 'x/y', %s, %s) RETURNING id",
+            ("ab" * 20, json.dumps({"installation_id": "777"})),
+        ).fetchone()[0]
+
+    agent = ClaudeAgent(
+        claude_bin=sys.executable, api_key="k",
+        base_url="https://api.deepseek.com/anthropic", model="m",
+        timeout=30.0, gh_token="t")
+    cfg = Config()
+    cfg.claude_bin = sys.executable
+    cfg.deepseek_base_url = "https://api.deepseek.com/anthropic"
+    cfg.deepseek_model = "deepseek-v4-flash"
+    cfg.deepseek_reasoning_effort = "max"
+    cfg.deepseek_max_tokens = 32000
+    cfg.routegate_anthropic_url = "http://127.0.0.1:8645"
+    cfg.routegate_model = "peak"
+
+    captured: dict[str, str] = {}
+
+    def fake_run(cmd, **kw):
+        captured.update({k: v for k, v in (kw.get("env") or {}).items()
+                         if "CONSUMER" in k or "CUSTOM_HEADERS" in k})
+        return subprocess.CompletedProcess(
+            args=["claude"], returncode=0, stderr="",
+            stdout=json.dumps({"type": "result",
+                               "result": "VERDICT: ACCEPT",
+                               "is_error": False, "subtype": "success", "num_turns": 1,
+                               "usage": {"input_tokens": 1, "output_tokens": 1,
+                                         "cache_read_input_tokens": 0,
+                                         "cache_creation_input_tokens": 0}}),
+        )
+
+    try:
+        from src.agent_claude import Route as AgentRoute
+
+        routes = [(4, AgentRoute(provider="deepseek",
+                                 model="deepseek-v4-flash"))]
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "k"}), \
+                patch("src.agent_claude.subprocess.run", side_effect=fake_run):
+            agent.run_with_chain(_GUESS_BRIEF, routes, cfg, "t",
+                                 usage_store=store, job_id=job_id)
+
+        wire = captured["X_RHOBEAR_CONSUMER"]
+        assert wire == "reviews:zeus/777", wire
+        attempts = store.get_attempts(job_id)
+        assert len(attempts) == 1
+        assert attempts[0].consumer == wire, (
+            f"wire {wire!r} != row {attempts[0].consumer!r}")
+    finally:
+        store.clear(job_id)
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute("DELETE FROM neo_jobs WHERE id = %s", (job_id,))
+
+
+@requires_pg
+def test_bad_install_id_never_reaches_the_wire(store: UsageStore) -> None:
+    """[Apollo r3, HIGH] A forged/poisoned `installation_id` in the job
+    payload must not ride into the child env: refused at the source
+    (job_consumer) AND at the sink (agent __init__), so neither the wire nor
+    the row can carry header-injection bytes."""
+    from src.agent_claude import ClaudeAgent, Route as AgentRoute
+
+    assert DSN
+    with psycopg.connect(DSN, autocommit=True) as c:
+        job_id = c.execute(
+            "INSERT INTO neo_jobs (kind, repo, head_sha, payload) "
+            "VALUES ('wake', 'x/y', %s, %s) RETURNING id",
+            ("ab" * 20, json.dumps({"installation_id": "777\r\nX-Injected: 1"})),
+        ).fetchone()[0]
+
+    agent = ClaudeAgent(claude_bin=sys.executable, api_key="k",
+                        base_url="https://api.deepseek.com/anthropic",
+                        model="m", timeout=30.0, gh_token="t")
+    cfg = Config()
+    cfg.claude_bin = sys.executable
+    cfg.deepseek_base_url = "https://api.deepseek.com/anthropic"
+    cfg.deepseek_model = "deepseek-v4-flash"
+    cfg.deepseek_reasoning_effort = "max"
+    cfg.deepseek_max_tokens = 32000
+    cfg.routegate_anthropic_url = "http://127.0.0.1:8645"
+    cfg.routegate_model = "peak"
+
+    captured: dict[str, str] = {}
+
+    def fake_run(cmd, **kw):
+        captured.update({k: v for k, v in (kw.get("env") or {}).items()
+                         if "CONSUMER" in k or "CUSTOM_HEADERS" in k})
+        return subprocess.CompletedProcess(
+            args=["claude"], returncode=0, stderr="",
+            stdout=json.dumps({"type": "result", "result": "VERDICT: ACCEPT",
+                               "is_error": False, "subtype": "success",
+                               "num_turns": 1,
+                               "usage": {"input_tokens": 1, "output_tokens": 1}}),
+        )
+
+    try:
+        routes = [(4, AgentRoute(provider="deepseek",
+                                 model="deepseek-v4-flash"))]
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "k"}), \
+                patch("src.agent_claude.subprocess.run", side_effect=fake_run):
+            agent.run_with_chain(_GUESS_BRIEF, routes, cfg, "t",
+                                 usage_store=store, job_id=job_id)
+
+        wire = captured["X_RHOBEAR_CONSUMER"]
+        assert wire == "reviews:zeus", wire          # bare, not poisoned
+        assert "\r" not in wire and "\n" not in wire
+        attempts = store.get_attempts(job_id)
+        assert attempts[0].consumer == wire
+    finally:
+        store.clear(job_id)
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute("DELETE FROM neo_jobs WHERE id = %s", (job_id,))
+
+
+@requires_pg
+def test_job_target_failure_warns_once(
+        store: UsageStore, caplog: Any, monkeypatch: Any) -> None:
+    """[Apollo r3, MEDIUM] Permanent attribution loss must be OBSERVABLE:
+    the first lookup failure logs WARNING (once, never the poisoned value),
+    later ones stay quiet (rate-limited) — not DEBUG-silence forever."""
+    import logging as _logging
+
+    import src.usage as usage_mod
+
+    monkeypatch.setattr(usage_mod, "_JOB_TARGET_WARNED", False)  # restored
+
+    class BoomConn:
+        def execute(self, *args, **kwargs):
+            raise RuntimeError("neo_jobs is gone")
+
+    with caplog.at_level(_logging.WARNING, logger="rhobear_neo.usage"):
+        store._job_target(BoomConn(), 4242)
+        first = [r for r in caplog.records
+                 if r.levelno == _logging.WARNING and "job target" in r.message]
+        store._job_target(BoomConn(), 4242)
+        store._job_target(BoomConn(), 4242)
+        again = [r for r in caplog.records
+                 if r.levelno == _logging.WARNING and "job target" in r.message]
+    assert len(first) == 1, "first attribution failure must warn"
+    assert len(again) == 1, "subsequent failures must be rate-limited"
+
+
+@requires_pg
+def test_job_lookup_failure_cannot_poison_metering(
+        store: UsageStore, caplog: Any) -> None:
+    """[Apollo r3, MEDIUM] The metering connection is autocommit: a failed
+    job-lookup statement cannot leave an aborted transaction that kills the
+    INSERT (the failure mode that would silently drop ALL metering)."""
+    import logging as _logging
+
+    assert DSN
+    with store._conn() as c:
+        assert c.autocommit is True, "_conn must be autocommit"
+        try:
+            c.execute("SELECT * FROM no_such_table_w106")
+        except Exception:
+            pass                                   # the lookup fails …
+        cur = c.execute(
+            "INSERT INTO neo_usage (job_id, attempt_number, route_idx, "
+            " provider, model, outcome, uncached_input, output_tokens) "
+            "VALUES (555002, 1, 0, 'deepseek', 'm', 'success', 1, 1) "
+            "RETURNING id")
+        assert cur.fetchone() is not None, "metering must survive the failure"
+    store.clear(555002)
+
+
+@requires_pg
+def test_route_name_and_cost_round_trip_postgres(store: UsageStore) -> None:
+    """[Apollo r4, MEDIUM] The new TEXT/DOUBLE columns must round-trip REAL
+    values through Postgres — not just the NULLs the rest of the suite
+    happens to write."""
+    assert DSN
+    ok = store.record_attempt(UsageAttempt(
+        job_id=555003, attempt_number=1, route_idx=0,
+        provider="routegate", model="peak", route_name="peak",
+        cost_usd=0.0042, outcome="success",
+        uncached_input=11, cached_input=4, output_tokens=5,
+        consumer="reviews:zeus/987654321", pr_number=44,
+        head_sha="ab" * 20, builder_round=1,
+    ))
+    assert ok is True
+    try:
+        row, = store.get_attempts(555003)
+        assert row.route_name == "peak"
+        assert row.cost_usd == 0.0042
+        assert row.consumer == "reviews:zeus/987654321"
+        assert row.head_sha == "ab" * 20
+    finally:
+        store.clear(555003)
+
+
+def test_brief_target_never_guesses():
+    """[Apollo r5, LOW] Anything the brief does not carry stays None — a bare
+    40-hex token without the commits/checkout context, a PR mention without
+    the TARGET line, and a round ratio outside the builder sentence must all
+    be ignored (the anchors may never loosen into guessing)."""
+    from src.usage import brief_target
+
+    target = brief_target(
+        "Please look at PR 44, sha 1234567890abcdef1234567890abcdef12345678, "
+        "and we are at 7/9 rounds of patience. No structure here.")
+    assert target.pr_number is None
+    assert target.head_sha is None
+    assert target.builder_round is None
+
+    empty = brief_target("")
+    assert (empty.pr_number, empty.head_sha, empty.builder_round) == (None, None, None)

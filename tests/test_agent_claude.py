@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -1111,12 +1112,34 @@ class TestStartupValidation:
         cfg.require().validate()  # should not raise
 
     def test_main_uses_validate_chain(self) -> None:
-        """main() must call .validate() — verify the chain is wired."""
+        """main() must drive `.require().validate()` FIRST — proved by
+        running it: a config whose validate() raises must take the process
+        down that chain and abort before any side effect (behavioural, per
+        Defect 6 — a source regex cannot tell a missing call from a
+        reformat)."""
         from src import __main__ as entrypoint
-        import inspect
-        source = inspect.getsource(entrypoint.main)
-        assert "require().validate()" in source, \
+
+        calls: list[str] = []
+
+        class ValidateBoom(RuntimeError):
+            pass
+
+        class _ConfigProbe:
+            def require(self):
+                calls.append("require")
+                return self
+
+            def validate(self):
+                calls.append("validate")
+                raise ValidateBoom("stop before side effects")
+
+        with patch.object(entrypoint._config, "load",
+                          lambda: _ConfigProbe()):
+            with pytest.raises(ValidateBoom):
+                entrypoint.main()
+        assert calls == ["require", "validate"], (
             "main() must call require().validate() before any side effect"
+        )
 
 
 # ===================================================================
@@ -1124,74 +1147,80 @@ class TestStartupValidation:
 # ===================================================================
 
 class TestProtocolCensus:
-    """neo_protocol.py must not contain stale DeepSeek-Pro, Pi, direct-HTTP,
-    Windows-home-path, OpenRouter-prefixed-model, or [1m]-suffix references.
-    The exact direct model ID `deepseek-v4-flash` (lowercase) is allowed —
-    only the stale/prefix/suffix forms are banned."""
+    """The stale-token census runs against what neo_protocol PUTS OUT at
+    runtime — the module's docstring and the brief build_brief() hands the
+    agent — not against the .py file's bytes.  Defect 6: a source-text
+    assertion breaks on any reformat and proves nothing about behaviour;
+    the shipped texts are what an operator or an agent can actually see.
+    tests/test_no_source_text_assertions.py enforces this tree-wide."""
 
     @staticmethod
-    def _protocol_source() -> str:
-        src_dir = os.path.join(os.path.dirname(__file__), "..", "src")
-        with open(os.path.join(src_dir, "neo_protocol.py")) as f:
-            return f.read()
+    def _runtime_texts() -> list[str]:
+        from src import neo_protocol
+        brief = neo_protocol.build_brief(
+            repo="o/r", pr=7, head_sha="a" * 40,
+            reviewer_context="apollo", reviewer_green=True,
+            auto_merge=False, builder_round=1, max_builder_rounds=5,
+            builder_model="deepseek-v4-flash")
+        return [neo_protocol.__doc__ or "", brief]
 
     def test_no_deepseek_pro_reference(self) -> None:
         """'DeepSeek-Pro' (capital D, capital S, capital P) is stale."""
-        src = self._protocol_source()
-        assert "DeepSeek-Pro" not in src, (
-            "neo_protocol.py must not mention DeepSeek-Pro"
-        )
+        for text in self._runtime_texts():
+            assert "DeepSeek-Pro" not in text, (
+                "neo_protocol must not mention DeepSeek-Pro"
+            )
 
     def test_no_headless_deepseek_reference(self) -> None:
         """'headless DeepSeek' with capital letters is the old agent description."""
-        src = self._protocol_source()
-        assert "headless DeepSeek" not in src, (
-            "neo_protocol.py must not mention 'headless DeepSeek'"
-        )
+        for text in self._runtime_texts():
+            assert "headless DeepSeek" not in text, (
+                "neo_protocol must not mention 'headless DeepSeek'"
+            )
 
     def test_no_pi_reference(self) -> None:
         """'Pi' (the old Pi protocol) is stale in the protocol text."""
-        src = self._protocol_source()
-        assert " Pi " not in src and "Pi\n" not in src, (
-            "neo_protocol.py must not reference Pi protocol"
-        )
+        for text in self._runtime_texts():
+            assert " Pi " not in text and "Pi\n" not in text, (
+                "neo_protocol must not reference Pi protocol"
+            )
 
     def test_no_direct_http_reference(self) -> None:
         """'direct' as in 'direct HTTP' or 'direct DeepSeek' is stale."""
-        src = self._protocol_source()
-        assert "direct " not in src, (
-            "neo_protocol.py must not describe direct-HTTP or direct-DeepSeek paths"
-        )
+        for text in self._runtime_texts():
+            assert "direct " not in text, (
+                "neo_protocol must not describe direct-HTTP or direct-DeepSeek paths"
+            )
 
     def test_no_prefixed_model_reference(self) -> None:
         """'deepseek/deepseek-v4-flash' (the OpenRouter slug) is stale — the
         protocol must name the exact unprefixed direct ID."""
-        src = self._protocol_source()
-        assert "deepseek/deepseek-v4-flash" not in src, (
-            "neo_protocol.py must not mention the prefixed OpenRouter model slug"
-        )
+        for text in self._runtime_texts():
+            assert "deepseek/deepseek-v4-flash" not in text, (
+                "neo_protocol must not mention the prefixed OpenRouter model slug"
+            )
 
     def test_no_context_suffix_reference(self) -> None:
         """'[1m]' (the OpenRouter CLI context hint) is stale — the direct
         route takes the bare model ID."""
-        src = self._protocol_source()
-        assert "[1m]" not in src, (
-            "neo_protocol.py must not mention the [1m] context suffix"
-        )
+        for text in self._runtime_texts():
+            assert "[1m]" not in text, (
+                "neo_protocol must not mention the [1m] context suffix"
+            )
 
     def test_no_windows_home_path(self) -> None:
         """Hardcoded Windows home paths (C:/Users/) must not appear."""
-        src = self._protocol_source()
-        assert "C:/Users/" not in src, (
-            "neo_protocol.py must not contain hardcoded Windows home paths"
-        )
+        for text in self._runtime_texts():
+            assert "C:/Users/" not in text, (
+                "neo_protocol must not contain hardcoded Windows home paths"
+            )
 
     def test_no_windows_path_reference(self) -> None:
         """'Windows' as a path reference is stale (VPS runtime)."""
-        src = self._protocol_source()
-        assert "Windows" not in src, (
-            "neo_protocol.py must not reference Windows paths"
-        )
+        for text in self._runtime_texts():
+            assert "Windows" not in text, (
+                "neo_protocol must not reference Windows paths"
+            )
 
 
 # ===================================================================
@@ -1351,3 +1380,990 @@ class TestAnchoredFallthroughClassification:
             stderr="")
         got = agent._classify_agent_error(NonZeroExit("x"), agent, proc=proc)
         assert got[0] is False and got[1] != "5xx"
+
+
+
+# ===================================================================
+# W1-06 — RouteGate wiring, optional gh_token, config defaults
+# ===================================================================
+
+class _FakeUsageStore:
+    """In-memory UsageStore stand-in (no Postgres): same idempotency rule
+    (unique on job_id + attempt_number + route_idx)."""
+
+    def __init__(self) -> None:
+        self.rows: list[Any] = []
+        self._keys: set[tuple] = set()
+
+    def record_attempt(self, attempt: Any) -> bool:
+        key = (attempt.job_id, attempt.attempt_number, attempt.route_idx)
+        if key in self._keys:
+            return False
+        self._keys.add(key)
+        self.rows.append(attempt)
+        return True
+
+
+def _zeus_brief() -> str:
+    """A real-shaped triage brief: TARGET line, canon status call with the
+    full 40-hex head SHA, builder-round sentence."""
+    head = "ab" * 20
+    return (
+        "TARGET: PR #44 in acme/widget at head " + head[:12] + "\n"
+        "gh api repos/acme/widget/commits/" + head + "/status\n"
+        "You have already spent 1/2 builder rounds on this PR.\n"
+    )
+
+
+def test_zeus_calls_go_through_roulegate(tmp_path: Any) -> None:
+    """Zeus's model calls resolve through RouteGate — never a direct provider
+    client built on the agent's own initiative.
+
+    from_config points the CLI at RouteGate's Anthropic wire (brief step 2's
+    conditional endpoint) with the consumer header, the attempt executes
+    against a live loopback RouteGate, and the row lands metered with the
+    consumer, PR, head SHA, builder round, tokens in/out/cached and only the
+    cost the response actually carried.
+    """
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    captured: dict[str, Any] = {}
+
+    class RouteGateHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802
+            length = int(self.headers.get("Content-Length") or 0)
+            self.rfile.read(length)
+            captured["path"] = self.path
+            captured["consumer"] = self.headers.get("X-RHOBEAR-Consumer")
+            body = json.dumps({
+                "id": "msg_1", "type": "message", "role": "assistant",
+                "model": "peak",
+                "content": [{"type": "text", "text": "ok"}],
+                "usage": {"input_tokens": 7, "output_tokens": 3,
+                          "estimated_cost": 0.0042},
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args: Any) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), RouteGateHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    # Fake Claude CLI: talks to whatever base URL the agent configured,
+    # carrying the consumer header the way Claude Code carries
+    # ANTHROPIC_CUSTOM_HEADERS, then emits a normal result envelope (with the
+    # cost RouteGate reported — nothing invented).
+    script = (
+        "import json, os, sys, urllib.request\n"
+        "base = os.environ['ANTHROPIC_BASE_URL']\n"
+        "# The real Claude CLI resolves base + /v1/messages itself — mirror\n"
+        "# that contract instead of posting the base verbatim.\n"
+        "url = base.rstrip('/') + '/v1/messages'\n"
+        "headers = {'Content-Type': 'application/json'}\n"
+        "custom = os.environ.get('ANTHROPIC_CUSTOM_HEADERS', '')\n"
+        "if ':' in custom:\n"
+        "    name, value = custom.split(':', 1)\n"
+        "    headers[name.strip()] = value.strip()\n"
+        "if os.environ.get('X_RHOBEAR_CONSUMER'):\n"
+        "    headers['X-RHOBEAR-Consumer'] = os.environ['X_RHOBEAR_CONSUMER']\n"
+        "req = urllib.request.Request(url, data=b'{}', headers=headers)\n"
+        "try:\n"
+        "    urllib.request.urlopen(req, timeout=5).read()\n"
+        "except Exception as exc:\n"
+        "    print('route gate probe failed: %s' % exc, file=sys.stderr)\n"
+        "    sys.exit(3)\n"
+        "print(json.dumps({\n"
+        "    'type': 'result', 'subtype': 'success', 'is_error': False,\n"
+        "    'result': 'VERDICT: ACCEPT-READY',\n"
+        "    'usage': {'input_tokens': 11, 'output_tokens': 5,\n"
+        "              'cache_read_input_tokens': 4,\n"
+        "              'estimated_cost': 0.0042},\n"
+        "    'num_turns': 1, 'stop_reason': 'end_turn',\n"
+        "    'permission_denials': [],\n"
+        "}))\n"
+        "sys.exit(0)\n"
+    )
+    script_path = tmp_path / "claude-fake"
+    script_path.write_text("#!" + sys.executable + "\n" + script)
+    script_path.chmod(0o755)
+
+    cfg = Config()
+    cfg.claude_bin = str(script_path)
+    cfg.deepseek_base_url = BASE
+    cfg.deepseek_model = MODEL
+    cfg.deepseek_reasoning_effort = "max"
+    cfg.deepseek_max_tokens = 32000
+    cfg.deepseek_timeout = 60
+    cfg.routegate_anthropic_url = "http://127.0.0.1:%d" % server.server_address[1]
+    cfg.routegate_model = "peak"
+
+    # The guard demands RouteGate's loopback PORT; this test's fake gate
+    # binds an ephemeral one, so pin the constant to the bound port for the
+    # run (production keeps 8645 — see ROUTEGATE_LOOPBACK_PORT).
+    port_patch = patch("src.agent_claude.ROUTEGATE_LOOPBACK_PORT",
+                       server.server_address[1])
+    port_patch.start()
+
+    try:
+        # RouteGate first: the agent must NOT build a direct provider client.
+        agent = ClaudeAgent.from_config(cfg, gh_token=GH_TOKEN)
+        assert agent.base_url.rstrip("/") == cfg.routegate_anthropic_url
+        env = agent._build_env(str(tmp_path / "neo-config"))
+        assert env["ANTHROPIC_BASE_URL"] == cfg.routegate_anthropic_url
+        # The consumer header travels with the call.
+        assert env["ANTHROPIC_CUSTOM_HEADERS"].startswith(
+            "X-RHOBEAR-Consumer: reviews:zeus"
+        )
+        assert env["X_RHOBEAR_CONSUMER"] == env["ANTHROPIC_CUSTOM_HEADERS"].split(
+            "X-RHOBEAR-Consumer: ", 1
+        )[1]
+
+        store = _FakeUsageStore()
+        usage, verdict, ridx, route = agent.run_with_chain(
+            _zeus_brief(), [], cfg, GH_TOKEN,
+            usage_store=store, job_id=11,
+        )
+
+        # The call actually reached RouteGate, with the header.
+        assert captured.get("path", "").endswith("/v1/messages")
+        assert captured.get("consumer", "").startswith("reviews:zeus")
+        assert captured["consumer"] == env["X_RHOBEAR_CONSUMER"]
+
+        assert verdict == "ACCEPT-READY"
+        assert usage["input_tokens"] == 11
+        assert route is not None and route.provider == "routegate"
+
+        # The attempt is metered: consumer, PR, head SHA, builder round,
+        # tokens in/out/cached, and only the cost the response carried.
+        assert len(store.rows) == 1
+        row = store.rows[0]
+        assert row.outcome == "success"
+        assert row.route_name == "peak"
+        assert row.consumer == captured["consumer"]
+        assert row.pr_number == 44
+        assert row.head_sha == "ab" * 20
+        assert row.builder_round == 1
+        assert row.uncached_input == 11
+        assert row.output_tokens == 5
+        assert row.cached_input == 4
+        assert row.cost_usd == 0.0042
+        assert row.had_gh_token is True, "gated path records identity too"
+    finally:
+        server.shutdown()
+        server.server_close()
+        port_patch.stop()
+
+
+def test_from_config_without_gh_token(caplog: Any) -> None:
+    """from_config() must construct WITHOUT a gh_token keyword, warn once per
+    process, and never raise (edge 5: a caller that does pass a token still
+    gets it — see test_from_config above)."""
+    import logging as _logging
+
+    import src.agent_claude as agent_mod
+
+    cfg = Config()
+    cfg.deepseek_base_url = BASE
+    cfg.deepseek_model = MODEL
+    cfg.deepseek_reasoning_effort = "max"
+    cfg.deepseek_max_tokens = 32000
+    cfg.deepseek_timeout = 1800
+    cfg.claude_bin = CLAUDE_BIN
+
+    with patch.object(agent_mod, "_GH_TOKEN_WARNED", False):
+        with caplog.at_level(_logging.WARNING):
+            agent = ClaudeAgent.from_config(cfg)
+            ClaudeAgent.from_config(cfg)  # second call must not re-warn
+
+    assert agent is not None
+    assert agent.gh_token == ""
+    warnings = [r.getMessage() for r in caplog.records
+                if "GH_TOKEN" in r.getMessage()]
+    assert len(warnings) == 1, warnings
+
+
+def test_validate_discards_foreign_routegate_url() -> None:
+    """Fail-closed where briefs flow: a foreign `routegate_anthropic_url`
+    is DISCARDED at startup (gate off, direct chain stands — never carried,
+    never fatal), so only the loopback RouteGate can hold Zeus's briefs.
+    The OpenAI-shape `routegate_base_url` carries no brief traffic
+    (no call site in this lane), so per Apollo r3's burn history (a validate
+    raise kept both services down) it warns and defaults instead of
+    crash-looping."""
+    from src.config import ROUTEGATE_BASE_URL
+
+    cfg = Config()
+    cfg.deepseek_base_url = BASE
+    cfg.deepseek_model = MODEL
+    cfg.deepseek_reasoning_effort = "max"
+    cfg.deepseek_max_tokens = 32000
+    cfg.claude_bin = sys.executable  # hermetic: no production binary needed
+
+    cfg.validate()  # loopback defaults are valid
+
+    foreign = Config()
+    foreign.claude_bin = sys.executable
+    foreign.routegate_base_url = "https://elsewhere.example/v1"
+    foreign.validate()                                # must not raise
+    assert foreign.routegate_base_url == ROUTEGATE_BASE_URL   # defaulted
+
+    offbox = Config()
+    offbox.claude_bin = sys.executable
+    offbox.routegate_anthropic_url = "https://elsewhere.example/v1/messages"
+    offbox.validate()                                # must not crash-loop
+    assert offbox.routegate_anthropic_url == "", (
+        "a malformed anthropic URL must be DISCARDED (gate off, direct "
+        "chain stands), never carried and never fatal")
+
+
+def test_validate_replaces_unknown_routegate_model() -> None:
+    """[Apollo r3, MEDIUM] The capability NAME is not a security boundary:
+    a typo'd NEO_ROUTEGATE_MODEL warns and defaults to `peak` instead of
+    crash-looping the service — brief containment lives in the
+    anthropic-URL guard and the agent's parsed loopback check."""
+    from src.config import ROUTEGATE_MODEL
+
+    cfg = Config()
+    cfg.deepseek_base_url = BASE
+    cfg.deepseek_model = MODEL
+    cfg.deepseek_reasoning_effort = "max"
+    cfg.deepseek_max_tokens = 32000
+    cfg.claude_bin = sys.executable
+    cfg.routegate_model = "fast"
+    cfg.validate()                                   # must not raise
+    assert cfg.routegate_model == ROUTEGATE_MODEL
+
+
+def test_roulegate_refuses_foreign_url() -> None:
+    """[Apollo HIGH/MEDIUM] The loopback guard is a security path: a
+    routegate_anthropic_url that is not the loopback gate must be refused
+    BOTH by from_config and by run_with_chain, so a cfg mutated after
+    validate() can never carry a brief off-box."""
+    cfg = Config()
+    cfg.deepseek_base_url = BASE
+    cfg.deepseek_model = MODEL
+    cfg.deepseek_reasoning_effort = "max"
+    cfg.deepseek_max_tokens = 32000
+    cfg.claude_bin = CLAUDE_BIN
+    cfg.routegate_anthropic_url = "https://evil.example/v1/messages"
+
+    with pytest.raises(AgentError, match="loopback"):
+        ClaudeAgent.from_config(cfg, gh_token=GH_TOKEN)
+
+    agent = _make_agent()
+    with pytest.raises(AgentError, match="loopback"):
+        agent.run_with_chain(
+            _zeus_brief(), [], cfg, GH_TOKEN,
+            usage_store=_FakeUsageStore(), job_id=1,
+        )
+
+
+def test_consumer_header_rejects_bad_install_id(tmp_path: Any) -> None:
+    """[Apollo MEDIUM] The consumer embeds an install id that reaches a
+    header env var: a value with newlines/CRLF must never get there."""
+    cfg = Config()
+    cfg.deepseek_base_url = BASE
+    cfg.deepseek_model = MODEL
+    cfg.deepseek_reasoning_effort = "max"
+    cfg.deepseek_max_tokens = 32000
+    cfg.claude_bin = CLAUDE_BIN
+    cfg.routegate_anthropic_url = "http://127.0.0.1:8645"
+
+    bad = ClaudeAgent.from_config(
+        cfg, gh_token=GH_TOKEN, install_id="123\r\nX-Injected: 1")
+    assert bad.consumer == "reviews:zeus"
+    env = bad._build_env(str(tmp_path / "neo-config"))
+    assert "\n" not in env["ANTHROPIC_CUSTOM_HEADERS"]
+    assert "\r" not in env["ANTHROPIC_CUSTOM_HEADERS"]
+
+    # A real install id still qualifies the consumer (L0's consumer shape).
+    good = ClaudeAgent.from_config(cfg, gh_token=GH_TOKEN, install_id="987654321")
+    assert good.consumer == "reviews:zeus/987654321"
+    assert good._build_env(str(tmp_path / "neo-config"))["X_RHOBEAR_CONSUMER"] == \
+        "reviews:zeus/987654321"
+
+
+def test_roulegate_guard_parses_the_url() -> None:
+    """[Apollo r2, HIGH] The loopback guard must PARSE the URL: scheme,
+    host, no userinfo, RouteGate's port — a prefix check lets
+    `http://127.0.0.1:8645@evil.example/...` (userinfo) and non-RouteGate
+    loopback ports straight through."""
+    cfg = Config()
+    cfg.deepseek_base_url = BASE
+    cfg.deepseek_model = MODEL
+    cfg.deepseek_reasoning_effort = "max"
+    cfg.deepseek_max_tokens = 32000
+    cfg.claude_bin = CLAUDE_BIN
+
+    for evil in (
+        "http://127.0.0.1:8645@evil.example/v1/messages",   # userinfo bypass
+        "http://127.0.0.1:1/v1/messages",                   # not RouteGate's port
+        "https://127.0.0.1:8645/v1/messages",               # not the gate's scheme
+        "http://[::1]:8645/v1/messages",                    # not the gate's host
+        "http://127.0.0.1:8645/v1/messages/../exfil",       # traversal out of /v1
+        "http://127.0.0.1:8645/v1/%2e%2e/admin",            # percent-encoded hop
+    ):
+        cfg.routegate_anthropic_url = evil
+        with pytest.raises(AgentError, match="loopback") as excinfo:
+            ClaudeAgent.from_config(cfg, gh_token=GH_TOKEN)
+        msg = str(excinfo.value)
+        # the refusal names the shape it wants and the path/host it saw …
+        assert "127.0.0.1:8645" in msg and "/v1/messages" in msg, evil
+        # … but never the RAW value: userinfo credentials are redacted
+        # (Apollo r6 — the redacted message shows scheme/host/port/path only)
+        assert "@evil.example" not in msg and "user:" not in msg, evil
+
+
+def test_roulegate_failure_is_metered_and_ends_the_run() -> None:
+    """[Apollo r2, HIGH] The gated failure path: a 402 at the gate is ONE
+    fallthrough row (route name `peak`, consumer, target) and the run ends —
+    no second attempt outside RouteGate."""
+    cfg = Config()
+    cfg.deepseek_base_url = BASE
+    cfg.deepseek_model = MODEL
+    cfg.deepseek_reasoning_effort = "max"
+    cfg.deepseek_max_tokens = 32000
+    cfg.claude_bin = CLAUDE_BIN
+    cfg.routegate_anthropic_url = "http://127.0.0.1:8645"
+    cfg.routegate_model = "peak"
+
+    agent = _make_agent()
+    store = _FakeUsageStore()
+    calls: list[Any] = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(
+            args=["claude"], returncode=0, stderr="",
+            stdout=json.dumps({"type": "result", "is_error": True,
+                               "subtype": "error_during_execution",
+                               "api_error_status": "402"}),
+        )
+
+    with patch("src.agent_claude.subprocess.run", side_effect=fake_run):
+        result = agent.run_with_chain(
+            _zeus_brief(), [], cfg, GH_TOKEN,
+            usage_store=store, job_id=3)
+
+    assert result == ({}, "", None, None)      # gate owns failover: run ends
+    assert len(calls) == 1                     # exactly one attempt, ever
+    row, = store.rows
+    assert row.outcome == "fallthrough"
+    assert row.error_class == "402"
+    assert row.had_gh_token is True, "gated failure rows record identity too"
+    assert row.route_name == "peak"
+    assert row.provider == "routegate"
+    assert row.consumer.startswith("reviews:zeus")
+    assert row.pr_number == 44 and row.head_sha == "ab" * 20
+
+
+def test_roulegate_non_fallthrough_reraises_after_metering() -> None:
+    """[Apollo r2, HIGH] A non-fallthrough failure at the gate is recorded
+    (outcome `error`) and then re-raised — never silently swallowed."""
+    cfg = Config()
+    cfg.deepseek_base_url = BASE
+    cfg.deepseek_model = MODEL
+    cfg.deepseek_reasoning_effort = "max"
+    cfg.deepseek_max_tokens = 32000
+    cfg.claude_bin = CLAUDE_BIN
+    cfg.routegate_anthropic_url = "http://127.0.0.1:8645"
+    cfg.routegate_model = "peak"
+
+    agent = _make_agent()
+    store = _FakeUsageStore()
+
+    def fake_run(cmd, **kw):
+        return subprocess.CompletedProcess(
+            args=["claude"], returncode=0, stderr="", stdout="not json at all")
+
+    with patch("src.agent_claude.subprocess.run", side_effect=fake_run):
+        with pytest.raises(AgentError):
+            agent.run_with_chain(
+                _zeus_brief(), [], cfg, GH_TOKEN,
+                usage_store=store, job_id=4)
+
+    row, = store.rows
+    assert row.outcome == "error"
+    assert row.route_name == "peak"
+    assert row.consumer.startswith("reviews:zeus")
+
+
+def test_sink_scrubs_consumer_header_injection(tmp_path: Any) -> None:
+    """[Apollo r3, HIGH] Validation at the SOURCE is not enough: the consumer
+    is validated again at the SINK (__init__), so a poisoned value (from a
+    forged job payload via UsageStore.job_consumer, or any caller) can never
+    reach ANTHROPIC_CUSTOM_HEADERS."""
+    from src.usage import DEFAULT_CONSUMER
+
+    for poisoned in (
+        "reviews:zeus\r\nX-Injected: 1",
+        "reviews:zeus\nX-Injected: 1",
+        "reviews:zeus; DROP",
+        "anything-else",
+    ):
+        agent = ClaudeAgent(
+            claude_bin=CLAUDE_BIN, api_key="k",
+            base_url="https://api.deepseek.com/anthropic", model=MODEL,
+            consumer=poisoned)
+        assert agent.consumer == DEFAULT_CONSUMER, poisoned
+        env = agent._build_env(str(tmp_path / "neo-config"))
+        headers = env.get("ANTHROPIC_CUSTOM_HEADERS", "")
+        assert "\n" not in headers and "\r" not in headers
+
+    good = ClaudeAgent(
+        claude_bin=CLAUDE_BIN, api_key="k",
+        base_url="http://127.0.0.1:8645", model="peak",
+        consumer="reviews:zeus/987654321")
+    assert good.consumer == "reviews:zeus/987654321"
+
+
+def test_direct_path_carries_no_consumer_header(tmp_path: Any) -> None:
+    """[Apollo r3, LOW] Internal attribution (lane + install id) rides to
+    RouteGate only — the direct provider path must not receive it."""
+    cfg = Config()
+    cfg.deepseek_base_url = BASE
+    cfg.deepseek_model = MODEL
+    cfg.deepseek_reasoning_effort = "max"
+    cfg.deepseek_max_tokens = 32000
+    cfg.claude_bin = CLAUDE_BIN
+    assert not cfg.routegate_anthropic_url   # direct path today
+
+    agent = ClaudeAgent.from_config(cfg, gh_token=GH_TOKEN,
+                                    install_id="987654321")
+    env = agent._build_env(str(tmp_path / "neo-config"))
+    assert "X_RHOBEAR_CONSUMER" not in env
+    assert "ANTHROPIC_CUSTOM_HEADERS" not in env
+
+    # …while the gated path still carries it.
+    cfg.routegate_anthropic_url = "http://127.0.0.1:8645"
+    gated = ClaudeAgent.from_config(cfg, gh_token=GH_TOKEN,
+                                    install_id="987654321")
+    genv = gated._build_env(str(tmp_path / "neo-config"))
+    assert genv["X_RHOBEAR_CONSUMER"] == "reviews:zeus/987654321"
+
+
+def test_operator_custom_header_is_not_inherited(tmp_path: Any) -> None:
+    """[Apollo r5, MEDIUM] The child env is a strict allowlist: an operator's
+    `ANTHROPIC_CUSTOM_HEADERS` (proxy auth? tracing token?) is NOT re-admitted
+    — the gated child receives exactly our consumer header and nothing else."""
+    cfg = Config()
+    cfg.deepseek_base_url = BASE
+    cfg.deepseek_model = MODEL
+    cfg.deepseek_reasoning_effort = "max"
+    cfg.deepseek_max_tokens = 32000
+    cfg.claude_bin = CLAUDE_BIN
+    cfg.routegate_anthropic_url = "http://127.0.0.1:8645"
+
+    agent = ClaudeAgent.from_config(cfg, gh_token=GH_TOKEN)
+    with patch.dict(os.environ,
+                    {"ANTHROPIC_CUSTOM_HEADERS": "X-Org-Trace: sekrit"}):
+        env = agent._build_env(str(tmp_path / "neo-config"))
+    value = env["ANTHROPIC_CUSTOM_HEADERS"]
+    assert value == "X-RHOBEAR-Consumer: reviews:zeus", value
+    assert "sekrit" not in value
+
+
+def test_gh_token_absent_from_child_env_when_missing(tmp_path: Any) -> None:
+    """[Apollo r3, MEDIUM] A missing gh_token must NOT let the operator's
+    personal GH_TOKEN become the child identity: the env is an allowlist,
+    and with no explicit token GH_TOKEN is simply absent."""
+    cfg = Config()
+    cfg.deepseek_base_url = BASE
+    cfg.deepseek_model = MODEL
+    cfg.deepseek_reasoning_effort = "max"
+    cfg.deepseek_max_tokens = 32000
+    cfg.claude_bin = CLAUDE_BIN
+
+    with patch.dict(os.environ, {"GH_TOKEN": "ghp_personal_operator_token"}):
+        agent = ClaudeAgent.from_config(cfg)   # no gh_token
+        env = agent._build_env(str(tmp_path / "neo-config"))
+    assert "GH_TOKEN" not in env
+    # …and with one, the passed token is the identity.
+    with patch.dict(os.environ, {"GH_TOKEN": "ghp_personal_operator_token"}):
+        tok = ClaudeAgent.from_config(cfg, gh_token="ghs_installation_token")
+        tenv = tok._build_env(str(tmp_path / "neo-config"))
+    assert tenv["GH_TOKEN"] == "ghs_installation_token"
+
+
+def test_null_cache_read_is_unknown() -> None:
+    """[Apollo r3, LOW] `cache_read_input_tokens: null` means NOT REPORTED —
+    never silently 0 (unknown stays unknown)."""
+    agent = _make_agent()
+    proc = subprocess.CompletedProcess(
+        args=["claude"], returncode=0, stderr="",
+        stdout=json.dumps({
+            "type": "result", "subtype": "success", "is_error": False,
+            "result": "VERDICT: ACCEPT",
+            "usage": {"input_tokens": 11, "output_tokens": 5,
+                      "cache_read_input_tokens": None},
+            "num_turns": 1, "stop_reason": "end_turn",
+            "permission_denials": [],
+        }))
+    usage, _verdict = agent._parse_output(proc)
+    assert usage["input_tokens"] == 11
+    assert "cached_input" not in usage, "null cache read must stay unknown"
+
+
+def test_validate_accepts_the_real_gate_url() -> None:
+    """[Apollo r4, HIGH] The ACCEPT branch of the fail-closed allow-list is
+    the production flip-switch this whole PR exists for: the exact
+    ROUTEGATE_ANTHROPIC_URL (and its trailing-slash form) must pass
+    validate() and yield a gated agent — otherwise CI is green while both
+    services crash-loop on the env flip."""
+    from src.config import ROUTEGATE_ANTHROPIC_URL
+
+    for url in (ROUTEGATE_ANTHROPIC_URL, ROUTEGATE_ANTHROPIC_URL + "/"):
+        cfg = Config()
+        cfg.deepseek_base_url = BASE
+        cfg.deepseek_model = MODEL
+        cfg.deepseek_reasoning_effort = "max"
+        cfg.deepseek_max_tokens = 32000
+        cfg.claude_bin = sys.executable
+        cfg.routegate_anthropic_url = url
+        cfg.validate()                                # must not raise
+
+        agent = ClaudeAgent.from_config(cfg, gh_token=GH_TOKEN)
+        assert agent.gated, url
+        assert agent.base_url.rstrip("/") == ROUTEGATE_ANTHROPIC_URL, url
+        assert agent.model == "peak"
+
+
+def test_missing_gh_token_is_recorded_on_the_attempt_row() -> None:
+    """[Apollo r4/r5, MEDIUM] A missing identity must be visible in METERING,
+    not only in a boot log: every attempt row carries `had_gh_token` — and it
+    records what the CHILD actually received (the run's gh_token argument),
+    not the token the agent object happens to hold."""
+    from src.usage import Route
+
+    cfg = Config()
+    cfg.deepseek_base_url = BASE
+    cfg.deepseek_model = MODEL
+    cfg.deepseek_reasoning_effort = "max"
+    cfg.deepseek_max_tokens = 32000
+    cfg.claude_bin = CLAUDE_BIN
+
+    envelope = json.dumps({
+        "type": "result", "subtype": "success", "is_error": False,
+        "result": "VERDICT: ACCEPT", "num_turns": 1,
+        "stop_reason": "end_turn", "permission_denials": [],
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    })
+
+    def fake_run(cmd, **kw):
+        return subprocess.CompletedProcess(args=["claude"], returncode=0,
+                                           stderr="", stdout=envelope)
+
+    routes = [(4, Route(provider="deepseek", model=MODEL))]
+    child_env: dict[str, str] = {}
+
+    def recording_run(cmd, **kw):
+        child_env.clear()          # each run's own env, no carry-over
+        child_env.update(kw.get("env") or {})
+        return fake_run(cmd, **kw)
+
+    with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "k"}), \
+            patch("src.agent_claude.subprocess.run", side_effect=recording_run):
+        with_token = ClaudeAgent(
+            claude_bin=CLAUDE_BIN, api_key="k", base_url=BASE, model=MODEL,
+            gh_token="ghs_installation_token")
+        store_ok = _FakeUsageStore()
+        with_token.run_with_chain(_zeus_brief(), routes, cfg,
+                                  "ghs_installation_token",
+                                  usage_store=store_ok, job_id=21)
+        row_ok, = store_ok.rows
+        assert row_ok.had_gh_token is True
+        assert child_env.get("GH_TOKEN") == "ghs_installation_token"
+
+        no_token = ClaudeAgent(
+            claude_bin=CLAUDE_BIN, api_key="k", base_url=BASE, model=MODEL)
+        store_missing = _FakeUsageStore()
+        no_token.run_with_chain(_zeus_brief(), routes, cfg, "",
+                                usage_store=store_missing, job_id=22)
+        row_missing, = store_missing.rows
+        assert row_missing.had_gh_token is False, (
+            "a run without GitHub identity must be flagged in metering")
+        assert "GH_TOKEN" not in child_env
+
+        # The DIVERGENT case (r5): the agent object holds a token but this
+        # run hands the child none — the row must say False, matching the
+        # child env the chain actually built.
+        store_mismatch = _FakeUsageStore()
+        with_token.run_with_chain(_zeus_brief(), routes, cfg, "",
+                                  usage_store=store_mismatch, job_id=23)
+        row_mismatch, = store_mismatch.rows
+        assert "GH_TOKEN" not in child_env
+        assert row_mismatch.had_gh_token is False, (
+            "had_gh_token must record the run argument the child got, "
+            "never self.gh_token")
+
+
+def test_unusable_estimated_cost_warns_and_stays_unknown(
+        caplog: Any) -> None:
+    """[Apollo r4, MEDIUM] A malformed `estimated_cost` from the gate must
+    not crash the run (and must not invent a number): WARNING + no key."""
+    import logging as _logging
+
+    agent = _make_agent()
+    proc = subprocess.CompletedProcess(
+        args=["claude"], returncode=0, stderr="",
+        stdout=json.dumps({
+            "type": "result", "subtype": "success", "is_error": False,
+            "result": "VERDICT: ACCEPT", "num_turns": 1,
+            "stop_reason": "end_turn", "permission_denials": [],
+            "usage": {"input_tokens": 1, "output_tokens": 1,
+                      "estimated_cost": "not-a-number"},
+        }))
+    with caplog.at_level(_logging.WARNING, logger="rhobear_neo.agent"):
+        usage, _verdict = agent._parse_output(proc)
+    assert "cost_usd" not in usage
+    assert any("estimated_cost" in rec.getMessage() for rec in caplog.records)
+
+
+def test_gate_base_follows_the_cli_client_contract() -> None:
+    """[Apollo r5, HIGH] ANTHROPIC_BASE_URL is a BASE: the Claude CLI
+    appends `/v1/messages` itself (see this repo's working
+    deepseek_base_url = https://api.deepseek.com/anthropic).  The gate value
+    must therefore be `http://127.0.0.1:8645`, so the client's real POST
+    lands on `http://127.0.0.1:8645/v1/messages` — not
+    `/v1/messages/v1/messages`."""
+    from src.config import ROUTEGATE_ANTHROPIC_URL
+
+    cfg = Config()
+    cfg.deepseek_base_url = BASE
+    cfg.deepseek_model = MODEL
+    cfg.deepseek_reasoning_effort = "max"
+    cfg.deepseek_max_tokens = 32000
+    cfg.claude_bin = sys.executable
+    cfg.routegate_anthropic_url = ROUTEGATE_ANTHROPIC_URL
+    cfg.validate()
+
+    agent = ClaudeAgent.from_config(cfg, gh_token=GH_TOKEN)
+    assert agent.gated
+    base = agent.base_url.rstrip("/")
+    client_post = base + "/v1/messages"          # the CLI's own resolution
+    assert client_post == "http://127.0.0.1:8645/v1/messages", client_post
+    assert not base.endswith("/messages"), "the configured value is a BASE"
+
+
+def test_boot_discard_composes_with_from_config() -> None:
+    """[Apollo r5, MEDIUM] The two layers have one documented ORDERING
+    contract: boot = validate() first (availability: a typo is discarded,
+    never fatal, and from_config then builds the direct agent); use = the
+    agent's parsed guard (security: a URL mutated AFTER validate() is
+    refused, and the caller's except AgentError releases the job — no boot
+    crash-loop either way)."""
+    cfg = Config()
+    cfg.deepseek_base_url = BASE
+    cfg.deepseek_model = MODEL
+    cfg.deepseek_reasoning_effort = "max"
+    cfg.deepseek_max_tokens = 32000
+    cfg.claude_bin = sys.executable
+
+    # Boot path: validate() runs first (__main__ line 77) …
+    cfg.routegate_anthropic_url = "https://elsewhere.example/v1/messages"
+    cfg.validate()
+    assert cfg.routegate_anthropic_url == ""    # discarded, not raised
+    agent = ClaudeAgent.from_config(cfg, gh_token=GH_TOKEN)
+    assert not agent.gated                      # direct chain stands
+
+    # Security path: post-validate mutation is refused at construction.
+    cfg.routegate_anthropic_url = "https://elsewhere.example/v1/messages"
+    with pytest.raises(AgentError, match="loopback"):
+        ClaudeAgent.from_config(cfg, gh_token=GH_TOKEN)
+
+
+def test_capability_name_is_scrubbed_at_the_sink() -> None:
+    """[Apollo r5, LOW] `cfg.routegate_model` lands in the child's argv — a
+    post-validate mutation must not put e.g. `--evil` there (or into the
+    metered route_name)."""
+    from src.config import ROUTEGATE_MODEL
+
+    cfg = Config()
+    cfg.deepseek_base_url = BASE
+    cfg.deepseek_model = MODEL
+    cfg.deepseek_reasoning_effort = "max"
+    cfg.deepseek_max_tokens = 32000
+    cfg.claude_bin = CLAUDE_BIN
+    cfg.routegate_anthropic_url = "http://127.0.0.1:8645"
+    for poisoned in ("--evil -e sh", "--evil"):  # mutated after validate()
+        cfg.routegate_model = poisoned
+        agent = ClaudeAgent.from_config(cfg, gh_token=GH_TOKEN)
+        assert agent.model == ROUTEGATE_MODEL, poisoned  # scrubbed at sink
+
+
+def test_documented_gate_strings_both_work() -> None:
+    """[Apollo r6, HIGH] BOTH forms the docs hand an operator must turn the
+    gate on: the bare base (canonical) AND the `/v1/messages` endpoint form
+    the field comment used — following the documented instruction may never
+    silently disable the feature this PR exists to enable."""
+    for documented in ("http://127.0.0.1:8645",
+                       "http://127.0.0.1:8645/v1/messages"):
+        cfg = Config()
+        cfg.deepseek_base_url = BASE
+        cfg.deepseek_model = MODEL
+        cfg.deepseek_reasoning_effort = "max"
+        cfg.deepseek_max_tokens = 32000
+        cfg.claude_bin = sys.executable
+        cfg.routegate_anthropic_url = documented
+
+        cfg.validate()                     # must KEEP the gate enabled
+        assert cfg.routegate_anthropic_url == "http://127.0.0.1:8645", \
+            documented
+
+        agent = ClaudeAgent.from_config(cfg, gh_token=GH_TOKEN)
+        assert agent.gated, documented
+        assert agent.base_url == "http://127.0.0.1:8645", documented
+        assert agent.base_url + "/v1/messages" == \
+            "http://127.0.0.1:8645/v1/messages", documented
+
+
+def test_guard_error_never_echoes_credentials() -> None:
+    """[Apollo r6, LOW] A rejected URL with userinfo must not print the
+    credential into logs / escalation output."""
+    from src.agent_claude import _require_loopback_roulegate
+
+    with pytest.raises(AgentError) as excinfo:
+        _require_loopback_roulegate("http://user:sup3rs3cret@evil.example/"
+                                    "v1/messages")
+    msg = str(excinfo.value)
+    assert "sup3rs3cret" not in msg
+    assert "user" not in msg
+
+
+def test_malformed_cache_read_is_unknown_and_survives(caplog: Any) -> None:
+    """[Apollo r6, LOW] A non-integer `cache_read_input_tokens` must behave
+    like the estimated_cost branch: WARNING, key absent, run survives — a
+    ValueError escaping `except AgentError` would kill the run handler."""
+    import logging as _logging
+
+    agent = _make_agent()
+    proc = subprocess.CompletedProcess(
+        args=["claude"], returncode=0, stderr="",
+        stdout=json.dumps({
+            "type": "result", "subtype": "success", "is_error": False,
+            "result": "VERDICT: ACCEPT", "num_turns": 1,
+            "stop_reason": "end_turn", "permission_denials": [],
+            "usage": {"input_tokens": 11, "output_tokens": 5,
+                      "cache_read_input_tokens": "four"},
+        }))
+    with caplog.at_level(_logging.WARNING, logger="rhobear_neo.agent"):
+        usage, _verdict = agent._parse_output(proc)   # must not raise
+    assert "cached_input" not in usage
+    assert any("cache_read" in rec.getMessage() for rec in caplog.records)
+
+
+def test_get_attempts_maps_columns_without_pg() -> None:
+    """[Apollo r6, MEDIUM] The row → UsageAttempt column mapping (order-
+    sensitive zip over the cursor description) is exercised without a
+    database, so a misordered/forgotten field cannot ship green just because
+    the PG round-trip test is skipped in the default run."""
+    from src.usage import UsageStore
+
+    row = (7, 1, 0, "routegate", "peak", 11, 4, 5, None, 812, "success", None,
+           "reviews:zeus/987654321", 44, "ab" * 20, 1, "peak", 0.0042, True)
+
+    class FakeCursor:
+        def __init__(self, sql: str) -> None:
+            # cols come from the SQL get_attempts ACTUALLY sends (Apollo r7):
+            # a reordered/dropped column must fail this test, not production
+            match = re.search(r"SELECT\s+(.*?)\s+FROM\s+neo_usage",
+                              sql, re.S | re.I)
+            assert match, f"unexpected get_attempts SQL: {sql!r}"
+            self.description = [(c.strip(),) for c in
+                                match.group(1).split(",") if c.strip()]
+
+        def fetchall(self):
+            return [row]
+
+    class FakeConn:
+        def execute(self, *args, **kwargs):
+            return FakeCursor(args[0] if args else kwargs.get("query", ""))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    store = UsageStore("postgresql://never-used")
+    with patch.object(type(store), "_conn",
+                      lambda self: FakeConn()):
+        attempts = store.get_attempts(7)
+    attempt, = attempts
+    assert attempt.consumer == "reviews:zeus/987654321"
+    assert attempt.pr_number == 44
+    assert attempt.head_sha == "ab" * 20
+    assert attempt.builder_round == 1
+    assert attempt.route_name == "peak"
+    assert attempt.cost_usd == 0.0042
+    assert attempt.had_gh_token is True
+    assert attempt.total_input() == 15
+
+
+def test_wire_consumer_parity_without_pg() -> None:
+    """[Apollo r7, MEDIUM] The core `getter(job_id) or consumer` branch of
+    `_wire_consumer` must run in the DEFAULT suite (the PG test alone was
+    the only exerciser), AND the install-qualified value the header carries
+    must land in the row — header == row, no database involved."""
+    from src.agent_claude import Route
+
+    class StoreWithJob(_FakeUsageStore):
+        def job_consumer(self, job_id: int) -> str:
+            return "reviews:zeus/777"
+
+    class StoreNoInstall(_FakeUsageStore):
+        def job_consumer(self, job_id: int) -> str:
+            return ""
+
+    agent = _make_agent()
+    assert agent._wire_consumer(StoreWithJob(), 1) == "reviews:zeus/777"
+    assert agent._wire_consumer(StoreNoInstall(), 1) == agent.consumer
+    assert agent._wire_consumer(None, 1) == agent.consumer
+    assert agent._wire_consumer(StoreWithJob(), None) == agent.consumer
+
+    # end to end on the gated path: header value == row value (fake store,
+    # no PG) — the install-qualified consumer reaches BOTH.
+    cfg = Config()
+    cfg.claude_bin = sys.executable
+    cfg.deepseek_base_url = BASE
+    cfg.deepseek_model = MODEL
+    cfg.deepseek_reasoning_effort = "max"
+    cfg.deepseek_max_tokens = 32000
+    cfg.routegate_anthropic_url = "http://127.0.0.1:8645"
+    cfg.routegate_model = "peak"
+
+    store = StoreWithJob()
+    captured: dict[str, str] = {}
+
+    def fake_run(cmd, **kw):
+        env = kw.get("env") or {}
+        captured.update({k: v for k, v in env.items() if "CONSUMER" in k})
+        return subprocess.CompletedProcess(
+            args=["claude"], returncode=0, stderr="",
+            stdout=json.dumps({"type": "result", "result": "VERDICT: ACCEPT",
+                               "is_error": False, "subtype": "success",
+                               "num_turns": 1,
+                               "usage": {"input_tokens": 1,
+                                         "output_tokens": 1}}),
+        )
+
+    with patch("subprocess.run", side_effect=fake_run):
+        agent.run_with_chain(_zeus_brief(), [(Route("routegate", "peak"), 1)],
+                             cfg, GH_TOKEN, usage_store=store, job_id=11)
+    row, = store.rows
+    assert row.consumer == "reviews:zeus/777"
+    assert captured["X_RHOBEAR_CONSUMER"] == "reviews:zeus/777"
+
+
+def test_query_or_fragment_gate_url_is_refused() -> None:
+    """[Apollo r7, MEDIUM] A gate URL carrying a query or fragment must be
+    REFUSED, never accepted and returned mangled by a position slice
+    (`.../v1/messages?x=1` → `http://127.0.0.1:8645/v1/`)."""
+    from src.agent_claude import _require_loopback_roulegate
+
+    for evil in ("http://127.0.0.1:8645/v1/messages?x=1",
+                 "http://127.0.0.1:8645#frag",
+                 "http://127.0.0.1:8645/v1/messages#frag"):
+        with pytest.raises(AgentError, match="loopback"):
+            _require_loopback_roulegate(evil)
+
+    # and the accepted endpoint form still normalises to the exact base
+    assert _require_loopback_roulegate(
+        "http://127.0.0.1:8645/v1/messages") == "http://127.0.0.1:8645"
+
+
+def test_missing_gh_token_is_error_at_the_call_site(caplog: Any) -> None:
+    """[Apollo r6, MEDIUM] A run with no GitHub identity must be visible in
+    the JOURNAL: an ERROR at the neo_worker call site that constructs the
+    agent (naming the job's run), not only from_config's once-per-process
+    line and `had_gh_token=False` on the metering rows.  The token-positive
+    control proves the line is emitted because the identity is missing, not
+    unconditionally."""
+    import contextlib
+    import logging as _logging
+
+    from src.jev_review import JevAssessment
+    from src.neo_worker import run_neo
+
+    class _State:
+        def already_acted(self, *a, **k):
+            return False
+
+        def builder_rounds(self, repo, pr):
+            return 0
+
+        def install(self, org, key):
+            return {}
+
+        def record(self, *a, **k):
+            pass
+
+        def record_escalating(self, *a, **k):
+            pass
+
+        def debit(self, *a, **k):
+            pass
+
+    class _Jobs:
+        def claim(self, *a, **k):
+            return True
+
+        def lease_renewal(self, *a, **k):
+            @contextlib.contextmanager
+            def _cm():
+                yield
+            return _cm()
+
+        def get(self, job_id):
+            return {"attempt": 1}
+
+        def resolve(self, *a, **k):
+            pass
+
+        def retry(self, *a, **k):
+            pass
+
+        def park(self, *a, **k):
+            pass
+
+        def create_builder(self, *a, **k):
+            pass
+
+        def create_wake(self, *a, **k):
+            raise AssertionError("wake carries job_id — create_wake unused")
+
+    def drive(token: str) -> list[str]:
+        cfg = Config()
+        cfg.deepseek_timeout = 60
+        wake = {"repo": "o/r", "sha": "c" * 40, "green": True,
+                "context": "rhobear-reviews", "pr_number": 5, "job_id": 42}
+        caplog.clear()
+        with caplog.at_level(_logging.ERROR, logger="rhobear_neo.worker"), \
+                patch("src.neo_worker.repo_token", return_value=token), \
+                patch("src.neo_worker.resolve_pr", return_value=5), \
+                patch("src.neo_worker._review_evidence",
+                      return_value={"ok": False, "reason": "no evidence"}), \
+                patch("src.neo_worker._jev_for_pr",
+                      return_value=JevAssessment(False, reason="no key")), \
+                patch("src.neo_worker._run_agent",
+                      return_value=({"input_tokens": 1, "output_tokens": 1},
+                                    "FIX-FORWARD", 0, None)):
+            run_neo(cfg, _State(), _Jobs(), wake, usage_store=None)
+        return [r.getMessage() for r in caplog.records
+                if r.name == "rhobear_neo.worker"
+                and r.levelno >= _logging.ERROR]
+
+    without = drive("")
+    assert any("gh_token" in msg for msg in without), (
+        "a run constructed without gh_token must log an ERROR at the caller"
+    )
+    with_token = drive("ghs_installation_token")
+    assert not any("gh_token" in msg for msg in with_token), (
+        "a run WITH identity must not emit the missing-identity ERROR"
+    )

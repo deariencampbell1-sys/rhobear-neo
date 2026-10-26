@@ -734,8 +734,47 @@ class TestBuilderChainNeverResetsOverCommittedWork:
         assert "route fix" in log, "the committed fix was not reset away"
 
 
-def test_builder_main_ensures_usage_schema():
-    import inspect
+def test_builder_main_ensures_usage_schema(monkeypatch):
+    """Behavioural (Defect 6 — no source text): drive nb.main() and prove
+    it creates the usage store and calls ensure_schema() ITSELF before the
+    poll loop — the builder process writes usage rows, so it must not
+    depend on the webhook process having created the table first."""
     from src import neo_builder as nb
-    src = inspect.getsource(nb.main)
-    assert "UsageStore(cfg.database_url).ensure_schema()" in src
+    from src import usage as usage_mod
+
+    calls: list[str] = []
+
+    class StopAfterSchemas(RuntimeError):
+        pass
+
+    class _FakeJobs:
+        def __init__(self, dsn):
+            self.dsn = dsn
+
+        def ensure_schema(self):
+            calls.append("jobs.ensure_schema")
+
+    class _FakeUsageStore:
+        def __init__(self, dsn):
+            self.dsn = dsn
+
+        def ensure_schema(self):
+            calls.append("usage.ensure_schema")
+
+    def _boom_pool(*args, **kwargs):
+        raise StopAfterSchemas()   # stop right after both schemas exist
+
+    monkeypatch.setattr(nb, "Jobs", _FakeJobs)
+    monkeypatch.setattr(nb, "github_app_for", lambda cfg: object())
+    monkeypatch.setattr(usage_mod, "UsageStore", _FakeUsageStore)
+    monkeypatch.setattr(nb.concurrent.futures, "ThreadPoolExecutor",
+                        _boom_pool)
+    # env for a config that passes require().validate() hermetically
+    monkeypatch.setenv("RHOBEAR_NEO_WEBHOOK_SECRET", "test-secret")
+    monkeypatch.setenv("NEO_DEEPSEEK_API_KEY", "sk-test")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://localhost/neo_test")
+    monkeypatch.setenv("NEO_CLAUDE_BIN", sys.executable)
+
+    with pytest.raises(StopAfterSchemas):
+        nb.main()
+    assert calls == ["jobs.ensure_schema", "usage.ensure_schema"], calls
