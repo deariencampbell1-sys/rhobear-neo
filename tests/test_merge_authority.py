@@ -2085,3 +2085,21 @@ def test_a_red_reviewer_after_a_green_one_still_refuses_the_merge():
         ok, reason = _authority(_bundle(greens))
         assert ok is False, (sources, reason)
         assert "z-red" in reason, (sources, reason)
+
+
+def test_an_architect_status_from_a_non_owner_account_is_refused():
+    """Defect 4 (HIGH): the "architect status from the owner's account" branch
+    had only a positive test. On the non-lane merge path, an architect status
+    success set by a NON-OWNER account is refused: green2_ok False with a
+    reason naming the creator rule (it must be set from the owner's account).
+    Both the always-architect lane repo and the enabled-source route refuse.
+    The positive case (test_architect_approval_counts_as_green_2_on_the_exact_head)
+    stays green."""
+    for repo, enabled in ((W1_LANE_REPO, ()), ("acme/a", ("architect",))):
+        greens = _greens(repo=repo, reviews=[_review("APPROVED")],
+                         statuses=[_status("architect/l1-reviews", login="mallory")],
+                         enabled=enabled)
+        assert greens["green2_ok"] is False, (repo, greens)
+        assert "owner's account" in greens["green2_reason"], greens["green2_reason"]
+        ok, reason = _authority(_bundle(greens), install_auto_merge=True)
+        assert ok is False, (repo, reason)
