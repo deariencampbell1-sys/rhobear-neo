@@ -1584,9 +1584,14 @@ def test_neo_max_builder_rounds_default_is_2() -> None:
 
 
 def test_validate_rejects_foreign_routegate_url() -> None:
-    """Fail-closed: only the loopback RouteGate may hold Zeus's briefs — a
-    foreign routegate_base_url / routegate_anthropic_url is refused at
-    startup, same discipline as deepseek_base_url."""
+    """Fail-closed where briefs flow: only the loopback RouteGate may hold
+    Zeus's briefs — a foreign `routegate_anthropic_url` is refused at
+    startup.  The OpenAI-shape `routegate_base_url` carries no brief traffic
+    (no call site in this lane), so per Apollo r3's burn history (a validate
+    raise kept both services down) it warns and defaults instead of
+    crash-looping."""
+    from src.config import ROUTEGATE_BASE_URL
+
     cfg = Config()
     cfg.deepseek_base_url = BASE
     cfg.deepseek_model = MODEL
@@ -1598,13 +1603,31 @@ def test_validate_rejects_foreign_routegate_url() -> None:
 
     foreign = Config()
     foreign.routegate_base_url = "https://elsewhere.example/v1"
-    with pytest.raises(ValueError, match="routegate_base_url"):
-        foreign.validate()
+    foreign.validate()                                # must not raise
+    assert foreign.routegate_base_url == ROUTEGATE_BASE_URL   # defaulted
 
     offbox = Config()
     offbox.routegate_anthropic_url = "https://elsewhere.example/v1/messages"
     with pytest.raises(ValueError, match="routegate_anthropic_url"):
         offbox.validate()
+
+
+def test_validate_replaces_unknown_routegate_model() -> None:
+    """[Apollo r3, MEDIUM] The capability NAME is not a security boundary:
+    a typo'd NEO_ROUTEGATE_MODEL warns and defaults to `peak` instead of
+    crash-looping the service — brief containment lives in the
+    anthropic-URL guard and the agent's parsed loopback check."""
+    from src.config import ROUTEGATE_MODEL
+
+    cfg = Config()
+    cfg.deepseek_base_url = BASE
+    cfg.deepseek_model = MODEL
+    cfg.deepseek_reasoning_effort = "max"
+    cfg.deepseek_max_tokens = 32000
+    cfg.claude_bin = sys.executable
+    cfg.routegate_model = "fast"
+    cfg.validate()                                   # must not raise
+    assert cfg.routegate_model == ROUTEGATE_MODEL
 
 
 def test_roulegate_refuses_foreign_url() -> None:
@@ -1640,6 +1663,7 @@ def test_consumer_header_rejects_bad_install_id(tmp_path: Any) -> None:
     cfg.deepseek_reasoning_effort = "max"
     cfg.deepseek_max_tokens = 32000
     cfg.claude_bin = CLAUDE_BIN
+    cfg.routegate_anthropic_url = "http://127.0.0.1:8645/v1/messages"
 
     bad = ClaudeAgent.from_config(
         cfg, gh_token=GH_TOKEN, install_id="123\r\nX-Injected: 1")
@@ -1751,3 +1775,124 @@ def test_roulegate_non_fallthrough_reraises_after_metering() -> None:
     assert row.outcome == "error"
     assert row.route_name == "peak"
     assert row.consumer.startswith("reviews:zeus")
+
+
+def test_sink_scrubs_consumer_header_injection() -> None:
+    """[Apollo r3, HIGH] Validation at the SOURCE is not enough: the consumer
+    is validated again at the SINK (__init__), so a poisoned value (from a
+    forged job payload via UsageStore.job_consumer, or any caller) can never
+    reach ANTHROPIC_CUSTOM_HEADERS."""
+    from src.usage import DEFAULT_CONSUMER
+
+    for poisoned in (
+        "reviews:zeus\r\nX-Injected: 1",
+        "reviews:zeus\nX-Injected: 1",
+        "reviews:zeus; DROP",
+        "anything-else",
+    ):
+        agent = ClaudeAgent(
+            claude_bin=CLAUDE_BIN, api_key="k",
+            base_url="https://api.deepseek.com/anthropic", model=MODEL,
+            consumer=poisoned)
+        assert agent.consumer == DEFAULT_CONSUMER, poisoned
+        env = agent._build_env(str(os.path.join(tempfile.gettempdir(),
+                                                "neo-config")))
+        headers = env.get("ANTHROPIC_CUSTOM_HEADERS", "")
+        assert "\n" not in headers and "\r" not in headers
+
+    good = ClaudeAgent(
+        claude_bin=CLAUDE_BIN, api_key="k",
+        base_url="http://127.0.0.1:8645/v1/messages", model="peak",
+        consumer="reviews:zeus/987654321")
+    assert good.consumer == "reviews:zeus/987654321"
+
+
+def test_direct_path_carries_no_consumer_header() -> None:
+    """[Apollo r3, LOW] Internal attribution (lane + install id) rides to
+    RouteGate only — the direct provider path must not receive it."""
+    cfg = Config()
+    cfg.deepseek_base_url = BASE
+    cfg.deepseek_model = MODEL
+    cfg.deepseek_reasoning_effort = "max"
+    cfg.deepseek_max_tokens = 32000
+    cfg.claude_bin = CLAUDE_BIN
+    assert not cfg.routegate_anthropic_url   # direct path today
+
+    agent = ClaudeAgent.from_config(cfg, gh_token=GH_TOKEN,
+                                    install_id="987654321")
+    env = agent._build_env(str(os.path.join(tempfile.gettempdir(),
+                                            "neo-config")))
+    assert "X_RHOBEAR_CONSUMER" not in env
+    assert "ANTHROPIC_CUSTOM_HEADERS" not in env
+
+    # …while the gated path still carries it.
+    cfg.routegate_anthropic_url = "http://127.0.0.1:8645/v1/messages"
+    gated = ClaudeAgent.from_config(cfg, gh_token=GH_TOKEN,
+                                    install_id="987654321")
+    genv = gated._build_env(str(os.path.join(tempfile.gettempdir(),
+                                             "neo-config")))
+    assert genv["X_RHOBEAR_CONSUMER"] == "reviews:zeus/987654321"
+
+
+def test_existing_custom_header_is_appended() -> None:
+    """[Apollo r3, LOW] An operator-supplied ANTHROPIC_CUSTOM_HEADERS is
+    extended, never silently replaced."""
+    cfg = Config()
+    cfg.deepseek_base_url = BASE
+    cfg.deepseek_model = MODEL
+    cfg.deepseek_reasoning_effort = "max"
+    cfg.deepseek_max_tokens = 32000
+    cfg.claude_bin = CLAUDE_BIN
+    cfg.routegate_anthropic_url = "http://127.0.0.1:8645/v1/messages"
+
+    agent = ClaudeAgent.from_config(cfg, gh_token=GH_TOKEN)
+    with patch.dict(os.environ,
+                    {"ANTHROPIC_CUSTOM_HEADERS": "X-Org-Trace: 1"}):
+        env = agent._build_env(str(os.path.join(tempfile.gettempdir(),
+                                                "neo-config")))
+    value = env["ANTHROPIC_CUSTOM_HEADERS"]
+    assert "X-Org-Trace: 1" in value
+    assert "X-RHOBEAR-Consumer: reviews:zeus" in value
+
+
+def test_gh_token_absent_from_child_env_when_missing() -> None:
+    """[Apollo r3, MEDIUM] A missing gh_token must NOT let the operator's
+    personal GH_TOKEN become the child identity: the env is an allowlist,
+    and with no explicit token GH_TOKEN is simply absent."""
+    cfg = Config()
+    cfg.deepseek_base_url = BASE
+    cfg.deepseek_model = MODEL
+    cfg.deepseek_reasoning_effort = "max"
+    cfg.deepseek_max_tokens = 32000
+    cfg.claude_bin = CLAUDE_BIN
+
+    with patch.dict(os.environ, {"GH_TOKEN": "ghp_personal_operator_token"}):
+        agent = ClaudeAgent.from_config(cfg)   # no gh_token
+        env = agent._build_env(str(os.path.join(tempfile.gettempdir(),
+                                                "neo-config")))
+    assert "GH_TOKEN" not in env
+    # …and with one, the passed token is the identity.
+    with patch.dict(os.environ, {"GH_TOKEN": "ghp_personal_operator_token"}):
+        tok = ClaudeAgent.from_config(cfg, gh_token="ghs_installation_token")
+        tenv = tok._build_env(str(os.path.join(tempfile.gettempdir(),
+                                               "neo-config")))
+    assert tenv["GH_TOKEN"] == "ghs_installation_token"
+
+
+def test_null_cache_read_is_unknown() -> None:
+    """[Apollo r3, LOW] `cache_read_input_tokens: null` means NOT REPORTED —
+    never silently 0 (unknown stays unknown)."""
+    agent = _make_agent()
+    proc = subprocess.CompletedProcess(
+        args=["claude"], returncode=0, stderr="",
+        stdout=json.dumps({
+            "type": "result", "subtype": "success", "is_error": False,
+            "result": "VERDICT: ACCEPT",
+            "usage": {"input_tokens": 11, "output_tokens": 5,
+                      "cache_read_input_tokens": None},
+            "num_turns": 1, "stop_reason": "end_turn",
+            "permission_denials": [],
+        }))
+    usage, _verdict = agent._parse_output(proc)
+    assert usage["input_tokens"] == 11
+    assert "cached_input" not in usage, "null cache read must stay unknown"

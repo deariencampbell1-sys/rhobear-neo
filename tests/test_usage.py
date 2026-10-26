@@ -1161,3 +1161,110 @@ def test_record_attempt_survives_missing_jobs_table(store: UsageStore) -> None:
         with psycopg.connect(DSN, autocommit=True) as c:
             c.execute("ALTER TABLE neo_jobs_tmp_w106 RENAME TO neo_jobs")
         store.clear(555001)
+
+
+@requires_pg
+def test_bad_install_id_never_reaches_the_wire(store: UsageStore) -> None:
+    """[Apollo r3, HIGH] A forged/poisoned `installation_id` in the job
+    payload must not ride into the child env: refused at the source
+    (job_consumer) AND at the sink (agent __init__), so neither the wire nor
+    the row can carry header-injection bytes."""
+    from src.agent_claude import ClaudeAgent, Route as AgentRoute
+
+    assert DSN
+    with psycopg.connect(DSN, autocommit=True) as c:
+        job_id = c.execute(
+            "INSERT INTO neo_jobs (kind, repo, head_sha, payload) "
+            "VALUES ('wake', 'x/y', %s, %s) RETURNING id",
+            ("ab" * 20, json.dumps({"installation_id": "777\r\nX-Injected: 1"})),
+        ).fetchone()[0]
+
+    agent = ClaudeAgent(claude_bin=sys.executable, api_key="k",
+                        base_url="https://api.deepseek.com/anthropic",
+                        model="m", timeout=30.0, gh_token="t")
+    cfg = Config()
+    cfg.claude_bin = sys.executable
+    cfg.deepseek_base_url = "https://api.deepseek.com/anthropic"
+    cfg.deepseek_model = "deepseek-v4-flash"
+    cfg.deepseek_reasoning_effort = "max"
+    cfg.deepseek_max_tokens = 32000
+    cfg.routegate_anthropic_url = "http://127.0.0.1:8645/v1/messages"
+    cfg.routegate_model = "peak"
+
+    captured: dict[str, str] = {}
+
+    def fake_run(cmd, **kw):
+        captured.update({k: v for k, v in (kw.get("env") or {}).items()
+                         if "CONSUMER" in k or "CUSTOM_HEADERS" in k})
+        return subprocess.CompletedProcess(
+            args=["claude"], returncode=0, stderr="",
+            stdout=json.dumps({"type": "result", "result": "VERDICT: ACCEPT",
+                               "is_error": False, "subtype": "success",
+                               "num_turns": 1,
+                               "usage": {"input_tokens": 1, "output_tokens": 1}}),
+        )
+
+    try:
+        routes = [(4, AgentRoute(provider="deepseek",
+                                 model="deepseek-v4-flash"))]
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "k"}), \
+                patch("src.agent_claude.subprocess.run", side_effect=fake_run):
+            agent.run_with_chain(_GUESS_BRIEF, routes, cfg, "t",
+                                 usage_store=store, job_id=job_id)
+
+        wire = captured["X_RHOBEAR_CONSUMER"]
+        assert wire == "reviews:zeus", wire          # bare, not poisoned
+        assert "\r" not in wire and "\n" not in wire
+        attempts = store.get_attempts(job_id)
+        assert attempts[0].consumer == wire
+    finally:
+        store.clear(job_id)
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute("DELETE FROM neo_jobs WHERE id = %s", (job_id,))
+
+
+@requires_pg
+def test_job_target_failure_warns_once(store: UsageStore, caplog: Any) -> None:
+    """[Apollo r3, MEDIUM] Permanent attribution loss must be OBSERVABLE:
+    the first lookup failure logs WARNING (once, never the poisoned value),
+    later ones stay quiet (rate-limited) — not DEBUG-silence forever."""
+    import logging as _logging
+
+    class BoomConn:
+        def execute(self, *args, **kwargs):
+            raise RuntimeError("neo_jobs is gone")
+
+    with caplog.at_level(_logging.WARNING, logger="rhobear_neo.usage"):
+        store._job_target(BoomConn(), 4242)
+        first = [r for r in caplog.records
+                 if r.levelno == _logging.WARNING and "job target" in r.message]
+        store._job_target(BoomConn(), 4242)
+        store._job_target(BoomConn(), 4242)
+        again = [r for r in caplog.records
+                 if r.levelno == _logging.WARNING and "job target" in r.message]
+    assert len(first) == 1, "first attribution failure must warn"
+    assert len(again) == 1, "subsequent failures must be rate-limited"
+
+
+@requires_pg
+def test_job_lookup_failure_cannot_poison_metering(
+        store: UsageStore, caplog: Any) -> None:
+    """[Apollo r3, MEDIUM] The metering connection is autocommit: a failed
+    job-lookup statement cannot leave an aborted transaction that kills the
+    INSERT (the failure mode that would silently drop ALL metering)."""
+    import logging as _logging
+
+    assert DSN
+    with store._conn() as c:
+        assert c.autocommit is True, "_conn must be autocommit"
+        try:
+            c.execute("SELECT * FROM no_such_table_w106")
+        except Exception:
+            pass                                   # the lookup fails …
+        cur = c.execute(
+            "INSERT INTO neo_usage (job_id, attempt_number, route_idx, "
+            " provider, model, outcome, uncached_input, output_tokens) "
+            "VALUES (555002, 1, 0, 'deepseek', 'm', 'success', 1, 1) "
+            "RETURNING id")
+        assert cur.fetchone() is not None, "metering must survive the failure"
+    store.clear(555002)
