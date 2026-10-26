@@ -154,3 +154,53 @@ class TestTrustedCheckRun:
                                    '"coverage": "complete"}'}},
         ])
         assert granted is False
+
+
+# ---------------------------------------------------------------------------
+# Defect 4 — build_evidence fails open on an empty rollup
+# ---------------------------------------------------------------------------
+
+class TestEmptyRollupFailsClosed:
+    def test_empty_rollup_is_unknown_not_pass(self):
+        """No rollup data at all is UNKNOWN (None — matching merge_authority's
+        treatment of unknown findings), never a pass.  An evidence bundle with
+        an empty rollup is denied even when everything else is green."""
+        ev, (granted, reason) = _authority([_run()], rollup=[])
+        assert ev["required_checks_pass"] is None
+        assert granted is False
+        assert "check" in reason.lower()
+
+    def test_one_failing_check_is_false(self):
+        ev, (granted, reason) = _authority(
+            [_run()],
+            rollup=[{"context": "ci/test", "conclusion": "FAILURE"}],
+        )
+        assert ev["required_checks_pass"] is False
+        assert granted is False
+
+    def test_all_green_is_true(self):
+        ev, (granted, reason) = _authority([_run()])
+        assert ev["required_checks_pass"] is True
+        assert granted is True
+
+    def test_missing_output_summary_is_a_denial_not_a_pass(self):
+        cr = _run(summary="")
+        cr["output"] = {}
+        ev, (granted, reason) = _authority([cr])
+        assert ev["unresolved_critical_high"] is None
+        assert granted is False
+
+    def test_summary_that_is_not_valid_json_is_a_denial_not_a_pass(self):
+        ev, (granted, reason) = _authority([
+            _run(summary="not json {"),
+        ])
+        assert ev["unresolved_critical_high"] is None
+        assert ev["coverage_complete"] is False
+        assert granted is False
+
+    def test_summary_that_is_not_a_json_object_is_a_denial(self):
+        ev, (granted, reason) = _authority([
+            _run(summary='["unresolved_critical_high", 0]'),
+        ])
+        assert ev["unresolved_critical_high"] is None
+        assert granted is False
