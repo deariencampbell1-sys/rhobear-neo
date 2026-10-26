@@ -127,6 +127,32 @@ def test_source_matches_is_normalised_and_never_matches_an_unknown_reviewer():
     assert not tr.source_matches("", "anything")
 
 
+# ---------------------------------------------------------------------------
+# Defect 1 (CRITICAL): source_matches is normalised EQUALITY — a prefix in
+# either direction must never match, or any GitHub account named `ap` or
+# `apollox` could spoof the Apollo ACCEPT that authorises a merge.
+# One row per case (the W1-07-r2 table).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("source,name,expected", [
+    ("apollo", "ap", False),
+    ("apollo", "apol", False),
+    ("apollo", "apollox", False),
+    ("apollo", "apollobot2", False),
+    ("apollo", "Apollo", True),
+    ("apollo", "apollo[bot]", True),
+    ("CodeAnt", "code-ant", True),
+    ("CodeAnt", "CodeAnt[bot]", True),
+    ("CodeAnt", "codecov", False),
+    ("Greptile", "greptile[bot]", True),
+])
+def test_source_matches_table(source, name, expected):
+    """Normalised equality only; [bot]/-bot/_bot suffixes and separators stay
+    tolerated (the reason the function exists) and nothing else does."""
+    from src import trusted_reviewers as tr
+    assert tr.source_matches(source, name) is expected, (source, name)
+
+
 def test_disabled_source_is_not_in_the_enabled_set():
     """Disabled CodeAnt does not count — the toggle is the customer's choice."""
     from src import trusted_reviewers as tr

@@ -2053,3 +2053,17 @@ def test_newest_status_per_trusted_context_decides():
         ev = neo_worker._review_evidence("tok", cfg, "acme/a", 5, SHA1)
     assert ev["trusted_states"] == ["failure"], ev["trusted_states"]
     assert ev["trusted_green"] is False
+
+
+def test_a_review_by_a_prefix_login_is_never_a_trusted_green():
+    """End-to-end (W1-07-r2 defect 1, CRITICAL): a review by GitHub login
+    `apol` on the exact head, with no architect status, must leave
+    green2_ok False. A prefix of the trusted source's name is a DIFFERENT
+    GitHub account — it must never produce the green that authorises a merge."""
+    greens = _greens(enabled=("apollo",),
+                     reviews=[_review("APPROVED", author="apol")],
+                     statuses=[])
+    assert greens["green2_ok"] is False, greens
+    assert greens["green1_ok"] is False, greens
+    ok, reason = _authority(_bundle(greens))
+    assert ok is False, reason
