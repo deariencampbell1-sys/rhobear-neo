@@ -1768,14 +1768,20 @@ W1_LANE_REPO = f"{W1_OWNER}/rhobear-neo"
 
 
 def _review(state, oid=SHA1, author="rhobear-reviews[bot]",
-            at="2026-10-26T11:52:00Z"):
-    return {"state": state, "commit": {"oid": oid}, "author": {"login": author},
+            at="2026-10-26T11:52:00Z", author_type="Bot"):
+    return {"state": state, "commit": {"oid": oid},
+            "author": {"login": author, "type": author_type},
             "submitted_at": at, "body": "verdict: ACCEPT",
             "html_url": f"https://github.com/acme/a/pull/5#pullrequestreview-{state}"}
 
 
-def _status(context, state="success", login=W1_OWNER, created="2026-10-26T11:50:00Z"):
-    return {"context": context, "state": state, "creator": {"login": login},
+def _status(context, state="success", login=None, created="2026-10-26T11:50:00Z",
+            creator_type="Bot"):
+    if login is None:
+        login = (W1_OWNER if context == "rhobear-reviews" or context.startswith("architect/")
+                 else f"{context}[bot]")
+    return {"context": context, "state": state,
+            "creator": {"login": login, "type": creator_type},
             "created_at": created, "target_url": f"https://ci.example/{context}"}
 
 
@@ -1803,6 +1809,46 @@ def _authority(ev, install_auto_merge=True):
     from src.jev_review import JevAssessment
     return neo_worker.merge_authority(install_auto_merge, ev,
                                       JevAssessment(False, reason="no key"))
+
+
+@pytest.mark.parametrize(("signal", "expected"), [
+    ({"name": "CodeAnt", "conclusion": "SUCCESS",
+      "app": {"slug": "codeant-ai"}}, True),
+    ({"name": "CodeAnt", "conclusion": "SUCCESS",
+      "app": {"slug": "mallory"}}, False),
+    (_status("CodeAnt", login="CodeAnt[bot]", creator_type="Bot"), True),
+    (_status("CodeAnt", login="CodeAnt", creator_type="User"), False),
+    (_review("APPROVED", author="CodeAnt[bot]", author_type="Bot"), True),
+    (_review("APPROVED", author="CodeAnt", author_type="User"), False),
+], ids=("real-app-check", "user-look-alike-check", "bot-status",
+        "user-status", "bot-review", "user-review"))
+def test_green2b_requires_reviewer_identity_not_just_name(signal, expected):
+    kind = "review" if "author" in signal else "status" if "context" in signal else "check"
+    greens = _greens(enabled=("CodeAnt",),
+                     reviews=[signal] if kind == "review" else [],
+                     statuses=[signal] if kind == "status" else [],
+                     rollup=[signal] if kind == "check" else [])
+    assert greens["green2_ok"] is expected, greens
+
+
+def test_user_codeant_status_never_makes_pr_green_end_to_end():
+    greens = _greens(enabled=("CodeAnt",),
+                     statuses=[_status("CodeAnt", login="CodeAnt", creator_type="User"),
+                               _status("rhobear-reviews")],
+                     reviews=[_review("APPROVED")])
+    assert greens["green1_ok"] is True
+    assert greens["green2_ok"] is False
+    ok, reason = _authority(_bundle(greens))
+    assert not ok and "green 2" in reason
+
+
+def test_green2b_uses_newest_status_per_context():
+    statuses = [_status("CodeAnt", login="CodeAnt[bot]", created="2026-10-26T11:50:00Z"),
+                _status("CodeAnt", "failure", login="CodeAnt[bot]",
+                        created="2026-10-26T12:00:00Z")]
+    greens = _greens(enabled=("CodeAnt",), statuses=statuses)
+    assert greens["green2_ok"] is False
+    assert any("CodeAnt" in red for red in greens["trusted_red"])
 
 
 def test_two_greens_codeant_and_apollo_merge():

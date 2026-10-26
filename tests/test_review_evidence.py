@@ -265,7 +265,7 @@ def test_trusted_reviewer_outside_org_counts():
 
     sha = SHA
     statuses = [{"context": "CodeAnt", "state": "success",
-                 "creator": {"login": "codeant-bot"},
+                 "creator": {"login": "codeant-bot", "type": "Bot"},
                  "created_at": "2026-10-26T11:50:00Z",
                  "target_url": "https://ci.example/CodeAnt"}]
 

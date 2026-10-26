@@ -153,7 +153,10 @@ def norm_name(name: str) -> str:
 #: customer row gets an EXPLICIT alias here — never a heuristic prefix.  A
 #: prefix match would let a GitHub account named `ap`, `apol`, `apollox` or
 #: `apollobot2` spoof the Apollo ACCEPT that authorises a merge.
-ALIASES: dict[str, tuple[str, ...]] = {}
+ALIASES: dict[str, tuple[str, ...]] = {
+    # CodeAnt's customer-facing name differs from its GitHub App slug/login.
+    "CodeAnt": ("codeant-ai",),
+}
 
 
 def source_matches(source: str, name: str) -> bool:

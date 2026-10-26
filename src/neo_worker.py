@@ -186,6 +186,21 @@ def _newer(candidate: str, incumbent: str) -> bool:
     return a > b
 
 
+def _newest_status_per_context(statuses: list[dict]) -> dict[str, dict]:
+    """Keep one status per context, independent of GitHub's response order.
+
+    Equal or unusable timestamps preserve the first item (GitHub normally sends
+    newest first); any parseable newer timestamp replaces the incumbent."""
+    newest: dict[str, dict] = {}
+    for status in statuses or []:
+        context = str(status.get("context") or "")
+        prior = newest.get(context)
+        if prior is None or _newer(str(status.get("created_at") or ""),
+                                   str(prior.get("created_at") or "")):
+            newest[context] = status
+    return newest
+
+
 # --- W1-07-r1: the two greens on ONE head SHA (the merge rule (b)-(d)) -----
 # Board `merge-authority` v7 / `trusted` / `verdicts`:
 #   green 1: Apollo ACCEPT on the head commit — always required; a commit
@@ -260,8 +275,10 @@ def _green_fields(cfg: Config, repo: str, sha: str, reviews: list, statuses: lis
                    green1_url=str(chosen.get("html_url") or ""),
                    green1_at=str(chosen.get("submitted_at") or ""))
 
+    latest_statuses = _newest_status_per_context(statuses).values()
+
     # --- green 2a: the architect's approval on this exact head -------------
-    arch = next((s for s in (statuses or [])
+    arch = next((s for s in latest_statuses
                  if is_architect_context(str(s.get("context") or ""))), None)
     architect_on = repo in ARCHITECT_ALWAYS_REPOS or any(
         str(src or "").strip().lower().startswith("architect")
@@ -278,13 +295,16 @@ def _green_fields(cfg: Config, repo: str, sha: str, reviews: list, statuses: lis
     if not out.get("green2_ok"):
         greens_found: list = []
         for src in enabled_sources:
-            st = next((s for s in (statuses or [])
-                       if tr.source_matches(src, str(s.get("context") or ""))), None)
+            st = next((s for s in latest_statuses
+                       if tr.source_matches(src, str(s.get("context") or ""))
+                       and tr.source_matches(src, str((s.get("creator") or {}).get("login") or ""))
+                       and str((s.get("creator") or {}).get("type") or "") == "Bot"), None)
             rv = next((r for r in reversed(reviews or [])
                        if _review_oid(r) == sha and _review_author(r)
-                       and tr.source_matches(src, _review_author(r))), None)
+                       and tr.source_matches(src, _review_author(r))
+                       and str((r.get("author") or {}).get("type") or "") == "Bot"), None)
             ck = next((c for c in (rollup or [])
-                       if tr.source_matches(src, str(c.get("context") or c.get("name") or ""))), None)
+                       if tr.source_matches(src, str((c.get("app") or {}).get("slug") or ""))), None)
             signals = []
             if st is not None:
                 signals.append((str(st.get("context") or ""),
@@ -583,19 +603,22 @@ def lane_merge_authority(lane_merge: bool, evidence: dict, lane: str,
         return False, "head moved since the wake — stale evidence cannot authorize this SHA"
     if not evidence.get("trusted_green"):
         return False, "Apollo's status is not success on this exact head SHA"
+    if not evidence.get("required_checks_pass"):
+        return False, "required checks have not passed on this exact head SHA"
     for r in reviews:
         oid = str((r.get("commit") or {}).get("oid") or r.get("commit_id") or "")
         if oid == head and str(r.get("state") or "").upper() == "CHANGES_REQUESTED":
             return False, "Apollo requested changes on this exact head SHA"
-    # Statuses arrive newest first; only the latest one for the architect context counts.
-    latest = next((s for s in statuses
+    latest_statuses = _newest_status_per_context(statuses).values()
+    latest = next((s for s in latest_statuses
                    if str(s.get("context") or "").lower() == ARCHITECT_CONTEXT + lane), None)
     if not latest or str(latest.get("state") or "").lower() != "success":
         return False, f"waiting for the {lane} architect to accept this exact head"
     if str((latest.get("creator") or {}).get("login") or "").lower() != owner.lower():
         return False, f"the {ARCHITECT_CONTEXT}{lane} status was not set from the owner's account"
     if require_drift:
-        drift = next((s for s in statuses if str(s.get("context") or "").lower() == DRIFT_CONTEXT), None)
+        drift = next((s for s in latest_statuses
+                      if str(s.get("context") or "").lower() == DRIFT_CONTEXT), None)
         if not drift:
             return False, "waiting for L0's drift check (l0/drift) on this exact head"
         if str(drift.get("state") or "").lower() != "success":
@@ -650,16 +673,13 @@ def _lane_pr(evidence: dict) -> tuple[str, list[dict]] | None:
     The head branch comes from the collector's `pr view --json headRefName`
     read (one read, one source — 0241eaf's separate `_gh(cfg, …)` read is
     reconciled to this line's `_gh(token, …)` arity by folding it into the
-    evidence read).  A bundle without the key is older/patched evidence and
-    keeps the legacy behaviour (same idiom as trusted_producer_ok); an
-    explicit empty head_ref means the branch could not be read and Neo skips
-    (fail closed, 0241eaf).
+    evidence read).  A missing/unavailable branch is not evidence of a lane:
+    continue ordinary non-merge work, while merge authority still fails closed
+    on any incomplete evidence bundle.
     """
-    if "head_ref" not in evidence:
-        return None
     branch = str(evidence.get("head_ref") or "")
     if not branch:
-        raise AgentError("PR head branch unavailable — cannot tell whether it is a lane branch")
+        return None
     lane = lane_of(branch)
     return (lane, evidence.get("reviews") or []) if lane else None
 

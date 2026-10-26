@@ -37,13 +37,14 @@ class FakeState:
 
 def evidence(**over):
     e = {"ok": True, "decided_sha": HEAD, "head_sha": HEAD, "trusted_green": True,
-         "head_ref": "l3-kit/package-tokens", "reviews": []}
+         "required_checks_pass": True, "head_ref": "l3-kit/package-tokens", "reviews": []}
     e.update(over)
     return e
 
 
-def architect(state="success", login=OWNER, lane="l3-kit"):
-    return {"context": f"architect/{lane}", "state": state, "creator": {"login": login}}
+def architect(state="success", login=OWNER, lane="l3-kit", created=""):
+    return {"context": f"architect/{lane}", "state": state,
+            "creator": {"login": login}, "created_at": created}
 
 
 def test_lane_of():
@@ -63,6 +64,7 @@ def test_authority_needs_apollo_and_the_architect_on_this_head():
     assert ok
     for args, why in (
         ((True, evidence(trusted_green=False), "l3-kit", [architect()], []), "Apollo"),
+        ((True, evidence(required_checks_pass=False), "l3-kit", [architect()], []), "required checks"),
         ((True, evidence(), "l3-kit", [], []), "waiting"),
         ((True, evidence(), "l3-kit", [architect(lane="l9-front-door")], []), "waiting"),
         ((True, evidence(), "l3-kit", [architect(login="rhobear-neo[bot]")], []), "owner"),
@@ -79,6 +81,15 @@ def test_only_the_newest_architect_status_counts():
     newest_first = [architect(state="failure"), architect()]
     ok, _ = neo_worker.lane_merge_authority(True, evidence(), "l3-kit", newest_first, [], OWNER)
     assert not ok
+    oldest_first = [architect(created="2026-10-26T11:50:00Z"),
+                    architect(state="failure", created="2026-10-26T12:00:00Z")]
+    ok, _ = neo_worker.lane_merge_authority(True, evidence(), "l3-kit", oldest_first, [], OWNER)
+    assert not ok
+
+
+def test_lane_pr_empty_or_unavailable_head_ref_does_not_raise():
+    assert neo_worker._lane_pr({"ok": True, "head_ref": ""}) is None
+    assert neo_worker._lane_pr({"ok": False, "head_ref": ""}) is None
 
 
 def test_old_changes_requested_on_another_head_does_not_block():
@@ -152,7 +163,8 @@ def test_lane_gate_reads_evidence_through_the_real_collector():
     def gh(token, *args, timeout=30):
         if args[:2] == ("pr", "view"):
             return 0, json.dumps({"headRefOid": HEAD, "headRefName": "l8b/fix-usb-macros",
-                                  "reviews": [], "statusCheckRollup": []})
+                                  "reviews": [], "statusCheckRollup": [
+                                      {"context": "rhobear-reviews", "state": "SUCCESS"}]})
         if args[0] == "api" and "/check-runs" in args[1]:
             return 0, json.dumps({"total_count": 1, "check_runs": [
                 {"id": 1, "name": "rhobear-reviews", "app": {"id": 17265050},
@@ -298,3 +310,20 @@ def test_lane_gate_fails_closed_with_a_lane_hold_when_the_evidence_read_breaks()
     assert not any(c[:2] == ("pr", "merge") for c in calls)
     assert state.rows[-1][3] == "lane_hold"
     assert "evidence" in state.rows[-1][5]["reason"]
+
+
+def test_transient_evidence_failure_does_not_skip_agent_on_non_lane_pr():
+    state = FakeState()
+    gh, _ = fake_gh([])
+    transient = {"ok": False, "reason": "pr view unavailable",
+                 "decided_sha": HEAD, "head_ref": ""}
+    with mock.patch.object(neo_worker, "_gh", gh), \
+         mock.patch.object(neo_worker, "repo_token", return_value="tok"), \
+         mock.patch.object(neo_worker, "resolve_pr", return_value=51), \
+         mock.patch.object(neo_worker, "_review_evidence", return_value=transient), \
+         mock.patch.object(neo_worker, "_run_agent", return_value=(None, "", 0, "")), \
+         mock.patch.object(neo_worker.ClaudeAgent, "from_config") as agent:
+        neo_worker.run_neo(Config(), state, mock.MagicMock(),
+                           {"job_id": 1, "repo": REPO, "sha": HEAD, "green": True,
+                            "context": "rhobear-reviews"})
+    agent.assert_called_once()
