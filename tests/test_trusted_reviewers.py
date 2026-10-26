@@ -166,6 +166,17 @@ def test_source_matches_table(source, name, expected):
     assert tr.source_matches(source, name) is expected, (source, name)
 
 
+def test_an_empty_review_author_matches_no_source():
+    """Defect 5 (MEDIUM): an empty/missing/whitespace author never matches any
+    source — an anonymous review must never fall open to any trusted
+    reviewer (including Apollo)."""
+    from src import trusted_reviewers as tr
+    for empty in ("", None, "   ", "\t\n"):
+        assert tr.source_matches("apollo", empty) is False, repr(empty)
+        assert tr.source_matches("CodeAnt", empty) is False, repr(empty)
+        assert tr.source_matches(empty, "apollo") is False, repr(empty)
+
+
 def test_disabled_source_is_not_in_the_enabled_set():
     """Disabled CodeAnt does not count — the toggle is the customer's choice."""
     from src import trusted_reviewers as tr

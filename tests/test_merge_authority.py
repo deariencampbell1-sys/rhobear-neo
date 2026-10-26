@@ -2103,3 +2103,17 @@ def test_an_architect_status_from_a_non_owner_account_is_refused():
         assert "owner's account" in greens["green2_reason"], greens["green2_reason"]
         ok, reason = _authority(_bundle(greens), install_auto_merge=True)
         assert ok is False, (repo, reason)
+
+
+def test_a_review_with_no_author_is_never_apollos():
+    """Defect 5 (MEDIUM): an empty/missing review author fell open — the
+    green-1 loop skipped the Apollo check for a falsy author and chose the
+    nameless review as Apollo's ACCEPT. Empty, None and whitespace authors
+    never match any source."""
+    for author in ("", None, "   "):
+        greens = _greens(enabled=(),
+                         statuses=[_status("rhobear-reviews")],
+                         reviews=[_review("APPROVED", author=author)])
+        assert greens["green1_ok"] is False, (repr(author), greens)
+        ok, reason = _authority(_bundle(greens))
+        assert ok is False, (repr(author), reason)
