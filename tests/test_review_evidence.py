@@ -251,3 +251,48 @@ class TestTrustedRunSelectionIsRobust:
             ev, (granted, reason) = _authority(listing)
             assert ev["unresolved_critical_high"] == 2, listing
             assert granted is False
+
+
+def test_trusted_reviewer_outside_org_counts():
+    """W1-07-r1: a trusted reviewer OUTSIDE the org counts as green 2 (board
+    `trusted`: "Zeus ACCEPT, or a trusted reviewer below — either counts").
+    Before the two-green rule a green from outside the org did not count at
+    all. A green from an account on no trusted list still counts for nothing."""
+    import dataclasses
+    import json
+    from unittest import mock as _mock
+    from src import neo_worker
+
+    sha = SHA
+    statuses = [{"context": "CodeAnt", "state": "success",
+                 "creator": {"login": "codeant-bot"},
+                 "created_at": "2026-10-26T11:50:00Z",
+                 "target_url": "https://ci.example/CodeAnt"}]
+
+    def fake_gh(token, *args, timeout=30):
+        if args[:2] == ("pr", "view"):
+            return 0, json.dumps({
+                "headRefOid": sha, "headRefName": "topic",
+                "reviews": [{"state": "APPROVED", "commit": {"oid": sha},
+                             "author": {"login": "rhobear-reviews[bot]"},
+                             "submitted_at": "2026-10-26T11:52:00Z",
+                             "body": "verdict: ACCEPT"}],
+                "statusCheckRollup": []})
+        if args[0] == "api" and "/check-runs" in args[1]:
+            return 0, json.dumps({"total_count": 0, "check_runs": []})
+        if args[0] == "api" and args[1].endswith("/status"):
+            return 0, json.dumps({"total_count": len(statuses), "statuses": statuses})
+        raise AssertionError(f"unexpected gh call {args}")
+
+    cfg = dataclasses.replace(_cfg(), trusted_reviewer_app_id=TRUSTED_APP)
+    with _mock.patch.object(neo_worker, "_gh", side_effect=fake_gh):
+        ev = neo_worker._review_evidence("tok", cfg, "acme/checkout", 5, sha,
+                                         enabled_sources=("CodeAnt",))
+    assert ev["ok"] is True
+    assert ev["green1_ok"] is True, ev
+    assert ev["green2_ok"] is True and ev["green2_kind"] == "trusted", ev
+
+    with _mock.patch.object(neo_worker, "_gh", side_effect=fake_gh):
+        ev = neo_worker._review_evidence("tok", cfg, "acme/checkout", 5, sha,
+                                         enabled_sources=())
+    assert ev["green2_ok"] is False, ev

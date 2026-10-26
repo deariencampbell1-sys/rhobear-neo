@@ -1751,3 +1751,255 @@ class TestConfigDefaults:
         except ValueError as exc:
             assert "max_builder_rounds" not in str(exc).lower()
             assert "NEO_MAX_BUILDER_ROUNDS" not in str(exc)
+
+
+# ---------------------------------------------------------------------------
+# W1-07-r1 — the two greens on the exact head (the merge rule (b)-(d))
+#
+# Board `merge-authority` v7 / `trusted` / `verdicts`:
+#   green 1: Apollo ACCEPT on the head commit — always required
+#   green 2: the repo's own merge authority — architect approval bound to the
+#            exact head, OR a trusted reviewer's green. Either one counts.
+#   a trusted reviewer that is red always blocks; a new push resets all of it.
+# ---------------------------------------------------------------------------
+
+W1_OWNER = "deariencampbell1-sys"
+W1_LANE_REPO = f"{W1_OWNER}/rhobear-neo"
+
+
+def _review(state, oid=SHA1, author="rhobear-reviews[bot]",
+            at="2026-10-26T11:52:00Z"):
+    return {"state": state, "commit": {"oid": oid}, "author": {"login": author},
+            "submitted_at": at, "body": "verdict: ACCEPT",
+            "html_url": f"https://github.com/acme/a/pull/5#pullrequestreview-{state}"}
+
+
+def _status(context, state="success", login=W1_OWNER, created="2026-10-26T11:50:00Z"):
+    return {"context": context, "state": state, "creator": {"login": login},
+            "created_at": created, "target_url": f"https://ci.example/{context}"}
+
+
+def _greens(*, repo="acme/a", reviews=None, statuses=None, rollup=None,
+            enabled=(), sha=SHA1):
+    from src import neo_worker
+    return neo_worker._green_fields(Config(), repo, sha,
+                                    reviews or [], statuses or [], rollup or [], enabled)
+
+
+def _bundle(greens, **over):
+    ev = {"ok": True, "head_sha": SHA1, "decided_sha": SHA1, "review_bound_ok": True,
+          "trusted_green": True, "trusted_states": ["success"],
+          "trusted_producer_ok": True, "review_sha_match": True,
+          "failing_checks": 0}
+    ev.update(greens)
+    ev.update(over)
+    return ev
+
+
+def _authority(ev, install_auto_merge=True):
+    from src import neo_worker
+    from src.jev_review import JevAssessment
+    return neo_worker.merge_authority(install_auto_merge, ev,
+                                      JevAssessment(False, reason="no key"))
+
+
+def test_two_greens_codeant_and_apollo_merge():
+    """CodeAnt green + Apollo ACCEPT on the exact head merges (owner Q5)."""
+    greens = _greens(enabled=("CodeAnt",),
+                     statuses=[_status("CodeAnt"), _status("rhobear-reviews")],
+                     reviews=[_review("APPROVED")])
+    ok, reason = _authority(_bundle(greens))
+    assert ok is True, reason
+
+
+def test_apollo_alone_is_not_enough():
+    """Apollo ACCEPT is green 1 — never enough on its own."""
+    greens = _greens(enabled=(), statuses=[_status("rhobear-reviews")],
+                     reviews=[_review("APPROVED")])
+    ok, reason = _authority(_bundle(greens))
+    assert ok is False
+    assert "green 2" in reason, reason
+
+
+def test_disabled_codeant_does_not_count():
+    """A disabled trusted reviewer's green does not count (the toggle)."""
+    greens = _greens(enabled=(), statuses=[_status("CodeAnt"), _status("rhobear-reviews")],
+                     reviews=[_review("APPROVED")])
+    assert greens["green2_ok"] is False
+    ok, reason = _authority(_bundle(greens))
+    assert ok is False and "green 2" in reason, reason
+    # ...and the same green counts the moment the customer turns it on.
+    on = _greens(enabled=("CodeAnt",),
+                 statuses=[_status("CodeAnt"), _status("rhobear-reviews")],
+                 reviews=[_review("APPROVED")])
+    assert _authority(_bundle(on))[0] is True
+
+
+def test_trusted_reviewer_red_blocks():
+    """A trusted reviewer that is red always blocks, even with Apollo's ACCEPT
+    (board `verdicts`: "Zeus will not merge #46 even with Apollo's ACCEPT")."""
+    greens = _greens(enabled=("CodeAnt",),
+                     statuses=[_status("CodeAnt", "failure"), _status("rhobear-reviews")],
+                     reviews=[_review("APPROVED")])
+    ok, reason = _authority(_bundle(greens))
+    assert ok is False and "red" in reason and "CodeAnt" in reason, reason
+    # REQUEST CHANGES from a trusted reviewer blocks too.
+    greens = _greens(enabled=("Greptile",),
+                     statuses=[_status("rhobear-reviews")],
+                     reviews=[_review("APPROVED"),
+                              _review("CHANGES_REQUESTED", author="greptile[bot]")])
+    ok, reason = _authority(_bundle(greens))
+    assert ok is False and "red" in reason and "greptile" in reason, reason
+
+
+def test_new_push_resets_the_greens():
+    """Any new push resets both greens: everything here is bound to the head."""
+    greens = _greens(enabled=("CodeAnt",), statuses=[],
+                     reviews=[_review("APPROVED", oid=SHA2)])
+    assert greens["green1_ok"] is False and greens["green2_ok"] is False
+    ok, reason = _authority(_bundle(greens))
+    assert ok is False, reason
+
+
+def test_production_74_is_refused_naming_the_missing_green():
+    """Production #74 (reviews-app, f0820bc, 2026-10-25): Apollo's review was
+    COMMENTED and the only green was one rhobear-reviews status — Zeus merged
+    it on a bare status green. Refused here, and the reason names the missing
+    green(s)."""
+    greens = _greens(enabled=(), reviews=[_review("COMMENTED")],
+                     statuses=[_status("rhobear-reviews")],
+                     rollup=[{"context": "rhobear-reviews", "state": "success"}])
+    ok, reason = _authority(_bundle(greens, trusted_producer_ok=False))
+    assert ok is False
+    assert "green 1" in reason and "green 2" in reason, reason
+    assert "COMMENTED" in reason, reason
+
+
+def test_lane_repo_never_merges_without_architect_approval_on_the_exact_head():
+    """A lane repo (rhobear-neo) with auto-merge ON still refuses without
+    architect approval on the exact head — no bare status green, ever."""
+    greens = _greens(repo=W1_LANE_REPO, reviews=[_review("APPROVED")], statuses=[],
+                     enabled=())
+    ok, reason = _authority(_bundle(greens), install_auto_merge=True)
+    assert ok is False
+    assert "architect" in reason, reason
+
+
+def test_absent_check_is_not_green():
+    """Apollo green, architect status absent — no merge; the reason names the
+    missing status. A missing check counts as NOTHING (never as passing)."""
+    greens = _greens(reviews=[_review("APPROVED")], statuses=[], enabled=())
+    assert greens["green2_ok"] is False
+    assert "architect" in greens["green2_reason"], greens["green2_reason"]
+    ok, reason = _authority(_bundle(greens))
+    assert ok is False and "green 2" in reason, reason
+
+
+def test_merge_requires_exact_head():
+    """A review on a parent commit is not green for the head."""
+    greens = _greens(reviews=[_review("APPROVED", oid=SHA2)],
+                     statuses=[_status("architect/l3-kit")], enabled=())
+    assert greens["green1_ok"] is False
+    ok, reason = _authority(_bundle(greens))
+    assert ok is False and "green 1" in reason, reason
+
+
+def test_architect_approval_counts_as_green_2_on_the_exact_head():
+    """The architect's ACCEPT bound to the exact head is green 2 on its own
+    (board `merge-authority` v7: "either one counts")."""
+    greens = _greens(repo=W1_LANE_REPO, reviews=[_review("APPROVED")],
+                     statuses=[_status("architect/l1-reviews")], enabled=())
+    assert greens["green2_ok"] is True and greens["green2_kind"] == "architect"
+    ok, reason = _authority(_bundle(greens), install_auto_merge=True)
+    assert ok is True, reason
+
+
+def test_a_reviewer_with_review_and_status_counts_once():
+    """An outside reviewer with both a review and a status is one green —
+    counted once, not twice."""
+    greens = _greens(enabled=("CodeAnt",),
+                     statuses=[_status("CodeAnt")],
+                     reviews=[_review("APPROVED", author="CodeAnt[bot]")])
+    assert greens["green2_ok"] is True
+    assert len(greens["trusted_seen"]) == 1, greens["trusted_seen"]
+    comment_lines = [ln for ln in _merge_comment(_bundle(greens)).splitlines()
+                     if ln.startswith(("1:", "2:"))]
+    assert len(comment_lines) == 2, comment_lines
+
+
+def _merge_comment(evidence):
+    from src import merge_executor
+    return merge_executor.two_green_comment(evidence)
+
+
+def test_merge_comment_lists_both_greens_with_links_and_ci_summary():
+    """The one merge comment (board `verdicts` 02): the two greens with links
+    and the CI summary, posted BEFORE the merge call."""
+    greens = _greens(enabled=("CodeAnt",),
+                     statuses=[_status("CodeAnt"), _status("rhobear-reviews")],
+                     reviews=[_review("APPROVED")],
+                     rollup=[{"context": "rhobear-reviews", "state": "success"},
+                             {"name": "CodeAnt", "conclusion": "SUCCESS"}])
+    body = _merge_comment(_bundle(greens))
+    assert body.startswith(f"Two greens on {SHA1[:7]}"), body
+    assert "1: " in body and "Apollo ACCEPT" in body
+    assert "2: " in body and "CodeAnt passed (trusted)" in body
+    assert "CI: 2 of 2 checks passed" in body, body
+    assert "#pullrequestreview-APPROVED" in body, body          # green 1 link
+    assert "https://ci.example/CodeAnt" in body, body           # green 2 link
+    assert "11:52" in body and "11:50" in body, body            # times
+
+
+def test_merge_rechecks_the_two_green_gate_immediately_before_the_merge():
+    """merge() re-runs the same gate immediately before the merge API call —
+    a bundle missing a green never reaches the merge call (step 5)."""
+    greens = _greens(enabled=(), statuses=[_status("rhobear-reviews")],
+                     reviews=[_review("COMMENTED")])
+    ev = _bundle(greens)
+    calls = []
+
+    def fake_gh(token, *args, **kw):
+        calls.append(args)
+        if args[:3] == ("pr", "view", "5"):
+            return 0, json.dumps({"headRefOid": SHA1, "state": "OPEN",
+                                  "mergeable": "MERGEABLE", "headRefName": "topic",
+                                  "isCrossRepository": False})
+        raise AssertionError(f"unexpected call: {args}")
+
+    with patch("src.merge_executor._gh", side_effect=fake_gh):
+        with pytest.raises(MergeDenied) as exc:
+            merge("o/r", 5, SHA1, ev, "tok")
+    assert "green 1" in str(exc.value), exc.value
+    assert not [c for c in calls if "PUT" in c], calls
+    assert not [c for c in calls if c[:2] == ("pr", "comment")], calls
+
+
+def test_merge_posts_the_comment_then_merges():
+    """Two greens present: one comment is posted first, then the merge."""
+    greens = _greens(enabled=("CodeAnt",),
+                     statuses=[_status("CodeAnt"), _status("rhobear-reviews")],
+                     reviews=[_review("APPROVED")])
+    ev = _bundle(greens)
+    calls = []
+
+    def fake_gh(token, *args, **kw):
+        calls.append(args)
+        if args[:3] == ("pr", "view", "5"):
+            return 0, json.dumps({"headRefOid": SHA1, "state": "OPEN",
+                                  "mergeable": "MERGEABLE", "headRefName": "topic",
+                                  "isCrossRepository": False})
+        if args[:2] == ("pr", "comment"):
+            return 0, "{}"
+        if args[:2] == ("api", "-X") and "PUT" in args:
+            return 0, json.dumps({"merged": True, "sha": "M" * 40})
+        if args[:2] == ("api", "-X") and "DELETE" in args:
+            return 0, ""
+        return 0, "main"
+
+    with patch("src.merge_executor._gh", side_effect=fake_gh):
+        result = merge("o/r", 5, SHA1, ev, "tok")
+    assert result["merged"] is True
+    kinds = ["comment" if c[:2] == ("pr", "comment") else
+             "merge" if ("PUT" in c and "merge" in c) else "other" for c in calls]
+    assert "comment" in kinds and "merge" in kinds
+    assert kinds.index("comment") < kinds.index("merge"), kinds
