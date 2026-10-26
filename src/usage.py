@@ -29,12 +29,15 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 from typing import Any
 
 import psycopg  # psycopg3
+
+from .config import install_id_is_valid
 
 log = logging.getLogger("rhobear_neo.usage")
 
@@ -43,6 +46,12 @@ log = logging.getLogger("rhobear_neo.usage")
 # gate always sees `reviews:zeus/...` on a row even when the caller is an
 # older lane file that predates the consumer field.
 DEFAULT_CONSUMER = "reviews:zeus"
+
+# The job-row lookup is best effort, but SILENTLY losing every PR / head /
+# round / install attribution forever is an incident, not a debug line: the
+# first failure warns (never echoing row values), later ones stay quiet.
+_JOB_TARGET_WARNED = False
+_JOB_TARGET_WARN_LOCK = threading.Lock()
 
 
 # ── Schema ───────────────────────────────────────────────────────────────────
@@ -226,10 +235,12 @@ class UsageStore:
         with self._conn() as c:
             job_pr, job_sha, job_round, install_id = self._job_target(
                 c, attempt.job_id)
-            if install_id and "/" not in consumer:
-                # Bare lane default → the L0 consumer shape reviews:zeus/<install>.
-                # An already-qualified consumer (a caller that knew the
-                # install) is never rewritten.
+            if install_id and "/" not in consumer and \
+                    install_id_is_valid(install_id):
+                # Bare lane default → the L0 consumer shape reviews:zeus/<install>,
+                # but only with an id GitHub could actually have sent (an
+                # unvalidated payload value never reaches a stored row).
+                # An already-qualified consumer is never rewritten.
                 consumer = f"{consumer}/{install_id}"
             pr_number = job_pr if job_pr is not None else attempt.pr_number
             head_sha = job_sha if job_sha is not None else attempt.head_sha
@@ -279,8 +290,19 @@ class UsageStore:
                 (job_id,),
             ).fetchone()
         except Exception:  # noqa: BLE001 — metering must never raise here
-            log.debug("job target lookup failed for job %s", job_id,
-                      exc_info=True)
+            global _JOB_TARGET_WARNED
+            with _JOB_TARGET_WARN_LOCK:
+                first = not _JOB_TARGET_WARNED
+                _JOB_TARGET_WARNED = True
+            if first:
+                log.warning(
+                    "job target lookup failed for job %s — attribution "
+                    "(pr/head/round/install) stays NULL on every row until "
+                    "the jobs table is readable again", job_id,
+                    exc_info=True)
+            else:
+                log.debug("job target lookup failed for job %s", job_id,
+                          exc_info=True)
             return None, None, None, None
         if row is None:
             return None, None, None, None
@@ -295,7 +317,11 @@ class UsageStore:
 
         Lets the WIRE header carry the same consumer the row will store
         (Apollo r2): the agent resolves this before the call instead of
-        letting the row be upgraded after it.  Best effort — never raises.
+        letting the row be upgraded after it.  The install id is validated
+        through the same shape check as `Config.zeus_consumer` — a forged or
+        malformed payload value returns None (the caller falls back to the
+        bare default) instead of riding into a header.  Best effort — never
+        raises.
         """
         if job_id is None:
             return None
@@ -306,7 +332,7 @@ class UsageStore:
             log.debug("job consumer lookup failed for job %s", job_id,
                       exc_info=True)
             return None
-        if not install_id:
+        if not install_id_is_valid(install_id or ""):
             return None
         return f"{DEFAULT_CONSUMER}/{install_id}"
 

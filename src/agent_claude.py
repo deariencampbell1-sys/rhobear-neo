@@ -35,7 +35,7 @@ import threading
 import time
 from urllib.parse import urlsplit
 
-from .config import Config
+from .config import Config, ROUTEGATE_PORT
 from .usage import (
     DEFAULT_CONSUMER, BriefTarget, Route, UsageAttempt, brief_target,
     classify_error_text,
@@ -69,7 +69,39 @@ def _warn_missing_gh_token() -> None:
     )
 
 
-ROUTEGATE_LOOPBACK_PORT = 8645
+ROUTEGATE_LOOPBACK_PORT = ROUTEGATE_PORT   # single source: src/config.py
+
+# The consumer may be only what this lane mints: `reviews:zeus` or
+# `reviews:zeus/<install-id>`.  Checked AT THE SINK (agent construction) as
+# well as at the source (Config.zeus_consumer / UsageStore.job_consumer), so
+# a poisoned job payload or any caller can never put header bytes into
+# ANTHROPIC_CUSTOM_HEADERS — validation at the source alone is bypassable.
+_CONSUMER_RE = re.compile(r"reviews:zeus(/[A-Za-z0-9_-]{1,64})?")
+
+
+def _scrub_consumer(consumer: str | None) -> str:
+    """Validate the consumer where it enters the client (the header sink).
+
+    Non-conforming → the bare lane default, logged as a repr (control
+    characters are escaped, so the warning itself cannot be forged)."""
+    value = (consumer or "").strip()
+    if not value:
+        return ""
+    if not _CONSUMER_RE.fullmatch(value):
+        log.warning("consumer refused at the agent sink: %r — using the "
+                    "bare lane default", value)
+        return DEFAULT_CONSUMER
+    return value
+
+
+def _is_gate_url(url: str) -> bool:
+    """True when `url` is the loopback RouteGate Anthropic wire (parsed by
+    the same fail-closed guard that refuses foreign URLs)."""
+    try:
+        _require_loopback_roulegate(url)
+    except AgentError:
+        return False
+    return True
 
 
 def _require_loopback_roulegate(url: str) -> str:
@@ -197,9 +229,13 @@ class ClaudeAgent:
         self.max_tokens = max_tokens
         self.timeout = timeout
         self.gh_token = gh_token
-        # Consumer attribution carried on every call (brief step 1):
-        # `reviews:zeus` or `reviews:zeus/<install_id>`.
-        self.consumer = consumer
+        # Consumer attribution for gated calls (brief step 1):
+        # `reviews:zeus` or `reviews:zeus/<install_id>` — validated at the
+        # SINK (a poisoned value never reaches a header env var) and only
+        # attached when the call goes through RouteGate: a third-party
+        # provider never receives this lane's internal attribution.
+        self.consumer = _scrub_consumer(consumer)
+        self.gated = _is_gate_url(self.base_url)
 
     # ------------------------------------------------------------------
     # Factory
@@ -697,14 +733,18 @@ class ClaudeAgent:
         if self.gh_token:
             env["GH_TOKEN"] = self.gh_token
         # Consumer attribution (W1-06): the gate's per-lane header rides with
-        # every call.  ANTHROPIC_CUSTOM_HEADERS is how Claude Code carries a
-        # custom header on the wire; X_RHOBEAR_CONSUMER is this service's own
-        # auditable env form of the same value.  Neither is a secret.
-        if self.consumer:
+        # GATED calls only (a third-party provider never receives it).
+        # ANTHROPIC_CUSTOM_HEADERS is how Claude Code carries a custom header
+        # on the wire; X_RHOBEAR_CONSUMER is this service's own auditable env
+        # form of the same value.  Neither is a secret.  An operator-supplied
+        # ANTHROPIC_CUSTOM_HEADERS (proxy auth, tracing) is EXTENDED, never
+        # replaced — ours appends as an extra line.
+        if self.gated and self.consumer:
             env["X_RHOBEAR_CONSUMER"] = self.consumer
+            ours = f"X-RHOBEAR-Consumer: {self.consumer}"
+            existing = (os.environ.get("ANTHROPIC_CUSTOM_HEADERS") or "").strip()
             env["ANTHROPIC_CUSTOM_HEADERS"] = (
-                f"X-RHOBEAR-Consumer: {self.consumer}"
-            )
+                f"{existing}\n{ours}" if existing else ours)
         return env
 
     def _build_cmd(self, brief: str) -> list[str]:
@@ -849,10 +889,10 @@ class ClaudeAgent:
         }
         # Cached tokens and the response's own cost estimate (RouteGate
         # `usage.estimated_cost`): carried ONLY when the response actually
-        # had them — unknown stays absent, never invented or estimated here.
-        if "cache_read_input_tokens" in usage_raw:
-            usage["cached_input"] = int(
-                usage_raw.get("cache_read_input_tokens") or 0)
+        # had them — a present-but-null field is NOT REPORTED (unknown stays
+        # unknown), never 0, never invented or estimated here.
+        if usage_raw.get("cache_read_input_tokens") is not None:
+            usage["cached_input"] = int(usage_raw["cache_read_input_tokens"])
         cost = usage_raw.get("estimated_cost")
         if cost is not None:
             try:

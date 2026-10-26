@@ -1602,6 +1602,7 @@ def test_validate_rejects_foreign_routegate_url() -> None:
     cfg.validate()  # loopback defaults are valid
 
     foreign = Config()
+    foreign.claude_bin = sys.executable
     foreign.routegate_base_url = "https://elsewhere.example/v1"
     foreign.validate()                                # must not raise
     assert foreign.routegate_base_url == ROUTEGATE_BASE_URL   # defaulted

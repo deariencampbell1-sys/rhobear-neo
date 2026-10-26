@@ -39,15 +39,39 @@ MAX_BUILDER_ROUNDS_DEFAULT = 2
 # keeps Zeus's Claude-CLI triage on DeepSeek's Anthropic endpoint exactly as
 # brief step 2's "if not" branch requires.  Fail-closed: only the loopback
 # values below pass validate().
-ROUTEGATE_BASE_URL = "http://127.0.0.1:8645/v1"
-ROUTEGATE_ANTHROPIC_URL = "http://127.0.0.1:8645/v1/messages"
+ROUTEGATE_PORT = 8645
+ROUTEGATE_BASE_URL = f"http://127.0.0.1:{ROUTEGATE_PORT}/v1"
+ROUTEGATE_ANTHROPIC_URL = f"http://127.0.0.1:{ROUTEGATE_PORT}/v1/messages"
 # The RouteGate capability that serves peak-hours/cost-aware routing
 # (route-policy.yaml); also the route name recorded on gated attempts.
 ROUTEGATE_MODEL = "peak"
 
 # An install id may only be what GitHub sends: digits/word chars/dashes.
-# Anything else never reaches a header (see Config.zeus_consumer).
+# Anything else never reaches a header (Config.zeus_consumer AND the agent's
+# sink validation both consult this).
 _INSTALL_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+def install_id_is_valid(install_id: str) -> bool:
+    """True only for what GitHub sends — the single shape check for an
+    install id anywhere it might reach a header or an attribution row."""
+    return bool(install_id) and bool(_INSTALL_ID_RE.fullmatch(install_id))
+
+
+def zeus_consumer_for(install_id: str) -> str:
+    """L0's consumer shape: `reviews:zeus/<install_id>`.
+
+    Invalid or absent id → the bare lane default (a warning that never
+    echoes the value).  Module-level so the store (`UsageStore.job_consumer`,
+    `record_attempt`) and the agent's sink all validate through ONE shape.
+    """
+    if not install_id:
+        return "reviews:zeus"
+    if not install_id_is_valid(install_id):
+        log.warning("invalid install id for consumer attribution — "
+                    "using the bare lane default")
+        return "reviews:zeus"
+    return f"reviews:zeus/{install_id}"
 
 
 def _get(name: str, default: str = "") -> str:
@@ -265,15 +289,11 @@ class Config:
         The id is validated before it is embedded: it goes into a header env
         var, so a value with newlines/CRLF or anything GitHub would never
         send is dropped (bare lane default, warning without the value) rather
-        than interpolated.
+        than interpolated.  The shape logic is module-level
+        (`zeus_consumer_for`) so the store and the agent's sink validate the
+        same way.
         """
-        install_id = (install_id or "").strip()
-        if not install_id:
-            return "reviews:zeus"
-        if not _INSTALL_ID_RE.fullmatch(install_id):
-            log.warning("invalid install id for consumer attribution — "
-                        "using the bare lane default")
-            return "reviews:zeus"
+        return zeus_consumer_for((install_id or "").strip())
         return f"reviews:zeus/{install_id}"
 
     def __post_init__(self) -> None:
@@ -339,16 +359,23 @@ class Config:
 
         Raises ValueError (safe to log — no secrets) on any violation.
 
-        RouteGate endpoints are validated fail-closed the same way: only the
-        loopback gate passes, so a stale/foreign URL can never point Zeus's
-        briefs (and their context) off-box.
+        RouteGate endpoints: the Anthropic wire URL (which carries briefs) is
+        validated fail-closed — only the loopback gate passes, so a
+        stale/foreign URL can never point Zeus's briefs (and their context)
+        off-box.  The other two RouteGate knobs warn-and-default (see below).
         """
-        # --- RouteGate: loopback only, Anthropic wire only when L2 serves it ---
+        # --- RouteGate -------------------------------------------------
+        # Brief containment (anthropic URL) stays fail-closed: only the
+        # loopback gate may hold Zeus's briefs.  The capability NAME and the
+        # OpenAI-shape base URL (no brief traffic in this lane) are
+        # operational knobs: a typo warns and defaults instead of
+        # crash-looping both services (Apollo r3 — this codebase already
+        # burned on a validate() raise that kept services down).
         if self.routegate_base_url.rstrip("/") != ROUTEGATE_BASE_URL:
-            raise ValueError(
-                f"routegate_base_url must be the loopback RouteGate "
-                f"({ROUTEGATE_BASE_URL}), got {self.routegate_base_url!r}"
-            )
+            log.warning("routegate_base_url %r is not the loopback gate — "
+                        "defaulting to %s",
+                        self.routegate_base_url, ROUTEGATE_BASE_URL)
+            self.routegate_base_url = ROUTEGATE_BASE_URL
         rg_anthropic = self.routegate_anthropic_url.strip().rstrip("/")
         if rg_anthropic and rg_anthropic != ROUTEGATE_ANTHROPIC_URL:
             raise ValueError(
@@ -358,10 +385,10 @@ class Config:
                 f"{self.routegate_anthropic_url!r}"
             )
         if self.routegate_model.strip() != ROUTEGATE_MODEL:
-            raise ValueError(
-                f"routegate_model must be the RouteGate capability "
-                f"{ROUTEGATE_MODEL!r}, got {self.routegate_model!r}"
-            )
+            log.warning("routegate_model %r is not the RouteGate capability "
+                        "— defaulting to %r",
+                        self.routegate_model, ROUTEGATE_MODEL)
+            self.routegate_model = ROUTEGATE_MODEL
 
         base = self.deepseek_base_url.rstrip("/")
         if base not in {

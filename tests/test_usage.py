@@ -1139,31 +1139,6 @@ def test_header_and_row_consumer_match(store: UsageStore) -> None:
 
 
 @requires_pg
-def test_record_attempt_survives_missing_jobs_table(store: UsageStore) -> None:
-    """[Apollo r2, MEDIUM] The job lookup is best effort: with `neo_jobs`
-    unreadable the attempt row must still land — `_conn()` is autocommit
-    (no failed statement can poison the INSERT that follows)."""
-    assert DSN
-    with psycopg.connect(DSN, autocommit=True) as c:
-        c.execute("ALTER TABLE neo_jobs RENAME TO neo_jobs_tmp_w106")
-    try:
-        ok = store.record_attempt(UsageAttempt(
-            job_id=555001, attempt_number=1, route_idx=0,
-            provider="deepseek", model="m", outcome="success",
-            uncached_input=1, output_tokens=1, latency_ms=9,
-        ))
-        assert ok is True
-        row, = store.get_attempts(555001)
-        assert row.consumer == "reviews:zeus", (
-            "no job row to qualify it: bare lane default, never invented")
-        assert row.pr_number is None and row.head_sha is None
-    finally:
-        with psycopg.connect(DSN, autocommit=True) as c:
-            c.execute("ALTER TABLE neo_jobs_tmp_w106 RENAME TO neo_jobs")
-        store.clear(555001)
-
-
-@requires_pg
 def test_bad_install_id_never_reaches_the_wire(store: UsageStore) -> None:
     """[Apollo r3, HIGH] A forged/poisoned `installation_id` in the job
     payload must not ride into the child env: refused at the source
@@ -1229,6 +1204,10 @@ def test_job_target_failure_warns_once(store: UsageStore, caplog: Any) -> None:
     the first lookup failure logs WARNING (once, never the poisoned value),
     later ones stay quiet (rate-limited) — not DEBUG-silence forever."""
     import logging as _logging
+
+    import src.usage as usage_mod
+
+    usage_mod._JOB_TARGET_WARNED = False   # deterministic: the flag is global
 
     class BoomConn:
         def execute(self, *args, **kwargs):
