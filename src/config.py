@@ -166,11 +166,15 @@ class Config:
     # documented step-1 default, validated fail-closed to the loopback gate.
     routegate_base_url: str = field(default_factory=lambda: _get(
         "NEO_ROUTEGATE_BASE_URL", ROUTEGATE_BASE_URL))
-    # Anthropic-wire endpoint of the gate.  Empty = gate not serving this wire
+    # Anthropic-wire entry of the gate.  Empty = gate not serving this wire
     # yet (the current state): the CLI keeps DeepSeek's Anthropic endpoint.
-    # Set to http://127.0.0.1:8645/v1/messages the moment L2 exposes it, and
-    # every triage attempt runs through RouteGate with consumer reviews:zeus
-    # (RouteGate then owns failover — no provider fallback outside the gate).
+    # Set to the BASE http://127.0.0.1:8645 the moment L2 exposes it — the
+    # Claude CLI appends /v1/messages itself (deepseek_base_url proves the
+    # contract).  The historical /v1/messages endpoint form is ALSO accepted
+    # and normalised to the base; any other path is discarded fail-closed.
+    # Every triage attempt then runs through RouteGate with consumer
+    # reviews:zeus (RouteGate owns failover — no provider fallback outside
+    # the gate; the outage surface becomes the gate itself).
     routegate_anthropic_url: str = field(default_factory=lambda: _get(
         "NEO_ROUTEGATE_ANTHROPIC_URL", ""))
     # RouteGate capability name — also the route name metered on gated attempts.
@@ -386,6 +390,15 @@ class Config:
                         self.routegate_base_url, ROUTEGATE_BASE_URL)
             self.routegate_base_url = ROUTEGATE_BASE_URL
         rg_anthropic = self.routegate_anthropic_url.strip().rstrip("/")
+        # BOTH documented forms turn the gate on (Apollo r6): the base is
+        # canonical; the field comment's historical /v1/messages endpoint
+        # form is normalised to it (the CLI appends the path itself), so
+        # following either instruction can never silently disable the gate.
+        if rg_anthropic == ROUTEGATE_ANTHROPIC_URL + "/v1/messages":
+            log.info("routegate_anthropic_url: endpoint form normalised "
+                     "to the base %s", ROUTEGATE_ANTHROPIC_URL)
+            rg_anthropic = ROUTEGATE_ANTHROPIC_URL
+            self.routegate_anthropic_url = rg_anthropic
         if rg_anthropic and rg_anthropic != ROUTEGATE_ANTHROPIC_URL:
             # Not the allow-listed endpoint: DISCARD it (gate off, the direct
             # chain stands) instead of raising.  Raising would crash-loop both

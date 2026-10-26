@@ -1708,7 +1708,12 @@ def test_roulegate_guard_parses_the_url() -> None:
         cfg.routegate_anthropic_url = evil
         with pytest.raises(AgentError, match="loopback") as excinfo:
             ClaudeAgent.from_config(cfg, gh_token=GH_TOKEN)
-        assert evil in str(excinfo.value), evil
+        msg = str(excinfo.value)
+        # the refusal names the shape it wants and the path/host it saw …
+        assert "127.0.0.1:8645" in msg and "/v1/messages" in msg, evil
+        # … but never the RAW value: userinfo credentials are redacted
+        # (Apollo r6 — the redacted message shows scheme/host/port/path only)
+        assert "@evil.example" not in msg and "user:" not in msg, evil
 
 
 def test_roulegate_failure_is_metered_and_ends_the_run() -> None:

@@ -57,12 +57,17 @@ _GH_TOKEN_WARN_LOCK = threading.Lock()
 
 
 def _warn_missing_gh_token() -> None:
+    """A missing installation token is loud once per process — ERROR, not a
+    debug-grade warning: the run proceeds unauthenticated and the only other
+    signal is `had_gh_token=False` on the attempt rows (which is what an
+    operator should alert on; the caller-side enforcement lives in
+    neo_worker, outside this lane's files — filed as an owner follow-up)."""
     global _GH_TOKEN_WARNED
     with _GH_TOKEN_WARN_LOCK:
         if _GH_TOKEN_WARNED:
             return
         _GH_TOKEN_WARNED = True
-    log.warning(
+    log.error(
         "ClaudeAgent.from_config() called without gh_token — the CLI runs "
         "with no GH_TOKEN; no personal token may become a silent identity"
     )
@@ -96,10 +101,13 @@ def _scrub_consumer(consumer: str | None) -> str:
 def _scrub_capability(name: str | None) -> str:
     """Validate the RouteGate capability name AT THE SINK — it lands in the
     child's argv (`--model`) and in the metered `route_name`, so a
-    post-validate mutation of `cfg.routegate_model` must not put e.g.
-    `--evil` into either.  Non-conforming → the real capability (`peak`)."""
+    post-validate mutation of `cfg.routegate_model` must not put a flag in
+    either.  A character class alone lets a bare `--evil` through
+    (Apollo r6), so values starting with `-` are refused too, and any
+    non-conforming value → the real capability (`peak`)."""
     value = (name or "").strip()
-    if not re.fullmatch(r"[A-Za-z0-9._-]{1,32}", value):
+    if value.startswith("-") or not re.fullmatch(r"[A-Za-z0-9._-]{1,32}",
+                                                 value):
         log.warning("routegate capability refused at the agent sink: %r — "
                     "using %r", value, ROUTEGATE_MODEL)
         return ROUTEGATE_MODEL
@@ -121,18 +129,22 @@ def _require_loopback_roulegate(url: str) -> str:
 
     The value is a BASE (`http://127.0.0.1:8645`) — the Claude CLI appends
     `/v1/messages` itself, exactly as it does for `deepseek_base_url`
-    (`https://api.deepseek.com/anthropic`).  The guard therefore requires
-    scheme http, host exactly 127.0.0.1, no userinfo, RouteGate's port, and
-    NO path at all: any path (including `..`, `%2e%2e`, or a doubled
-    `/v1/messages`) is refused, so the client always resolves
-    `base + /v1/messages` and nothing else.
+    (`https://api.deepseek.com/anthropic`).  The guard requires scheme http,
+    host exactly 127.0.0.1, no userinfo, RouteGate's port, and NO path (or
+    `/v1/messages` from the field comment's historical form, which is
+    NORMALISED to the base so the client still appends it exactly once —
+    a doubled or traversal path such as `/v1/messages/../exfil` or
+    `%2e%2e` is refused outright).
 
     Parsed, not prefixed: a prefix check lets
     `http://127.0.0.1:8645@evil.example/...` (userinfo) or an arbitrary
     loopback port through.  validate() whitelists the exact base, but a cfg
     can be mutated after it — so both construction paths (from_config and
     _for_roulegate) re-check here and refuse anything that would route a
-    brief (and its repo context) off-box.  Returns the normalised URL.
+    brief (and its repo context) off-box.  The error message quotes only
+    scheme/host/port/path — never userinfo — so a credential parked in a
+    mistyped URL cannot leak into logs or escalation output.  Returns the
+    normalised BASE.
     """
     clean = (url or "").strip().rstrip("/")
     parts = urlsplit(clean)
@@ -141,17 +153,21 @@ def _require_loopback_roulegate(url: str) -> str:
         port = parts.port
     except ValueError:  # unparseable port → not the gate
         port = None
+    port_txt = f":{port}" if port is not None else ""
+    shown = f"{parts.scheme}://{parts.hostname}{port_txt}{path}"
     if (parts.scheme != "http"
             or parts.hostname != "127.0.0.1"
             or parts.username is not None
             or parts.password is not None
             or port != ROUTEGATE_LOOPBACK_PORT
-            or path not in ("", "/")):
+            or path not in ("", "/", "/v1/messages")):
         raise AgentError(
             f"routegate_anthropic_url must be the loopback RouteGate BASE "
             f"(http://127.0.0.1:{ROUTEGATE_LOOPBACK_PORT} — the CLI "
-            f"appends /v1/messages), got {url!r}"
+            f"appends /v1/messages), got {shown!r}"
         )
+    if path == "/v1/messages":
+        return clean[:-len("/v1/messages")]
     return clean
 
 
@@ -386,6 +402,13 @@ class ClaudeAgent:
         row can never disagree; falls back to the agent's own consumer when
         the store or row has nothing.  A store without the method (test
         doubles, older callers) keeps the agent's own consumer.
+
+        Connection cost (Apollo r6, accepted & documented): this lookup runs
+        BEFORE the attempt (the header must be on the wire), so the GATED
+        path uses one extra connection per attempt (job lookup + row
+        insert = 2) while the direct path does only the insert (1).  The
+        lookup cannot share the INSERT's connection — it precedes the model
+        call by seconds — and the header is the point of the ordering.
         """
         consumer = (self.consumer or "").strip() or DEFAULT_CONSUMER
         if usage_store is None or job_id is None or "/" in consumer:
@@ -926,7 +949,16 @@ class ClaudeAgent:
         # had them — a present-but-null field is NOT REPORTED (unknown stays
         # unknown), never 0, never invented or estimated here.
         if usage_raw.get("cache_read_input_tokens") is not None:
-            usage["cached_input"] = int(usage_raw["cache_read_input_tokens"])
+            # Malformed input must behave like the cost branch below: the
+            # key stays unknown — never a ValueError escaping the caller's
+            # `except AgentError` (Apollo r6).
+            try:
+                usage["cached_input"] = int(
+                    usage_raw["cache_read_input_tokens"])
+            except (TypeError, ValueError):
+                log.warning("unusable cache_read_input_tokens %r — "
+                            "cached_input left unknown",
+                            usage_raw.get("cache_read_input_tokens"))
         cost = usage_raw.get("estimated_cost")
         if cost is not None:
             try:
