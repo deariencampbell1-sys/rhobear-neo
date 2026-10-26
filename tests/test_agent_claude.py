@@ -1930,6 +1930,8 @@ def test_validate_accepts_the_real_gate_url() -> None:
 def test_missing_gh_token_is_recorded_on_the_attempt_row() -> None:
     """[Apollo r4, MEDIUM] A missing identity must be visible in METERING,
     not only in a boot log: every attempt row carries `had_gh_token`."""
+    from src.usage import Route
+
     cfg = Config()
     cfg.deepseek_base_url = BASE
     cfg.deepseek_model = MODEL
