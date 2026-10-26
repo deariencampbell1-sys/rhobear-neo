@@ -6,12 +6,15 @@ install with CodeAnt on; a customer's explicit disabled row is never flipped
 back. list/set/delete are install-scoped for Wave 3.
 
 No test touches a real database: psycopg.connect is replaced with a recording
-fake. The NEO_TEST_DSN-gated integration tests below run against the
-integrator's throwaway Postgres only.
+fake that is RESTORED on exit (defect 3: the old _install leaked the fake, so
+the NEO_TEST_DSN-gated integration test below ran against stale fake SQL and
+never touched real SQL). The integration test runs against the integrator's
+throwaway Postgres only, and skips with a printed reason otherwise.
 """
 from __future__ import annotations
 
-from unittest import mock
+import contextlib
+import os
 
 import pytest
 
@@ -54,49 +57,59 @@ class FakeConn:
         self.commits += 1
 
 
-def _install(module, rows=()):
-    """A recording fake DB under module._connect; returns the FakeConn."""
+@contextlib.contextmanager
+def recording_db(rows=()):
+    """A recording fake DB installed as trusted_reviewers._connect — and
+    RESTORED on exit (defect 3, HIGH): the fixture installs and restores, so
+    after it exits module._connect is the original object again and no later
+    test (the NEO_TEST_DSN integration one in particular) can run against a
+    stale fake."""
+    from src import trusted_reviewers as tr
     conn = FakeConn(rows)
-    module._connect = lambda dsn: conn
-    return conn
+    original = tr._connect
+    tr._connect = lambda dsn: conn
+    try:
+        yield conn
+    finally:
+        tr._connect = original
 
 
 def test_ensure_schema_creates_the_table_and_seeds_the_owner_install_once():
     from src import trusted_reviewers as tr
-    conn = _install(tr)
-    tr.ensure_schema("dsn")
-    sqls = [sql for sql, _ in conn.cur.calls]
-    assert any("CREATE TABLE IF NOT EXISTS trusted_reviewers" in sql for sql in sqls), sqls
-    assert any("updated_at" in sql and "enabled" in sql for sql in sqls), sqls
-    seed = [p for sql, p in conn.cur.calls if "INSERT" in sql.upper() and "ON CONFLICT" in sql.upper()]
-    assert seed and seed[0][:2] == (OWNER, "CodeAnt"), seed
-    assert "DO NOTHING" in [sql for sql, _ in conn.cur.calls if "INSERT" in sql.upper()][0].upper(), \
-        "a customer's disabled row must never be flipped back"
+    with recording_db() as conn:
+        tr.ensure_schema("dsn")
+        sqls = [sql for sql, _ in conn.cur.calls]
+        assert any("CREATE TABLE IF NOT EXISTS trusted_reviewers" in sql for sql in sqls), sqls
+        assert any("updated_at" in sql and "enabled" in sql for sql in sqls), sqls
+        seed = [p for sql, p in conn.cur.calls if "INSERT" in sql.upper() and "ON CONFLICT" in sql.upper()]
+        assert seed and seed[0][:2] == (OWNER, "CodeAnt"), seed
+        assert "DO NOTHING" in [sql for sql, _ in conn.cur.calls if "INSERT" in sql.upper()][0].upper(), \
+            "a customer's disabled row must never be flipped back"
 
 
 def test_set_list_delete_are_install_scoped():
     from src import trusted_reviewers as tr
-    conn = _install(tr)
-    tr.set_source("dsn", OWNER, "*", "Greptile", enabled=True)
-    upsert = [c for c in conn.cur.calls if "DO UPDATE" in c[0].upper()]
-    assert upsert, conn.cur.calls
-    sql, params = upsert[0]
-    assert "ON CONFLICT (install_id, repo, source) DO UPDATE" in sql, sql
-    assert params == (OWNER, "*", "Greptile", True), params
-    assert conn.commits >= 1
+    with recording_db() as conn:
+        tr.set_source("dsn", OWNER, "*", "Greptile", enabled=True)
+        upsert = [c for c in conn.cur.calls if "DO UPDATE" in c[0].upper()]
+        assert upsert, conn.cur.calls
+        sql, params = upsert[0]
+        assert "ON CONFLICT (install_id, repo, source) DO UPDATE" in sql, sql
+        assert params == (OWNER, "*", "Greptile", True), params
+        assert conn.commits >= 1
 
-    conn = _install(tr, rows=[(OWNER, "*", "Greptile", True, "2026-10-26T00:00:00Z")])
-    rows = tr.list_sources("dsn", OWNER)
-    assert rows == [{"install_id": OWNER, "repo": "*", "source": "Greptile",
-                     "enabled": True, "updated_at": "2026-10-26T00:00:00Z"}]
-    sql, params = conn.cur.calls[-1]
-    assert "install_id = %s" in sql and params == (OWNER,), (sql, params)
+    with recording_db(rows=[(OWNER, "*", "Greptile", True, "2026-10-26T00:00:00Z")]) as conn:
+        rows = tr.list_sources("dsn", OWNER)
+        assert rows == [{"install_id": OWNER, "repo": "*", "source": "Greptile",
+                         "enabled": True, "updated_at": "2026-10-26T00:00:00Z"}]
+        sql, params = conn.cur.calls[-1]
+        assert "install_id = %s" in sql and params == (OWNER,), (sql, params)
 
-    conn = _install(tr)
-    tr.delete_source("dsn", OWNER, "*", "Greptile")
-    sql, params = conn.cur.calls[-1]
-    assert sql.strip().upper().startswith("DELETE"), sql
-    assert params == (OWNER, "*", "Greptile"), params
+    with recording_db() as conn:
+        tr.delete_source("dsn", OWNER, "*", "Greptile")
+        sql, params = conn.cur.calls[-1]
+        assert sql.strip().upper().startswith("DELETE"), sql
+        assert params == (OWNER, "*", "Greptile"), params
 
 
 def test_enabled_sources_wildcard_is_overridden_by_a_repo_row():
@@ -107,14 +120,14 @@ def test_enabled_sources_wildcard_is_overridden_by_a_repo_row():
         (OWNER, "*", "Greptile", False, ""),
         (OWNER, "*", "CodeRabbit", True, ""),
     ]
-    _install(tr, rows)
-    # The repo row overrides the wildcard per source.
-    assert tr.enabled_sources("dsn", OWNER, "deariencampbell1-sys/rhobear-neo") == ("CodeRabbit",)
-    assert set(tr.enabled_sources("dsn", OWNER, "deariencampbell1-sys/rhobear-reviews-app")) == {
-        "CodeAnt", "CodeRabbit"}
+    with recording_db(rows):
+        # The repo row overrides the wildcard per source.
+        assert tr.enabled_sources("dsn", OWNER, "deariencampbell1-sys/rhobear-neo") == ("CodeRabbit",)
+        assert set(tr.enabled_sources("dsn", OWNER, "deariencampbell1-sys/rhobear-reviews-app")) == {
+            "CodeAnt", "CodeRabbit"}
     # Another install never sees this install's rows.
-    _install(tr, rows=[])
-    assert tr.enabled_sources("dsn", "acme", "acme/checkout") == ()
+    with recording_db(rows=[]):
+        assert tr.enabled_sources("dsn", "acme", "acme/checkout") == ()
 
 
 def test_source_matches_is_normalised_and_never_matches_an_unknown_reviewer():
@@ -156,42 +169,26 @@ def test_source_matches_table(source, name, expected):
 def test_disabled_source_is_not_in_the_enabled_set():
     """Disabled CodeAnt does not count — the toggle is the customer's choice."""
     from src import trusted_reviewers as tr
-    _install(tr, rows=[(OWNER, "*", "CodeAnt", False, "")])
-    assert tr.enabled_sources("dsn", OWNER, "deariencampbell1-sys/rhobear-neo") == ()
+    with recording_db(rows=[(OWNER, "*", "CodeAnt", False, "")]):
+        assert tr.enabled_sources("dsn", OWNER, "deariencampbell1-sys/rhobear-neo") == ()
 
 
 # ---------------------------------------------------------------------------
 # Integration (the integrator's throwaway PG: NEO_TEST_DSN) — real SQL.
 # ---------------------------------------------------------------------------
 
-def _dsn():
-    import os
-    return os.environ.get("NEO_TEST_DSN") or ""
+def _require_dsn() -> str:
+    """The integration test's own guard: without NEO_TEST_DSN it SKIPS with a
+    printed reason — it never silently passes without touching real SQL."""
+    dsn = os.environ.get("NEO_TEST_DSN") or ""
+    if not dsn:
+        reason = ("NEO_TEST_DSN is unset — real-SQL integration needs the "
+                  "integrator's throwaway Postgres; skipping with this "
+                  "printed reason (never silently passing)")
+        print(reason)
+        pytest.skip(reason)
+    return dsn
 
-
-@pytest.mark.skipif(not _dsn(), reason="NEO_TEST_DSN not set (throwaway Postgres)")
-def test_integration_real_sql_roundtrip():
-    from src import trusted_reviewers as tr
-    dsn = _dsn()
-    tr.ensure_schema(dsn)
-    tr.ensure_schema(dsn)                      # idempotent
-    tr.set_source(dsn, "w1-07-test", "w1-07-test/repo", "Greptile", enabled=True)
-    assert "Greptile" in tr.enabled_sources(dsn, "w1-07-test", "w1-07-test/repo")
-    tr.set_source(dsn, "w1-07-test", "w1-07-test/repo", "Greptile", enabled=False)
-    assert tr.enabled_sources(dsn, "w1-07-test", "w1-07-test/repo") == ()
-    tr.delete_source(dsn, "w1-07-test", "w1-07-test/repo", "Greptile")
-    assert tr.list_sources(dsn, "w1-07-test", "w1-07-test/repo") == []
-    # The seed is present exactly once and never re-enabled a disabled row.
-    tr.set_source(dsn, tr.DEFAULT_OWNER_INSTALL_ID, "*", tr.SEED_SOURCE, enabled=False)
-    tr.ensure_schema(dsn)
-    assert tr.enabled_sources(dsn, tr.DEFAULT_OWNER_INSTALL_ID, "any/repo") == ()
-    tr.set_source(dsn, tr.DEFAULT_OWNER_INSTALL_ID, "*", tr.SEED_SOURCE, enabled=True)
-
-# ---------------------------------------------------------------------------
-# Defect 3 (HIGH): the fake DB must be installed AND restored, and the
-# integration test must skip with a printed reason when NEO_TEST_DSN is
-# unset — never run against a stale fake and never silently pass.
-# ---------------------------------------------------------------------------
 
 def test_the_connect_fake_is_restored_after_the_fixture_exits():
     """After the fixture exits, module._connect is the original object (the
@@ -215,3 +212,21 @@ def test_the_integration_guard_skips_with_a_printed_reason(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "NEO_TEST_DSN" in out, out
     assert "NEO_TEST_DSN" in str(exc.value), str(exc.value)
+
+
+def test_integration_real_sql_roundtrip():
+    from src import trusted_reviewers as tr
+    dsn = _require_dsn()
+    tr.ensure_schema(dsn)
+    tr.ensure_schema(dsn)                      # idempotent
+    tr.set_source(dsn, "w1-07-test", "w1-07-test/repo", "Greptile", enabled=True)
+    assert "Greptile" in tr.enabled_sources(dsn, "w1-07-test", "w1-07-test/repo")
+    tr.set_source(dsn, "w1-07-test", "w1-07-test/repo", "Greptile", enabled=False)
+    assert tr.enabled_sources(dsn, "w1-07-test", "w1-07-test/repo") == ()
+    tr.delete_source(dsn, "w1-07-test", "w1-07-test/repo", "Greptile")
+    assert tr.list_sources(dsn, "w1-07-test", "w1-07-test/repo") == []
+    # The seed is present exactly once and never re-enabled a disabled row.
+    tr.set_source(dsn, tr.DEFAULT_OWNER_INSTALL_ID, "*", tr.SEED_SOURCE, enabled=False)
+    tr.ensure_schema(dsn)
+    assert tr.enabled_sources(dsn, tr.DEFAULT_OWNER_INSTALL_ID, "any/repo") == ()
+    tr.set_source(dsn, tr.DEFAULT_OWNER_INSTALL_ID, "*", tr.SEED_SOURCE, enabled=True)
