@@ -790,3 +790,162 @@ def test_divergent_classify_cli_fallthrough_is_deleted():
     divergent duplicate must be GONE."""
     import src.usage as usage
     assert not hasattr(usage, "classify_cli_fallthrough")
+
+
+# ===================================================================
+# W1-06 — RouteGate metering: per-attempt rows, anchored classification
+# ===================================================================
+
+class _FakeUsageStore:
+    """In-memory UsageStore stand-in (no Postgres): same idempotency rule
+    (unique on job_id + attempt_number + route_idx)."""
+
+    def __init__(self):
+        self.rows = []
+        self._keys = set()
+
+    def record_attempt(self, attempt):
+        key = (attempt.job_id, attempt.attempt_number, attempt.route_idx)
+        if key in self._keys:
+            return False
+        self._keys.add(key)
+        self.rows.append(attempt)
+        return True
+
+
+def test_attempt_is_metered():
+    """Edge 1 + 4: a 402 mid-attempt is ONE fallthrough row recorded with its
+    route name and an incremented attempt counter; two attempts in one run are
+    two rows; replaying a row never double counts."""
+    from src.agent_claude import ClaudeAgent
+
+    cfg = Config()
+    cfg.claude_bin = sys.executable
+    cfg.deepseek_base_url = "https://api.deepseek.com/anthropic"
+    cfg.deepseek_model = "deepseek-v4-flash"
+    cfg.deepseek_reasoning_effort = "max"
+    cfg.deepseek_max_tokens = 32000
+    cfg.neo_routes = "zai:glm-5.3-flash,deepseek:deepseek-v4-flash"
+
+    agent = ClaudeAgent(
+        claude_bin=sys.executable, api_key="k",
+        base_url="https://api.deepseek.com/anthropic",
+        model="deepseek-v4-flash", timeout=30, gh_token="t",
+    )
+    store = _FakeUsageStore()
+    head = "cd" * 20
+    brief = (
+        "TARGET: PR #44 in acme/widget at head " + head[:12] + "\n"
+        "gh api repos/acme/widget/commits/" + head + "/status\n"
+        "You have already spent 1/2 builder rounds on this PR.\n"
+    )
+
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        if len(calls) == 1:
+            # Route 1 (zai) — a provider 402 mid-attempt.
+            return subprocess.CompletedProcess(
+                args=["claude"], returncode=0, stderr="",
+                stdout=json.dumps({
+                    "type": "result", "is_error": True,
+                    "subtype": "error_during_execution",
+                    "api_error_status": "402",
+                }),
+            )
+        # Route 2 (deepseek) — success, no cost carried by the response.
+        return subprocess.CompletedProcess(
+            args=["claude"], returncode=0, stderr="",
+            stdout=json.dumps({
+                "type": "result", "subtype": "success", "is_error": False,
+                "result": "VERDICT: ACCEPT-READY",
+                "usage": {"input_tokens": 50, "output_tokens": 20},
+                "num_turns": 1, "stop_reason": "end_turn",
+                "permission_denials": [],
+            }),
+        )
+
+    with patch.dict(os.environ, {"ZAI_API_KEY": "k1",
+                                 "DEEPSEEK_API_KEY": "k2"}, clear=True):
+        avail = available_routes(resolve_route_chain(cfg.neo_routes))
+        with patch("src.agent_claude.subprocess.run", side_effect=fake_run):
+            usage, verdict, ridx, route = agent.run_with_chain(
+                brief, avail, cfg, "t",
+                usage_store=store, job_id=7,
+            )
+
+    assert verdict == "ACCEPT-READY"
+    assert ridx == 1
+    assert len(calls) == 2
+    # Attempt counter incremented: one row per attempt, in order.
+    assert [r.route_idx for r in store.rows] == [0, 1]
+
+    first, second = store.rows
+    # Edge 1: 402 → exactly one fallthrough, recorded with its route name.
+    assert first.outcome == "fallthrough"
+    assert first.error_class == "402"
+    assert (first.provider, first.model) == ("zai", "glm-5.3-flash")
+    assert first.route_name is None          # direct route — no RouteGate cap
+    assert first.consumer == "reviews:zeus"  # written with consumer reviews:zeus
+    assert first.pr_number == 44
+    assert first.head_sha == head
+    assert first.builder_round == 1
+    assert first.cost_usd is None            # unknown stays None
+    assert first.latency_ms is not None
+
+    # Edge 4: two attempts → two rows, the winner metered with tokens.
+    assert second.outcome == "success"
+    assert (second.provider, second.model) == ("deepseek", "deepseek-v4-flash")
+    assert second.uncached_input == 50
+    assert second.output_tokens == 20
+    assert second.cost_usd is None
+    assert second.pr_number == 44 and second.head_sha == head
+
+    # Idempotent per attempt: replaying the same row never double counts.
+    assert store.record_attempt(first) is False
+    assert len(store.rows) == 2
+
+
+def test_fallthrough_classification_not_substring():
+    """usage.classify_error_text is the text classifier for attempts and it
+    anchors on `api_error_status` / `HTTP <code>` shapes only: "cost 1500
+    tokens" contains "500" but must never classify as a 5xx."""
+    from src.usage import classify_error_text
+
+    fall, cls = classify_error_text("run burned cost 1500 tokens")
+    assert fall is False
+    assert cls != "5xx"
+
+    assert classify_error_text("HTTP 503 Service Unavailable") == (True, "5xx")
+    assert classify_error_text("402") == (True, "402")
+    assert classify_error_text("Error code: 402 — payment required") == (True, "402")
+    assert classify_error_text("status: 400 bad request") == (False, "400")
+    assert classify_error_text("read 400 bytes then 150 files") != (False, "400")
+
+
+def test_stream_close_is_fallthrough():
+    """Edge 2: a stream that closes before any output is a fallthrough —
+    never a successful empty review."""
+    from src.agent_claude import ClaudeAgent, MissingResult
+
+    agent = ClaudeAgent.__new__(ClaudeAgent)
+    closed = subprocess.CompletedProcess(
+        args=["claude"], returncode=0, stdout="", stderr="")
+    fall, cls = agent._classify_agent_error(
+        MissingResult("no stdout from claude"), agent, proc=closed)
+    assert fall is True
+    assert cls == "stream_closed"
+
+    # A run that DID take turns but produced no verdict text still fails
+    # closed and is NOT a fallthrough — the model ran, don't silently retry.
+    ran = subprocess.CompletedProcess(
+        args=["claude"], returncode=0, stderr="",
+        stdout=json.dumps({
+            "type": "result", "subtype": "success", "is_error": False,
+            "result": "", "num_turns": 2, "stop_reason": "end_turn",
+        }),
+    )
+    fall2, cls2 = agent._classify_agent_error(
+        MissingResult("no result text from claude"), agent, proc=ran)
+    assert fall2 is False
