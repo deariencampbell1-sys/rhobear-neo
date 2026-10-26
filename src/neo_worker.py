@@ -862,7 +862,10 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict,
     if lane_pr:
         run_lane_gate(token, cfg, state, repo, pr, sha, lane_pr[0], lane_pr[1])
         return
-    if str(wake.get("context") or "").startswith(ARCHITECT_CONTEXT) or wake.get("context") == DRIFT_CONTEXT:
+    # Same case-insensitive normaliser as the webhook dispatch (defect 4).
+    from .webhook_server import is_architect_context, is_drift_context
+    if is_architect_context(str(wake.get("context") or "")) \
+            or is_drift_context(str(wake.get("context") or "")):
         return  # an architect or L0 drift status only ever drives a lane PR
 
     # Jev never supplies a green verdict.
