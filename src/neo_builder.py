@@ -649,7 +649,12 @@ def dispatch_one(cfg: Config, jobs: Jobs, row: dict) -> None:
     # Escalated rounds are exempt from the cap.
     is_escalated = bool((payload or {}).get("escalated"))
     if not is_escalated and round_ > cfg.max_builder_rounds:
-        jobs.park(row["id"],
+        # Present the claimant's worker_token (defect 2 fix): park() is
+        # fail-closed — a BARE park() refuses a row under a live lease, so the
+        # just-claimed round would sit `running` until lease expiry and park
+        # later with a misleading reason.  This token is the one claim_queued
+        # minted for THIS claim.
+        jobs.park(row["id"], worker_token=wtoken,
                   reason=f"max builder rounds ({cfg.max_builder_rounds}) reached (round {round_})")
         log.info("park %s#%s round=%s > max=%s — owner must re-arm",
                  repo, pr, round_, cfg.max_builder_rounds)
@@ -982,7 +987,9 @@ def main() -> int:
             # Round cap (defect 1 fix): escalated rounds are exempt.
             is_escalated = bool((payload or {}).get("escalated"))
             if not is_escalated and round_ > cfg.max_builder_rounds:
-                jobs.park(row["id"],
+                # Same fix as dispatch_one: present the claimant's token so
+                # the just-claimed row parks NOW, on its live lease.
+                jobs.park(row["id"], worker_token=row.get("worker_token"),
                           reason=f"max builder rounds ({cfg.max_builder_rounds}) reached (round {round_})")
                 log.info("park %s#%s round=%s > max=%s — owner must re-arm",
                          repo, pr, round_, cfg.max_builder_rounds)
