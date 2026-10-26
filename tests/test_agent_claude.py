@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -1524,6 +1525,7 @@ def test_zeus_calls_go_through_roulegate(tmp_path: Any) -> None:
         assert row.output_tokens == 5
         assert row.cached_input == 4
         assert row.cost_usd == 0.0042
+        assert row.had_gh_token is True, "gated path records identity too"
     finally:
         server.shutdown()
         server.server_close()
@@ -1752,6 +1754,7 @@ def test_roulegate_failure_is_metered_and_ends_the_run() -> None:
     row, = store.rows
     assert row.outcome == "fallthrough"
     assert row.error_class == "402"
+    assert row.had_gh_token is True, "gated failure rows record identity too"
     assert row.route_name == "peak"
     assert row.provider == "routegate"
     assert row.consumer.startswith("reviews:zeus")
@@ -1988,7 +1991,6 @@ def test_missing_gh_token_is_recorded_on_the_attempt_row() -> None:
         # The DIVERGENT case (r5): the agent object holds a token but this
         # run hands the child none — the row must say False, matching the
         # child env the chain actually built.
-        with_token.store_mismatch = True
         store_mismatch = _FakeUsageStore()
         with_token.run_with_chain(_zeus_brief(), routes, cfg, "",
                                   usage_store=store_mismatch, job_id=23)
@@ -2176,23 +2178,25 @@ def test_get_attempts_maps_columns_without_pg() -> None:
     the PG round-trip test is skipped in the default run."""
     from src.usage import UsageStore
 
-    cols = ["job_id", "attempt_number", "route_idx", "provider", "model",
-            "uncached_input", "cached_input", "output_tokens",
-            "reasoning_tokens", "latency_ms", "outcome", "error_class",
-            "consumer", "pr_number", "head_sha", "builder_round",
-            "route_name", "cost_usd", "had_gh_token"]
     row = (7, 1, 0, "routegate", "peak", 11, 4, 5, None, 812, "success", None,
            "reviews:zeus/987654321", 44, "ab" * 20, 1, "peak", 0.0042, True)
 
     class FakeCursor:
-        description = [(c,) for c in cols]
+        def __init__(self, sql: str) -> None:
+            # cols come from the SQL get_attempts ACTUALLY sends (Apollo r7):
+            # a reordered/dropped column must fail this test, not production
+            match = re.search(r"SELECT\s+(.*?)\s+FROM\s+neo_usage",
+                              sql, re.S | re.I)
+            assert match, f"unexpected get_attempts SQL: {sql!r}"
+            self.description = [(c.strip(),) for c in
+                                match.group(1).split(",") if c.strip()]
 
         def fetchall(self):
             return [row]
 
     class FakeConn:
         def execute(self, *args, **kwargs):
-            return FakeCursor()
+            return FakeCursor(args[0] if args else kwargs.get("query", ""))
 
         def __enter__(self):
             return self
@@ -2213,3 +2217,75 @@ def test_get_attempts_maps_columns_without_pg() -> None:
     assert attempt.cost_usd == 0.0042
     assert attempt.had_gh_token is True
     assert attempt.total_input() == 15
+
+
+def test_wire_consumer_parity_without_pg() -> None:
+    """[Apollo r7, MEDIUM] The core `getter(job_id) or consumer` branch of
+    `_wire_consumer` must run in the DEFAULT suite (the PG test alone was
+    the only exerciser), AND the install-qualified value the header carries
+    must land in the row — header == row, no database involved."""
+    from src.agent_claude import Route
+
+    class StoreWithJob(_FakeUsageStore):
+        def job_consumer(self, job_id: int) -> str:
+            return "reviews:zeus/777"
+
+    class StoreNoInstall(_FakeUsageStore):
+        def job_consumer(self, job_id: int) -> str:
+            return ""
+
+    agent = _make_agent()
+    assert agent._wire_consumer(StoreWithJob(), 1) == "reviews:zeus/777"
+    assert agent._wire_consumer(StoreNoInstall(), 1) == agent.consumer
+    assert agent._wire_consumer(None, 1) == agent.consumer
+    assert agent._wire_consumer(StoreWithJob(), None) == agent.consumer
+
+    # end to end on the gated path: header value == row value (fake store,
+    # no PG) — the install-qualified consumer reaches BOTH.
+    cfg = Config()
+    cfg.claude_bin = sys.executable
+    cfg.deepseek_base_url = BASE
+    cfg.deepseek_model = MODEL
+    cfg.deepseek_reasoning_effort = "max"
+    cfg.deepseek_max_tokens = 32000
+    cfg.routegate_anthropic_url = "http://127.0.0.1:8645"
+    cfg.routegate_model = "peak"
+
+    store = StoreWithJob()
+    captured: dict[str, str] = {}
+
+    def fake_run(cmd, **kw):
+        env = kw.get("env") or {}
+        captured.update({k: v for k, v in env.items() if "CONSUMER" in k})
+        return subprocess.CompletedProcess(
+            args=["claude"], returncode=0, stderr="",
+            stdout=json.dumps({"type": "result", "result": "VERDICT: ACCEPT",
+                               "is_error": False, "subtype": "success",
+                               "num_turns": 1,
+                               "usage": {"input_tokens": 1,
+                                         "output_tokens": 1}}),
+        )
+
+    with patch("subprocess.run", side_effect=fake_run):
+        agent.run_with_chain(_zeus_brief(), [(Route("routegate", "peak"), 1)],
+                             cfg, GH_TOKEN, usage_store=store, job_id=11)
+    row, = store.rows
+    assert row.consumer == "reviews:zeus/777"
+    assert captured["X_RHOBEAR_CONSUMER"] == "reviews:zeus/777"
+
+
+def test_query_or_fragment_gate_url_is_refused() -> None:
+    """[Apollo r7, MEDIUM] A gate URL carrying a query or fragment must be
+    REFUSED, never accepted and returned mangled by a position slice
+    (`.../v1/messages?x=1` → `http://127.0.0.1:8645/v1/`)."""
+    from src.agent_claude import _require_loopback_roulegate
+
+    for evil in ("http://127.0.0.1:8645/v1/messages?x=1",
+                 "http://127.0.0.1:8645#frag",
+                 "http://127.0.0.1:8645/v1/messages#frag"):
+        with pytest.raises(AgentError, match="loopback"):
+            _require_loopback_roulegate(evil)
+
+    # and the accepted endpoint form still normalises to the exact base
+    assert _require_loopback_roulegate(
+        "http://127.0.0.1:8645/v1/messages") == "http://127.0.0.1:8645"
