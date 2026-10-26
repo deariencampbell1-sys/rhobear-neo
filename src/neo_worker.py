@@ -528,7 +528,8 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict,
                      detail={"reason": "out of credits — owner must top up"})
         _gh(token, "pr", "comment", str(pr), "-R", repo,
             "--body", "Neo: this install is out of credits — top up to resume auto-fix/merge.")
-        jobs.park(job_id, reason="out of credits — owner must top up")
+        jobs.park(job_id, worker_token=wtoken,
+                  reason="out of credits — owner must top up")
         log.info("%s#%s: install out of credits — gated (parked)", repo, pr)
         return
     # P0 hotfix: nullable inheritance for auto-merge.
