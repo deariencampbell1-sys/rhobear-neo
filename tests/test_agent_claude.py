@@ -2276,3 +2276,94 @@ def test_query_or_fragment_gate_url_is_refused() -> None:
     # and the accepted endpoint form still normalises to the exact base
     assert _require_loopback_roulegate(
         "http://127.0.0.1:8645/v1/messages") == "http://127.0.0.1:8645"
+
+
+def test_missing_gh_token_is_error_at_the_call_site(caplog: Any) -> None:
+    """[Apollo r6, MEDIUM] A run with no GitHub identity must be visible in
+    the JOURNAL: an ERROR at the neo_worker call site that constructs the
+    agent (naming the job's run), not only from_config's once-per-process
+    line and `had_gh_token=False` on the metering rows.  The token-positive
+    control proves the line is emitted because the identity is missing, not
+    unconditionally."""
+    import contextlib
+    import logging as _logging
+
+    from src.jev_review import JevAssessment
+    from src.neo_worker import run_neo
+
+    class _State:
+        def already_acted(self, *a, **k):
+            return False
+
+        def builder_rounds(self, repo, pr):
+            return 0
+
+        def install(self, org, key):
+            return {}
+
+        def record(self, *a, **k):
+            pass
+
+        def record_escalating(self, *a, **k):
+            pass
+
+        def debit(self, *a, **k):
+            pass
+
+    class _Jobs:
+        def claim(self, *a, **k):
+            return True
+
+        def lease_renewal(self, *a, **k):
+            @contextlib.contextmanager
+            def _cm():
+                yield
+            return _cm()
+
+        def get(self, job_id):
+            return {"attempt": 1}
+
+        def resolve(self, *a, **k):
+            pass
+
+        def retry(self, *a, **k):
+            pass
+
+        def park(self, *a, **k):
+            pass
+
+        def create_builder(self, *a, **k):
+            pass
+
+        def create_wake(self, *a, **k):
+            raise AssertionError("wake carries job_id — create_wake unused")
+
+    def drive(token: str) -> list[str]:
+        cfg = Config()
+        cfg.deepseek_timeout = 60
+        wake = {"repo": "o/r", "sha": "c" * 40, "green": True,
+                "context": "rhobear-reviews", "pr_number": 5, "job_id": 42}
+        caplog.clear()
+        with caplog.at_level(_logging.ERROR, logger="rhobear_neo.worker"), \
+                patch("src.neo_worker.repo_token", return_value=token), \
+                patch("src.neo_worker.resolve_pr", return_value=5), \
+                patch("src.neo_worker._review_evidence",
+                      return_value={"ok": False, "reason": "no evidence"}), \
+                patch("src.neo_worker._jev_for_pr",
+                      return_value=JevAssessment(False, reason="no key")), \
+                patch("src.neo_worker._run_agent",
+                      return_value=({"input_tokens": 1, "output_tokens": 1},
+                                    "FIX-FORWARD", 0, None)):
+            run_neo(cfg, _State(), _Jobs(), wake, usage_store=None)
+        return [r.getMessage() for r in caplog.records
+                if r.name == "rhobear_neo.worker"
+                and r.levelno >= _logging.ERROR]
+
+    without = drive("")
+    assert any("gh_token" in msg for msg in without), (
+        "a run constructed without gh_token must log an ERROR at the caller"
+    )
+    with_token = drive("ghs_installation_token")
+    assert not any("gh_token" in msg for msg in with_token), (
+        "a run WITH identity must not emit the missing-identity ERROR"
+    )
