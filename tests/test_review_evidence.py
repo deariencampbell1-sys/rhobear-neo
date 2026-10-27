@@ -274,7 +274,7 @@ def test_trusted_reviewer_outside_org_counts():
             return 0, json.dumps({
                 "headRefOid": sha, "headRefName": "topic",
                 "reviews": [{"state": "APPROVED", "commit": {"oid": sha},
-                             "author": {"login": "rhobear-reviews[bot]"},
+                             "author": {"login": "rhobear-reviews[bot]", "type": "Bot"},
                              "submitted_at": "2026-10-26T11:52:00Z",
                              "body": "verdict: ACCEPT"}],
                 "statusCheckRollup": []})
