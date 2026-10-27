@@ -374,17 +374,14 @@ def test_lane_gate_fails_closed_with_a_lane_hold_when_the_evidence_read_breaks()
     state = FakeState()
     gh, calls = fake_gh([architect()])
     cfg = dataclasses.replace(Config(), lane_merge=True)
-    ev = evidence()
     with mock.patch.object(neo_worker, "_gh", gh), \
          mock.patch("src.merge_executor._gh", gh), \
-         mock.patch.object(neo_worker, "repo_token", return_value="tok"), \
-         mock.patch.object(neo_worker, "resolve_pr", return_value=51), \
+         mock.patch.object(neo_worker, "_enabled_reviewers", return_value=()), \
          mock.patch.object(neo_worker, "_review_evidence",
-                           side_effect=[ev, TypeError("got an unexpected keyword")]), \
+                           side_effect=TypeError("got an unexpected keyword")), \
          mock.patch.object(neo_worker.ClaudeAgent, "from_config") as agent:
-        neo_worker.run_neo(cfg, state, mock.MagicMock(),
-                           {"job_id": 1, "repo": REPO, "sha": HEAD, "green": True,
-                            "context": "rhobear-reviews"})
+        neo_worker.run_lane_gate(
+            "tok", cfg, state, REPO, 51, HEAD, "l3-kit")
     agent.assert_not_called()
     assert not any(c[:2] == ("api", "-X") and "PUT" in c for c in calls)
     assert state.rows[-1][3] == "lane_hold"

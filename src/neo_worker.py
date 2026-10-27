@@ -20,13 +20,13 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import secrets
 import subprocess
 from datetime import datetime, timezone
 
 from .config import Config, DEFAULT_OWNER_INSTALL_ID
 from .jobs import Jobs
+from .neo_builder import LANE_BRANCH, lane_of
 from .neo_state import NeoState, verdict_color
 from .agent_claude import ClaudeAgent, AgentError
 from .github_app import AppNotConfigured, GitHubAppError, NoInstallation, repo_token
@@ -276,16 +276,23 @@ def _reviews_with_bot_types(token: str, repo: str, pr: int, reviews: list) -> li
         login = str((r.get("author") or {}).get("login")
                     or r.get("author_login") or "").lower()
         author = dict(r.get("author") or {})
+        rest = by_node.get(str(r.get("id") or ""))
         exact_bot = types.get(f"{login}[bot]") if login and not login.endswith("[bot]") else None
-        if exact_bot == "Bot":
-            if types.get(login) == "User":
-                log.warning("%s#%s ambiguous reviewer login %s: exact [bot] identity wins",
-                            repo, pr, login)
+        ambiguous = exact_bot == "Bot" and types.get(login) == "User"
+        if ambiguous:
+            log.warning("%s#%s ambiguous reviewer login %s: node id decides; login fallback fails closed",
+                        repo, pr, login)
+        if rest is not None:
+            # Identity comes from the exact REST row, never a same-login account.
+            user = rest.get("user") or {}
+            author["type"] = "Bot" if str(user.get("type") or "") == "Bot" else "User"
+        elif ambiguous:
+            author["type"] = "User"
+        elif exact_bot == "Bot":
             author["type"] = "Bot"
         else:
             author["type"] = types.get(login, "User")
         r["author"] = author
-        rest = by_node.get(str(r.get("id") or ""))
         if rest is not None:
             if not r.get("html_url") and rest.get("html_url"):
                 r["html_url"] = rest["html_url"]
@@ -368,14 +375,14 @@ def _green_fields(cfg: Config, repo: str, sha: str, reviews: list, statuses: lis
                    if _review_oid(r) == sha and _review_author(r)
                    and tr.source_matches(src, _review_author(r))
                    and str((r.get("author") or {}).get("type") or "") == "Bot"), None)
-        ck = next((c for c in (check_runs or [])
-                   if tr.source_matches(src, str((c.get("app") or {}).get("slug") or ""))), None)
+        cks = [c for c in (check_runs or [])
+               if tr.source_matches(src, str((c.get("app") or {}).get("slug") or ""))]
         signals = []
         if st is not None:
             signals.append((str(st.get("context") or ""),
                             str(st.get("state") or "").lower(), "status",
                             st.get("target_url") or "", st.get("created_at") or ""))
-        if ck is not None:
+        for ck in cks:
             signals.append((str(ck.get("context") or ck.get("name") or ""),
                             str(ck.get("conclusion") or ck.get("state") or "").lower(),
                             "check", ck.get("html_url") or ck.get("details_url") or "",
@@ -497,7 +504,7 @@ def _review_evidence(token: str, cfg: Config, repo: str, pr: int, sha: str,
         check_runs: list = []
         per_page = 100
         page = 1
-        while page <= 10:
+        while True:
             url = (f"repos/{repo}/commits/{sha}/check-runs"
                    f"?per_page={per_page}&page={page}")
             rc, raw_checks = _gh(token, "api", url, timeout=30)
@@ -631,6 +638,7 @@ def merge_authority(install_auto_merge: bool, evidence: dict,
     # never be merged under the non-lane rule (which skips architect and drift).
     if "head_ref" in evidence and not evidence.get("head_ref"):
         return False, "PR head branch unavailable — cannot rule out a lane PR"
+    cfg = cfg if cfg is not None else Config()
     if lane_of(str(evidence.get("head_ref") or ""), cfg):
         return False, "lane PR head must use the lane merge gate"
     if evidence.get("head_sha") != evidence.get("decided_sha"):
@@ -663,23 +671,9 @@ def merge_authority(install_auto_merge: bool, evidence: dict,
 # per branch, the lane's briefed worker. Neo never runs its agent on one (no fix-forward, no builder
 # bounce) and merges only the exact head that Apollo passed AND the lane architect accepted with a
 # commit status "architect/<lane>" set from the owner's account. L0 ruling 2026-10-25, north-star #1.
-LANE_BRANCH = re.compile(r"^(l\d+[a-d]?(?:-[a-z0-9-]+)?)/", re.IGNORECASE)
+# LANE_BRANCH and lane_of are imported from neo_builder: one classifier for both paths.
 ARCHITECT_CONTEXT = "architect/"
 DRIFT_CONTEXT = "l0/drift"   # L0 sentinel, SPRINT.md section 9
-
-
-def lane_of(branch: str, cfg: Config | None = None) -> str:
-    """Return the lane, unless an operator explicitly excludes its name."""
-    m = LANE_BRANCH.match(branch or "")
-    if not m:
-        return ""
-    lane = m.group(1).lower()
-    if cfg is not None:
-        excluded = {str(x).strip().lower()
-                    for x in (getattr(cfg, "lane_exclude", ()) or ())}
-        if lane in excluded:
-            return ""
-    return lane
 
 
 def lane_merge_authority(lane_merge: bool, evidence: dict, lane: str,
@@ -724,21 +718,24 @@ def lane_merge_authority(lane_merge: bool, evidence: dict, lane: str,
 
 
 def run_lane_gate(token: str, cfg: Config, state: NeoState, repo: str, pr: int, sha: str,
-                  lane: str) -> None:
+                  lane: str, evidence: dict | None = None,
+                  enabled_sources: tuple[str, ...] | None = None) -> None:
     """Decide a lane PR without the agent: merge the exact head, or hold and say why."""
     if state.already_acted(repo, pr, sha, "merged"):
         log.info("%s#%s@%s already merged by Neo — skip", repo, pr, sha[:8])
         return
     org = repo.split("/", 1)[0]
-    try:
-        enabled_sources = _enabled_reviewers(cfg, state, repo)
-        evidence = _review_evidence(token, cfg, repo, pr, sha,
-                                    enabled_sources=enabled_sources)
-    except Exception as exc:  # noqa: BLE001 — edge 5: a broken read fails CLOSED
-        reason = f"lane gate: evidence read broke ({type(exc).__name__}) — fail closed"
-        state.record(repo, pr, sha, "lane_hold", verdict="HOLD",
-                     detail={"lane": lane, "reason": reason})
-        return
+    if evidence is None:
+        try:
+            if enabled_sources is None:
+                enabled_sources = _enabled_reviewers(cfg, state, repo)
+            evidence = _review_evidence(token, cfg, repo, pr, sha,
+                                        enabled_sources=enabled_sources)
+        except Exception as exc:  # noqa: BLE001 — edge 5: a broken read fails CLOSED
+            reason = f"lane gate: evidence read broke ({type(exc).__name__}) — fail closed"
+            state.record(repo, pr, sha, "lane_hold", verdict="HOLD",
+                         detail={"lane": lane, "reason": reason})
+            return
     statuses = evidence.get("statuses") or []
     fresh_reviews = evidence.get("reviews") or []
     # Defect 1: the gate's conditions dropped review_bound_ok — an ACCEPT on an
@@ -771,6 +768,10 @@ def run_lane_gate(token: str, cfg: Config, state: NeoState, repo: str, pr: int, 
             reason = "merge executor returned no merge confirmation"
         except _merge_executor.MergeError as exc:
             reason = str(exc)
+        except Exception as exc:  # noqa: BLE001 — unexpected failures must be visible holds
+            log.warning("%s#%s@%s lane merge executor failed (%s)",
+                        repo, pr, sha[:8], type(exc).__name__)
+            reason = f"lane gate: merge executor failed ({type(exc).__name__})"
     state.record(repo, pr, sha, "lane_hold", verdict="HOLD", detail={"lane": lane, "reason": reason})
 
 
@@ -1032,8 +1033,9 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict,
     install_auto_merge = resolve_auto_merge(inst.get("auto_merge"), cfg)
 
     # --- exact-SHA evidence (Phase A) --------------------------------------
+    enabled_sources = _enabled_reviewers(cfg, state, repo)
     evidence = _review_evidence(token, cfg, repo, pr, sha,
-                                enabled_sources=_enabled_reviewers(cfg, state, repo))
+                                enabled_sources=enabled_sources)
     if evidence.get("ok") and evidence.get("head_sha") and evidence["head_sha"] != sha:
         state.record(repo, pr, sha, "stale_head", verdict="STALE",
                      detail={"context": wake.get("context"),
@@ -1060,7 +1062,8 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict,
         log.warning("%s#%s@%s %s — skip (fail closed)", repo, pr, sha[:8], exc)
         return
     if lane_pr is not None:
-        run_lane_gate(token, cfg, state, repo, pr, sha, lane_pr)
+        run_lane_gate(token, cfg, state, repo, pr, sha, lane_pr,
+                      evidence=evidence, enabled_sources=enabled_sources)
         return
     # Same case-insensitive normaliser as the webhook dispatch (defect 4).
     from .webhook_server import is_architect_context, is_drift_context

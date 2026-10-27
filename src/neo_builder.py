@@ -645,20 +645,28 @@ No markdown fences, nothing after the VERDICT line.
 
 # North Star lane branches belong to their lane's worker (one writer per branch): Builder never pushes to one.
 # Conservative on purpose: the full `l8d-engine-mcps/` form and the short `l8b/` form both count.
-LANE_HEAD = re.compile(r"^l\d+[a-d]?(-[a-z0-9-]+)?/", re.IGNORECASE)
+# This is the single classifier shared with neo_worker; the two paths must never drift.
+LANE_BRANCH = re.compile(r"^(l\d+[a-d]?(?:-[a-z0-9-]+)?)/", re.IGNORECASE)
+LANE_HEAD = LANE_BRANCH  # compatibility alias for existing imports
+
+
+def lane_of(branch: str, cfg: Config | None = None) -> str:
+    """Return the lane, unless an operator explicitly excludes its name."""
+    m = LANE_BRANCH.match(branch or "")
+    if not m:
+        return ""
+    lane = m.group(1).lower()
+    if cfg is not None:
+        excluded = {str(x).strip().lower()
+                    for x in (getattr(cfg, "lane_exclude", ()) or ())}
+        if lane in excluded:
+            return ""
+    return lane
 
 
 def is_lane_branch(branch: str, cfg: Config | None = None) -> bool:
     """True for a lane branch, unless its lane name is operator-excluded."""
-    m = LANE_HEAD.match(branch or "")
-    if not m:
-        return False
-    if cfg is not None:
-        excluded = {str(x).strip().lower()
-                    for x in (getattr(cfg, "lane_exclude", ()) or ())}
-        if branch.split("/", 1)[0].lower() in excluded:
-            return False
-    return True
+    return bool(lane_of(branch, cfg))
 
 
 def dispatch_one(cfg: Config, jobs: Jobs, row: dict) -> None:

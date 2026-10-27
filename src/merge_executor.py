@@ -207,7 +207,10 @@ def merge(
         )
     if state != "open":
         raise MergeDenied(f"PR is not open (state={state})")
-    if str(data.get("mergeable") or "") != "MERGEABLE":
+    mergeable = str(data.get("mergeable") or "")
+    # UNKNOWN is GitHub recomputing mergeability, not a permanent refusal.
+    # Continue through the exact-head REST merge; its response is authoritative.
+    if mergeable not in ("MERGEABLE", "UNKNOWN"):
         raise MergeDenied(f"PR is not mergeable (mergeable={data.get('mergeable')})")
     if data.get("isCrossRepository") is not False:
         raise MergeDenied("PR head is a fork or its repository is unknown")
