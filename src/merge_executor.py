@@ -47,6 +47,73 @@ class MergeFailed(MergeError):
     """The merge API call failed for another reason."""
 
 
+class EvidenceReadError(MergeError):
+    """A paginated evidence read failed or could not prove completeness."""
+
+
+def read_evidence_pages(gh, token: str, endpoint: str, item_key: str | None, *,
+                        max_pages: int = 50) -> list[dict]:
+    """Read every item from a GitHub REST list, failing closed on gaps.
+
+    ``total_count`` is authoritative when present: only an exact item count
+    completes the read.  Without it, GitHub's short-page convention terminates
+    the list.  A full final page at ``max_pages`` is never treated as complete.
+    """
+    items: list[dict] = []
+    for page in range(1, max_pages + 1):
+        separator = "&" if "?" in endpoint else "?"
+        url = f"{endpoint}{separator}per_page=100&page={page}"
+        try:
+            rc, raw = gh(token, "api", url, timeout=30)
+        except Exception as exc:  # noqa: BLE001 — normalize transport failures
+            raise EvidenceReadError(
+                f"{endpoint} page {page}: exit/read failure ({type(exc).__name__})") from exc
+        if rc != 0:
+            raise EvidenceReadError(
+                f"{endpoint} page {page}: exit={rc}: {str(raw)[:200]}")
+        try:
+            parsed = json.loads(raw)
+            if item_key is None:
+                batch = parsed
+                # Compatibility with the former `gh --paginate --slurp` shape.
+                if batch and all(isinstance(entry, list) for entry in batch):
+                    batch = [entry for page_items in batch for entry in page_items]
+                total = None
+            else:
+                if not isinstance(parsed, dict):
+                    raise TypeError("response must be an object")
+                batch = parsed.get(item_key)
+                total = parsed.get("total_count")
+            if not isinstance(batch, list):
+                raise TypeError(f"{item_key or 'response'} must be a list")
+            if not all(isinstance(item, dict) for item in batch):
+                raise TypeError("every evidence item must be an object")
+            if total is not None and (
+                    isinstance(total, bool) or not isinstance(total, int) or total < 0):
+                raise TypeError("total_count must be a nonnegative integer")
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise EvidenceReadError(
+                f"{endpoint} page {page}: malformed response ({exc})") from exc
+
+        items.extend(batch)
+        if total is not None:
+            if len(items) > total:
+                raise EvidenceReadError(
+                    f"{endpoint} page {page}: incomplete read (over total_count={total})")
+            if len(items) == total:
+                return items
+            if not batch or len(batch) < 100:
+                raise EvidenceReadError(
+                    f"{endpoint} page {page}: incomplete read before total_count={total}")
+        elif len(batch) < 100:
+            return items
+
+        if page == max_pages:
+            raise EvidenceReadError(
+                f"{endpoint} page {page}: capped before completion was proven")
+    raise EvidenceReadError(f"{endpoint}: capped with an invalid page limit")
+
+
 def _gh(token: str, *args: str, timeout: int = 30) -> tuple[int, str]:
     """Run `gh` as the repo's installation token (never a personal token)."""
     import os
@@ -72,6 +139,8 @@ def two_green_gate(evidence: dict) -> tuple[bool, str]:
     bound to the head SHA, so any new push resets all three.
     """
     problems: list[str] = []
+    if evidence.get("trusted_reviewers_unreadable"):
+        problems.append("trusted reviewers unreadable — cannot prove no trusted reviewer is red")
     if not evidence.get("green1_ok"):
         problems.append("green 1 missing: Apollo's review is not ACCEPT on this "
                         "exact head SHA (%s)" % (evidence.get("green1_reason")
@@ -328,12 +397,9 @@ def _delete_head_branch(token: str, repo: str, pr: int, head_ref: str, cross_rep
             return
         if head_ref == default.strip():
             return
-        rc, others = _gh(token, "pr", "list", "-R", repo, "--head", head_ref, "--state", "open",
-                         "--limit", "1000", "--json", "number", "--jq", ".[].number", timeout=30)
-        if rc != 0:
-            log.warning("head branch %s for %s#%s kept: open-PR check failed", head_ref, repo, pr)
-            return
-        if any(line.strip() and line.strip() != str(pr) for line in others.splitlines()):
+        others = read_evidence_pages(
+            _gh, token, f"repos/{repo}/pulls?head={head_ref}&state=open", None)
+        if any(row.get("number") != pr for row in others):
             log.info("head branch %s for %s#%s kept: another open PR uses it", head_ref, repo, pr)
             return
         rc_del, out_del = _gh(token, "api", "-X", "DELETE",

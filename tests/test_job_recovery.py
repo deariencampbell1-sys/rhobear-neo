@@ -769,8 +769,14 @@ class TestDefect5RollupGreen:
                        "output": {"summary": '{"unresolved_critical_high": 0, '
                                              '"coverage": "complete"}'}}
                 return 0, _json.dumps({"check_runs": [run], "total_count": 1})
+            if "/reviews" in args[1]:
+                return 0, "[]"
+            # W1-07-r10: the rollup is read from the complete REST statuses,
+            # so the scripted rollup entries are served there.
             return 0, _json.dumps({"statuses": [
-                {"context": "rhobear-reviews", "state": "success"}]})
+                {"context": "rhobear-reviews", "state": "success"},
+                *({"context": c["context"], "state": c["conclusion"].lower()}
+                  for c in rollup)]})
 
         with patch("src.neo_worker._gh", side_effect=fake_gh):
             return _review_evidence("tok", cfg, "o/r", 5, sha)
@@ -785,9 +791,10 @@ class TestDefect5RollupGreen:
         ev = self._evidence([{"context": "ci/test", "conclusion": "FAILURE"}])
         assert ev["rollup_green"] is False
         assert ev["required_checks_pass"] is False
+        # only the trusted run and status: every REST check is green
         ev = self._evidence([])
-        assert ev["rollup_green"] is None
-        assert ev["required_checks_pass"] is None
+        assert ev["rollup_green"] is True
+        assert ev["required_checks_pass"] is True
 
 
 # ---------------------------------------------------------------------------

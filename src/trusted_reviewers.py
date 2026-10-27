@@ -89,16 +89,17 @@ def ensure_schema(dsn: str, *, owner_install_id: str | None = DEFAULT_OWNER_INST
     Idempotent and self-healing; memoised per process so the merge-authority
     hot path runs this DDL once, not on every wake."""
     key = (str(dsn), owner_install_id)
+    # Hold the lock through first use: the memo check, connection, DDL/seed,
+    # commit and memo insertion are one atomic process-local operation.
     with _ensured_lock:
         if key in _ensured:
             return
-    with _connect(dsn) as conn:
-        with conn.cursor() as cur:
-            cur.execute(CREATE_TABLE_SQL)
-            if owner_install_id is not None:
-                cur.execute(SEED_SQL, (owner_install_id, SEED_SOURCE))
-        conn.commit()
-    with _ensured_lock:
+        with _connect(dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute(CREATE_TABLE_SQL)
+                if owner_install_id is not None:
+                    cur.execute(SEED_SQL, (owner_install_id, SEED_SOURCE))
+            conn.commit()
         _ensured.add(key)
 
 
@@ -147,7 +148,7 @@ def enabled_sources(dsn: str, install_id: str, repo: str) -> tuple[str, ...]:
         if not src:
             continue
         scope = str(r.get("repo") or "*")
-        if scope != "*" and scope != repo:
+        if scope != "*" and scope.casefold() != str(repo).casefold():
             continue                          # another repo's row says nothing here
         on = bool(r.get("enabled"))
         if scope == "*":

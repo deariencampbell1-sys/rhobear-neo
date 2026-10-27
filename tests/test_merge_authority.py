@@ -72,6 +72,10 @@ def _branch_lookups(gh_args, default="main", other_prs=""):
         return 0, default
     if gh_args[:2] == ("pr", "list"):
         return 0, other_prs
+    if gh_args[:1] == ("api",) and len(gh_args) > 1 and \
+            gh_args[1].startswith("repos/acme/a/pulls?head="):
+        numbers = [int(line) for line in other_prs.splitlines() if line.strip()]
+        return 0, json.dumps([{"number": number} for number in numbers])
     return None
 
 
@@ -658,21 +662,19 @@ class TestMergeBranchDeletion:
         assert result["merged"] is True
         assert deletes == []
 
-    def test_open_pr_check_is_not_capped_at_30(self):
-        """gh pr list returns 30 rows by default; a shared branch's older PR
-        beyond that cap must still be seen, so the check asks for more."""
+    def test_open_pr_check_uses_complete_pagination(self):
+        """The shared-branch safety read uses the same 100-row pager as evidence."""
         seen: list = []
         orig = _branch_lookups
 
         def spy(args, *a, **k):
-            if args[:2] == ("pr", "list"):
+            if args[:1] == ("api",) and len(args) > 1 and "/pulls?head=" in args[1]:
                 seen.append(args)
             return orig(args, *a, **k)
 
         with patch(f"{__name__}._branch_lookups", side_effect=spy):
             self._run()
-        assert seen and "--limit" in seen[0], seen
-        assert int(seen[0][seen[0].index("--limit") + 1]) >= 1000, seen
+        assert seen and "per_page=100&page=1" in seen[0][1], seen
 
     def test_own_branch_is_deleted_when_only_this_pr_uses_it(self):
         result, deletes = self._run(other_prs="1")
@@ -2105,7 +2107,9 @@ def test_newest_status_per_trusted_context_decides():
                                        "createdAt": "2026-10-26T11:55:00Z"}]})
         if args[0] == "api" and "/check-runs" in args[1]:
             return 0, json.dumps({"total_count": 0, "check_runs": []})
-        if args[0] == "api" and args[1].endswith("/status"):
+        if args[0] == "api" and "/pulls/5/reviews" in args[1]:
+            return 0, "[]"
+        if args[0] == "api" and "/status" in args[1]:
             return 0, json.dumps({"total_count": len(statuses), "statuses": statuses})
         raise AssertionError(f"unexpected gh call {args}")
 
@@ -2229,7 +2233,9 @@ def test_created_at_instants_are_compared_as_instants_not_strings():
                                       "reviews": [], "statusCheckRollup": []})
             if args[0] == "api" and "/check-runs" in args[1]:
                 return 0, json.dumps({"total_count": 0, "check_runs": []})
-            if args[0] == "api" and args[1].endswith("/status"):
+            if args[0] == "api" and "/pulls/5/reviews" in args[1]:
+                return 0, "[]"
+            if args[0] == "api" and "/status" in args[1]:
                 return 0, json.dumps({"total_count": len(statuses),
                                       "statuses": statuses})
             raise AssertionError(f"unexpected gh call {args}")

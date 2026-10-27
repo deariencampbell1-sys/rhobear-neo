@@ -211,7 +211,7 @@ def test_lane_gate_reads_evidence_through_the_real_collector():
                             '{"unresolved_critical_high": 0, "coverage": "complete"}'}}]})
         if args[0] == "api" and args[1].endswith("/statuses?per_page=100"):
             return 0, json.dumps(statuses)
-        if args[0] == "api" and args[1].endswith("/status"):
+        if args[0] == "api" and args[1].split("?")[0].endswith("/status"):
             return 0, json.dumps({"total_count": len(statuses), "statuses": statuses})
         if args[:2] == ("api", "-X") and "PUT" in args:
             return 0, json.dumps({"merged": True, "sha": HEAD})

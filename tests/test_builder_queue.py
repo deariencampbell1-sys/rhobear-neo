@@ -37,7 +37,8 @@ def test_dispatch_one_skips_a_lane_branch_and_marks_the_row_first():
     args, kw = jobs.resolve.call_args
     assert args[:2] == (7, "no_change")
     assert kw["worker_token"] == "w1"
-    assert kw["payload"] == {"skipped_lane": "l8b/mask-fix", "brief_dispatched": True}
+    assert kw["payload"] == {"skipped_lane": "l8b/mask-fix", "lane_skip": True,
+                             "brief_dispatched": False}
 
 
 def test_dispatch_one_still_takes_an_ordinary_branch():

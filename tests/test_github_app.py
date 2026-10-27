@@ -668,11 +668,13 @@ class TestWorkerWiring:
                     "output": {"summary": '{"unresolved_critical_high": 0, "coverage": "complete"}'},
                 }]}
                 return 0, json.dumps(data)
-            if args[:3] == ("api", f"repos/acme/a/commits/{SHA1}/status",):
+            if args[0] == "api" and args[1].split("?")[0] == f"repos/acme/a/commits/{SHA1}/status":
                 data = {"state": "success", "statuses": [
                     {"context": "rhobear-reviews", "state": "success"},
                 ]}
                 return 0, json.dumps(data)
+            if args[0] == "api" and args[1].split("?")[0] == "repos/acme/a/pulls/5/reviews":
+                return 0, "[]"
             raise AssertionError(f"unexpected _gh call: {args}")
 
         with patch("src.neo_worker._gh", side_effect=fake_gh):
@@ -686,9 +688,9 @@ class TestWorkerWiring:
         assert ev["coverage_complete"] is True
         assert ev["review_bound_ok"] is True
         assert ev["trusted_green"] is True
-        # Empty statusCheckRollup -> rollup_green is None (no data),
-        # which is correct: there is no rollup to judge.
-        assert ev["rollup_green"] is None
+        # W1-07-r10: the rollup comes from the complete REST check-runs and
+        # statuses (GraphQL statusCheckRollup is ignored), all success here.
+        assert ev["rollup_green"] is True
         assert ev["failing_checks"] == 0
 
     def test_review_evidence_pages_past_first_100_check_runs(self, rsa_key):
@@ -730,9 +732,11 @@ class TestWorkerWiring:
                                '{"unresolved_critical_high": 0, "coverage": "complete"}'},
                 })
                 return 0, json.dumps({"total_count": 150, "check_runs": runs})
-            if (args[0] == "api" and args[1].endswith("/status")):
+            if (args[0] == "api" and args[1].split("?")[0].endswith("/status")):
                 return 0, json.dumps({"state": "success", "statuses": [
                     {"context": "rhobear-reviews", "state": "success"}]})
+            if args[0] == "api" and args[1].split("?")[0] == "repos/acme/a/pulls/5/reviews":
+                return 0, "[]"
             raise AssertionError(f"unexpected _gh call: {args}")
 
         with patch("src.neo_worker._gh", side_effect=fake_gh):
@@ -758,9 +762,11 @@ class TestWorkerWiring:
                     and args[1].startswith(f"repos/acme/a/commits/{SHA1}/check-runs")):
                 data = {"total_count": 0, "check_runs": []}
                 return 0, json.dumps(data)
-            if args[:3] == ("api", f"repos/acme/a/commits/{SHA1}/status",):
+            if args[0] == "api" and args[1].split("?")[0] == f"repos/acme/a/commits/{SHA1}/status":
                 data = {"state": "success", "statuses": []}
                 return 0, json.dumps(data)
+            if args[0] == "api" and args[1].split("?")[0] == "repos/acme/a/pulls/5/reviews":
+                return 0, "[]"
             raise AssertionError(f"unexpected _gh call: {args}")
 
         with patch("src.neo_worker._gh", side_effect=fake_gh):

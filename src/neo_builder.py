@@ -669,6 +669,11 @@ def is_lane_branch(branch: str, cfg: Config | None = None) -> bool:
     return bool(lane_of(branch, cfg))
 
 
+def lane_skip_payload(head_ref: str) -> dict:
+    """One terminal receipt for a lane row skipped without dispatching a brief."""
+    return {"skipped_lane": head_ref, "lane_skip": True, "brief_dispatched": False}
+
+
 def dispatch_one(cfg: Config, jobs: Jobs, row: dict) -> None:
     """Dispatch one builder round. Uses Jobs for atomic claim and lifecycle.
 
@@ -745,7 +750,7 @@ def dispatch_one(cfg: Config, jobs: Jobs, row: dict) -> None:
     if is_lane_branch(head_ref, cfg):
         log.info("skip (lane branch %s, its lane's worker fixes it): %s#%s", head_ref, repo, pr)
         jobs.resolve(row["id"], "no_change", worker_token=wtoken,
-                     payload={"skipped_lane": head_ref, "brief_dispatched": True})
+                     payload=lane_skip_payload(head_ref))
         return
     if state.upper() == "CLOSED" or state.upper() == "MERGED":
         log.info("skip (closed/merged): %s#%s", repo, pr)
@@ -1093,6 +1098,13 @@ def main() -> int:
             # GLM 8: never resolve transient failure as terminal 'failed').
             parsed = parse_pr_state(pr_state(token, repo, pr))
             state = parsed[0] if parsed else ""
+            head_ref = parsed[1] if parsed else ""
+            if is_lane_branch(head_ref, cfg):
+                jobs.resolve(row["id"], "no_change",
+                             worker_token=row.get("worker_token"),
+                             payload=lane_skip_payload(head_ref))
+                log.info("skip lane branch %s for %s#%s before pool submit", head_ref, repo, pr)
+                continue
             if state.upper() in ("CLOSED", "MERGED"):
                 jobs.resolve(row["id"], "no_change",
                              worker_token=row.get("worker_token"),

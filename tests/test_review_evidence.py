@@ -283,7 +283,7 @@ def test_trusted_reviewer_outside_org_counts():
                 "statusCheckRollup": []})
         if args[0] == "api" and "/check-runs" in args[1]:
             return 0, json.dumps({"total_count": 0, "check_runs": []})
-        if args[0] == "api" and args[1].endswith("/status"):
+        if args[0] == "api" and args[1].split("?")[0].endswith("/status"):
             return 0, json.dumps({"total_count": len(statuses), "statuses": statuses})
         if args[0] == "api" and any("/pulls/5/reviews" in a for a in args):
             return 0, json.dumps([[{"user": {"login": "rhobear-reviews[bot]", "type": "Bot"}}]])
@@ -336,7 +336,7 @@ def _ev_fake_gh(pr_view_reviews, rest_rows, rest_rc=0):
                                   "reviews": pr_view_reviews, "statusCheckRollup": []})
         if args[0] == "api" and "/check-runs" in args[1]:
             return 0, json.dumps({"total_count": 0, "check_runs": []})
-        if args[0] == "api" and args[1].endswith("/status"):
+        if args[0] == "api" and args[1].split("?")[0].endswith("/status"):
             return 0, json.dumps({"total_count": 0, "statuses": []})
         if args[0] == "api" and any("/pulls/5/reviews" in a for a in args):
             if rest_rc != 0:
@@ -363,15 +363,17 @@ def test_a_failed_rest_reviews_read_fails_green_one_closed():
     from src.jev_review import JevAssessment
     with mock.patch.object(neo_worker, "_gh", _ev_fake_gh([_captured_accept()], [CAPTURED_REST_REVIEW_ROW], rest_rc=1)):
         ev = neo_worker._review_evidence("tok", _cfg(), "acme/a", 5, SHA1)
-    assert ev["reviews"][0]["author"]["type"] == "User"
-    assert ev["green1_ok"] is False
+    # W1-07-r10: an unreadable REST reviews read now fails the whole evidence
+    # closed (stronger than the old per-review User downgrade).
+    assert ev["ok"] is False
+    assert "pulls/5/reviews" in ev["reason"]
     bundle = {**ev, "trusted_producer_ok": True, "review_sha_match": True,
               "required_checks_pass": True, "unresolved_critical_high": 0,
               "coverage_complete": True, "auto_merge": True,
               "review_bound_ok": True, "trusted_green": True,
               "trusted_states": ["success"], "failing_checks": 0}
     ok, reason = neo_worker.merge_authority(True, bundle, JevAssessment(False, reason="no key"))
-    assert ok is False and "green 1" in reason, reason
+    assert ok is False and "review evidence unavailable" in reason, reason
 
 def test_a_user_account_reviewing_as_apollo_is_not_green_one():
     from src import neo_worker
@@ -443,7 +445,7 @@ def test_check_run_green_comes_from_unfiltered_check_runs_api():
             })
         if args[0] == "api" and "/check-runs" in args[1]:
             return 0, json.dumps({"total_count": 1, "check_runs": [check]})
-        if args[0] == "api" and args[1].endswith("/status"):
+        if args[0] == "api" and args[1].split("?")[0].endswith("/status"):
             return 0, json.dumps({"total_count": 0, "statuses": []})
         if args[0] == "api" and any("/pulls/5/reviews" in a for a in args):
             return 0, json.dumps([[CAPTURED_REST_REVIEW_ROW]])
