@@ -353,3 +353,41 @@ def test_one_read_connection_and_no_repeat_ddl_per_wake(monkeypatch):
         assert conn.connects == 3
         creates = [sql for sql, _ in conn.cur.calls if "CREATE TABLE" in sql.upper()]
         assert len(creates) == 1
+
+
+def test_ensure_schema_first_use_is_atomic():
+    """Concurrent first callers cannot race the memo check into duplicate DDL."""
+    import threading
+    import time
+    from src import trusted_reviewers as tr
+    with recording_db() as conn:
+        def slow_connect(dsn):
+            conn.connects += 1
+            time.sleep(0.05)
+            return conn
+        tr._connect = slow_connect
+        errors = []
+        def ensure():
+            try:
+                tr.ensure_schema("dsn")
+            except Exception as exc:
+                errors.append(exc)
+        threads = [threading.Thread(target=ensure) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=2)
+        assert not errors, errors
+        assert all(not thread.is_alive() for thread in threads)
+        creates = [sql for sql, _ in conn.cur.calls if "CREATE TABLE" in sql.upper()]
+        assert len(creates) == 1, conn.cur.calls
+
+
+def test_repo_scope_is_case_insensitive():
+    from src import trusted_reviewers as tr
+    rows = [
+        (OWNER, "*", "CodeAnt", True, ""),
+        (OWNER, "DearienCampbell1-SYS/Rhobear-Neo", "CodeAnt", False, ""),
+    ]
+    with recording_db(rows=rows):
+        assert tr.enabled_sources("dsn", OWNER, "deariencampbell1-sys/rhobear-neo") == ()

@@ -2411,3 +2411,174 @@ def test_merge_authority_without_cfg_honours_lane_exclusion(monkeypatch):
     ok, reason = neo_worker.merge_authority(
         True, ev, JevAssessment(False, reason="no key"))
     assert ok is True, reason
+
+
+@pytest.mark.parametrize("surface", ("check-runs", "combined-status", "reviews"))
+def test_every_paginated_evidence_read_sees_page_two_red(surface):
+    """A trusted red item beyond page one must refuse an otherwise green head."""
+    from src import neo_worker
+
+    cfg = Config()
+    cfg.trusted_reviewer_app_id = TRUSTED_APP
+    cfg.trusted_review_contexts = ("rhobear-reviews",)
+    cfg.auto_merge_default = True
+
+    apollo_graphql = _review("APPROVED")
+    apollo_graphql["id"] = "PRR_apollo"
+    apollo_rest = {
+        "node_id": "PRR_apollo", "state": "APPROVED", "commit_id": SHA1,
+        "body": "verdict: ACCEPT", "submitted_at": "2026-10-26T11:52:00Z",
+        "html_url": "https://github.com/acme/a/pull/5#pullrequestreview-apollo",
+        "user": {"login": "rhobear-reviews[bot]", "type": "Bot", "node_id": "U_apollo"},
+    }
+
+    check_page1 = [_check_run(SHA1)] + [
+        {"name": f"other-{i}", "head_sha": SHA1, "status": "completed",
+         "conclusion": "success", "app": {"id": UNTRUSTED_APP},
+         "output": {"summary": "{}"}}
+        for i in range(99)
+    ]
+    status_page1 = [
+        _status("rhobear-reviews"), _status("architect/l1-reviews"),
+        *[_status(f"ci/{i}", login=f"ci-{i}[bot]") for i in range(98)],
+    ]
+    review_page1 = [apollo_rest] + [
+        {"node_id": f"PRR_other_{i}", "state": "COMMENTED", "commit_id": SHA1,
+         "user": {"login": f"other-{i}", "type": "User", "node_id": f"U_other_{i}"}}
+        for i in range(99)
+    ]
+    red_check = {"name": "CodeAnt Security", "head_sha": SHA1, "status": "completed",
+                 "conclusion": "failure", "app": {"id": 151821869, "slug": "codeant-ai"}}
+    red_status = _status("security/deep-scan", "failure", login="CodeAnt[bot]")
+    red_status["creator"]["node_id"] = "U_codeant"
+    red_review = {"node_id": "PRR_codeant_red", "state": "CHANGES_REQUESTED",
+                  "commit_id": SHA1, "body": "security blocker",
+                  "submitted_at": "2026-10-26T12:00:00Z",
+                  "user": {"login": "CodeAnt[bot]", "type": "Bot", "node_id": "U_codeant"}}
+
+    pages = {"check-runs": [], "combined-status": [], "reviews": []}
+
+    def fake_gh(token, *args, timeout=30):
+        if args[:2] == ("pr", "view"):
+            return 0, json.dumps({"headRefOid": SHA1, "headRefName": "topic",
+                                  "reviews": [apollo_graphql], "statusCheckRollup": []})
+        if args[0] == "api" and any("/check-runs" in a for a in args):
+            url = next(a for a in args if "/check-runs" in a)
+            page = int(url.split("page=")[-1]) if "page=" in url else 1
+            pages["check-runs"].append(page)
+            batch = check_page1 if page == 1 else [red_check] if surface == "check-runs" else []
+            return 0, json.dumps({"total_count": len(check_page1) + (surface == "check-runs"),
+                                  "check_runs": batch})
+        if args[0] == "api" and any("/pulls/5/reviews" in a for a in args):
+            if "--paginate" in args:
+                return 0, json.dumps([review_page1] + ([[red_review]] if surface == "reviews" else []))
+            url = next(a for a in args if "/pulls/5/reviews" in a)
+            page = int(url.split("page=")[-1]) if "page=" in url else 1
+            pages["reviews"].append(page)
+            return 0, json.dumps(review_page1 if page == 1 else [red_review] if surface == "reviews" else [])
+        if args[0] == "api" and any(f"/commits/{SHA1}/status" in a for a in args):
+            url = next(a for a in args if f"/commits/{SHA1}/status" in a)
+            page = int(url.split("page=")[-1]) if "page=" in url else 1
+            pages["combined-status"].append(page)
+            batch = status_page1 if page == 1 else [red_status] if surface == "combined-status" else []
+            return 0, json.dumps({"state": "success", "total_count": len(status_page1) + (surface == "combined-status"),
+                                  "statuses": batch})
+        raise AssertionError(f"unexpected gh call {args}")
+
+    with patch.object(neo_worker, "_gh", side_effect=fake_gh):
+        ev = neo_worker._review_evidence("tok", cfg, W1_LANE_REPO, 5, SHA1,
+                                         enabled_sources=("CodeAnt",))
+    assert ev["ok"] is True, ev
+    assert ev["green1_ok"] is True and ev["green2_ok"] is True, ev
+    assert pages[surface] == [1, 2], pages
+    ok, reason = _authority(_bundle(ev))
+    assert ok is False and "CodeAnt" in reason, (surface, reason, ev)
+
+
+@pytest.mark.parametrize(("mode", "message"), (
+    ("error", "exit"), ("incomplete", "incomplete"), ("capped", "capped"),
+))
+def test_shared_evidence_reader_fails_closed(mode, message):
+    from src.merge_executor import EvidenceReadError, read_evidence_pages
+
+    def fake_gh(token, *args, timeout=30):
+        url = args[1]
+        page = int(url.split("page=")[-1])
+        if mode == "error" and page == 2:
+            return 1, "gh: HTTP 503"
+        if mode == "incomplete" and page == 2:
+            return 0, json.dumps({"total_count": 150, "check_runs": []})
+        total = 300 if mode == "capped" else 150
+        return 0, json.dumps({"total_count": total,
+                              "check_runs": [_check_run(SHA1) for _ in range(100)]})
+
+    with pytest.raises(EvidenceReadError, match=message):
+        read_evidence_pages(fake_gh, "tok", "repos/acme/a/commits/x/check-runs",
+                            "check_runs", max_pages=2)
+
+
+def test_trusted_status_uses_creator_node_id_not_context():
+    trusted_review = _review("APPROVED", author="CodeAnt[bot]")
+    trusted_review["author"]["node_id"] = "U_codeant"
+    red = _status("security/deep-scan", "failure", login="CodeAnt[bot]")
+    red["creator"]["node_id"] = "U_codeant"
+    foreign = _status("CodeAnt", "success", login="CodeAnt[bot]")
+    foreign["creator"]["node_id"] = "U_mallory"
+    greens = _greens(repo=W1_LANE_REPO, enabled=("CodeAnt",),
+                     reviews=[_review("APPROVED"), trusted_review],
+                     statuses=[_status("architect/l1-reviews"), red, foreign])
+    assert greens["green2_ok"] is True and greens["green2_kind"] == "architect"
+    assert len(greens["trusted_seen"]) == 1, greens
+    assert any("CodeAnt" in red for red in greens["trusted_red"]), greens
+    ok, reason = _authority(_bundle(greens))
+    assert ok is False and "CodeAnt" in reason, reason
+
+
+def test_unreadable_reviewers_refuse_two_green_gate():
+    from src import merge_executor
+    greens = _greens(repo=W1_LANE_REPO, reviews=[_review("APPROVED")],
+                     statuses=[_status("architect/l1-reviews")])
+    ev = _bundle(greens, trusted_reviewers_unreadable=True)
+    expected = "trusted reviewers unreadable — cannot prove no trusted reviewer is red"
+    ok, reason = merge_executor.two_green_gate(ev)
+    assert ok is False and expected in reason, reason
+    ok, reason = merge_executor.pre_merge_belts(ev)
+    assert ok is False and expected in reason, reason
+
+
+@pytest.mark.parametrize("comment_failure", ("raise", "rc1"))
+def test_post_merge_comment_failures_do_not_undo_merge(comment_failure, caplog):
+    greens = _greens(enabled=("CodeAnt",),
+                     statuses=[_status("CodeAnt"), _status("rhobear-reviews")],
+                     reviews=[_review("APPROVED")])
+    calls = []
+    base = _refusal_pr_view(calls)
+
+    def fake_gh(token, *args, timeout=30):
+        if args[:2] == ("pr", "comment"):
+            if comment_failure == "raise":
+                raise subprocess.TimeoutExpired(cmd="gh", timeout=30)
+            return 1, "comment refused"
+        return base(token, *args, timeout=timeout)
+
+    with caplog.at_level(logging.WARNING, logger="rhobear_neo.merge"):
+        with patch("src.merge_executor._gh", side_effect=fake_gh):
+            result = merge("o/r", 5, SHA1, _bundle(greens), "tok")
+    assert result["merged"] is True
+    if comment_failure == "rc1":
+        assert "comment refused" in caplog.text
+
+
+def test_pre_merge_belts_refuse_false_trusted_producer():
+    from src import merge_executor
+    greens = _greens(enabled=("CodeAnt",),
+                     statuses=[_status("CodeAnt"), _status("rhobear-reviews")],
+                     reviews=[_review("APPROVED")])
+    ev = _bundle(greens, trusted_producer_ok=False)
+    ok, reason = merge_executor.pre_merge_belts(ev)
+    assert ok is False and "trusted check run" in reason
+    calls = []
+    with patch("src.merge_executor._gh", _refusal_pr_view(calls)):
+        with pytest.raises(MergeDenied, match="trusted check run"):
+            merge("o/r", 5, SHA1, ev, "tok")
+    assert not any("PUT" in c for c in calls)

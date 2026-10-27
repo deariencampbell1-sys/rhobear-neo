@@ -128,3 +128,29 @@ def test_builder_and_worker_share_the_lane_classifier():
     from src import neo_worker
     assert neo_builder.lane_of is neo_worker.lane_of
     assert neo_builder.LANE_BRANCH is neo_worker.LANE_BRANCH
+
+
+def test_main_claim_loop_skips_lane_before_submit(monkeypatch):
+    """The main claim loop applies the same skip before dispatch_one reaches a pool."""
+    monkeypatch.setattr(Config, "require", lambda self: self)
+    monkeypatch.setattr(Config, "validate", lambda self: self)
+    monkeypatch.setattr(neo_builder, "github_app_for", lambda cfg: object())
+    monkeypatch.setattr(neo_builder, "repo_token", lambda cfg, repo, iid: "tok")
+    monkeypatch.setattr(neo_builder, "pr_state", lambda token, repo, pr: "OPEN\tl8b/mask-fix")
+    row = {"id": 10, "repo": "acme/a", "pr_number": 5, "head_sha": SHA,
+           "builder_round": 1, "attempt": 1, "worker_token": "w1", "payload": {}}
+    jobs = mock.MagicMock()
+    jobs.claim_queued.side_effect = [row, None]
+    jobs.recover_expired.return_value = []
+    jobs.supersede_older.return_value = []
+    monkeypatch.setattr(neo_builder, "Jobs", lambda dsn: jobs)
+    submit = mock.Mock(side_effect=AssertionError("lane row reached pool submit"))
+    monkeypatch.setattr(neo_builder.concurrent.futures.ThreadPoolExecutor, "submit", submit)
+    import sys
+    monkeypatch.setattr(sys, "argv", ["neo_builder", "--once"])
+    assert neo_builder.main() == 0
+    submit.assert_not_called()
+    jobs.resolve.assert_called_once_with(
+        10, "no_change", worker_token="w1",
+        payload={"skipped_lane": "l8b/mask-fix", "lane_skip": True,
+                 "brief_dispatched": False})
