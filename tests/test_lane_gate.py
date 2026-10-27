@@ -37,7 +37,8 @@ class FakeState:
 
 def evidence(**over):
     e = {"ok": True, "decided_sha": HEAD, "head_sha": HEAD, "trusted_green": True,
-         "required_checks_pass": True, "head_ref": "l3-kit/package-tokens", "reviews": []}
+         "required_checks_pass": True, "head_ref": "l3-kit/package-tokens", "reviews": [],
+         "green1_ok": True, "green1_reason": "", "trusted_red": []}
     e.update(over)
     return e
 
@@ -70,11 +71,26 @@ def test_authority_needs_apollo_and_the_architect_on_this_head():
         ((True, evidence(), "l3-kit", [architect(login="rhobear-neo[bot]")], []), "owner"),
         ((True, evidence(head_sha="b" * 40), "l3-kit", [architect()], []), "head moved"),
         ((False, evidence(), "l3-kit", [architect()], []), "disabled"),
-        ((True, evidence(), "l3-kit", [architect()],
-          [{"state": "CHANGES_REQUESTED", "commit": {"oid": HEAD}}]), "requested changes"),
+        ((True, evidence(green1_ok=False, green1_reason="CHANGES_REQUESTED"),
+          "l3-kit", [architect()], []), "green 1"),
     ):
         ok, reason = neo_worker.lane_merge_authority(*args, OWNER)
         assert not ok and why in reason, reason
+
+
+def test_lane_gate_requires_apollo_accept_not_only_a_status():
+    ok, reason = neo_worker.lane_merge_authority(
+        True, evidence(green1_ok=False, green1_reason="COMMENTED"),
+        "l3-kit", [architect()], [], OWNER)
+    assert ok is False
+    assert "green 1" in reason and "Apollo" in reason, reason
+
+
+def test_lane_gate_refuses_a_red_trusted_reviewer():
+    ok, reason = neo_worker.lane_merge_authority(
+        True, evidence(trusted_red=["CodeAnt (failure)"]),
+        "l3-kit", [architect()], [], OWNER)
+    assert ok is False and "CodeAnt" in reason, reason
 
 
 def test_only_the_newest_architect_status_counts():
@@ -118,7 +134,8 @@ def run(statuses, merge_rc=0, evidence_dict=None):
     state = FakeState()
     gh, calls = fake_gh(statuses, merge_rc)
     cfg = dataclasses.replace(Config(), lane_merge=True)
-    ev = evidence() if evidence_dict is None else evidence_dict
+    ev = evidence(statuses=statuses) if evidence_dict is None else {
+        **evidence_dict, "statuses": evidence_dict.get("statuses", statuses)}
     with mock.patch.object(neo_worker, "_gh", gh), \
          mock.patch.object(neo_worker, "repo_token", return_value="tok"), \
          mock.patch.object(neo_worker, "resolve_pr", return_value=51), \
@@ -163,7 +180,10 @@ def test_lane_gate_reads_evidence_through_the_real_collector():
     def gh(token, *args, timeout=30):
         if args[:2] == ("pr", "view"):
             return 0, json.dumps({"headRefOid": HEAD, "headRefName": "l8b/fix-usb-macros",
-                                  "reviews": [], "statusCheckRollup": [
+                                  "reviews": [{"state": "APPROVED", "commit_id": HEAD, "body": "",
+                                               "author": {"login": "rhobear-reviews[bot]",
+                                                          "type": "Bot"}}],
+                                  "statusCheckRollup": [
                                       {"context": "rhobear-reviews", "state": "SUCCESS"}]})
         if args[0] == "api" and "/check-runs" in args[1]:
             return 0, json.dumps({"total_count": 1, "check_runs": [
@@ -193,6 +213,26 @@ def test_lane_gate_reads_evidence_through_the_real_collector():
     assert state.rows[-1][3] == "merged", state.rows
 
 
+def test_lane_gate_uses_fresh_reviews_not_the_stale_outer_list():
+    fresh_review = {"state": "CHANGES_REQUESTED", "commit_id": HEAD,
+                    "author": {"login": "rhobear-reviews[bot]", "type": "Bot"}}
+    fresh = evidence(reviews=[fresh_review], statuses=[architect()],
+                     green1_ok=False, green1_reason="CHANGES_REQUESTED")
+    outer = [{"state": "APPROVED", "commit_id": HEAD,
+              "author": {"login": "rhobear-reviews[bot]", "type": "Bot"}}]
+    state = FakeState()
+    gh, calls = fake_gh([architect()])
+    cfg = dataclasses.replace(Config(), lane_merge=True)
+    with mock.patch.object(neo_worker, "_gh", gh), \
+         mock.patch.object(neo_worker, "_review_evidence", return_value=fresh), \
+         mock.patch.object(neo_worker, "_enabled_reviewers", return_value=()):
+        neo_worker.run_lane_gate("tok", cfg, state, REPO, 51, HEAD, "l3-kit", outer)
+    assert not any(c[:2] == ("pr", "merge") for c in calls), calls
+    assert not any(c[0] == "api" and c[1].endswith("/statuses?per_page=100") for c in calls), calls
+    assert state.rows[-1][3] == "lane_hold", state.rows
+    assert "green 1" in state.rows[-1][5]["reason"], state.rows
+
+
 def test_architect_status_wakes_neo_but_other_untrusted_contexts_do_not():
     wakes = []
     cfg = mock.Mock(repo_allowlist=(REPO,), trusted_review_contexts=("rhobear-reviews",))
@@ -218,6 +258,15 @@ def test_drift_gate_needs_a_green_l0_drift_on_this_head():
     assert not ok and "fails" in reason
     ok, _ = neo_worker.lane_merge_authority(True, evidence(), "l3-kit", [architect()], [], OWNER)
     assert ok   # switch off: unchanged behaviour
+
+
+def test_drift_success_requires_the_owner_creator():
+    for creator in ({"login": "mallory"}, None):
+        drift = {"context": "l0/drift", "state": "success", "creator": creator}
+        ok, reason = neo_worker.lane_merge_authority(
+            True, evidence(), "l3-kit", [drift, architect()], [], OWNER,
+            require_drift=True)
+        assert ok is False and "owner's account" in reason, reason
 
 
 def test_lane_require_drift_is_off_by_default_and_on_with_the_switch(monkeypatch):

@@ -22,6 +22,7 @@ No real GitHub / provider calls: all subprocesses and HTTP are fakes.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
@@ -1962,6 +1963,28 @@ def test_architect_approval_counts_as_green_2_on_the_exact_head():
     assert ok is True, reason
 
 
+def test_architect_green_never_hides_a_red_trusted_reviewer():
+    greens = _greens(repo=W1_LANE_REPO, reviews=[_review("APPROVED")],
+                     statuses=[_status("architect/l1-reviews"), _status("CodeAnt", "failure")],
+                     enabled=("CodeAnt",))
+    assert greens["green2_ok"] is True
+    assert greens["green2_kind"] == "architect"
+    assert len(greens["trusted_red"]) == 1
+    assert "CodeAnt" in greens["trusted_red"][0]
+    ok, reason = _authority(_bundle(greens))
+    assert ok is False and "CodeAnt" in reason, reason
+
+
+def test_apollo_green_one_requires_the_real_bot_identity():
+    greens = _greens(repo=W1_LANE_REPO,
+                     reviews=[_review("APPROVED", author="rhobear-reviews", author_type="User")],
+                     statuses=[_status("architect/l1-reviews")])
+    assert greens["green1_ok"] is False
+    assert greens["green2_ok"] is True
+    ok, reason = _authority(_bundle(greens))
+    assert ok is False and "green 1" in reason, reason
+
+
 def test_a_reviewer_with_review_and_status_counts_once():
     """An outside reviewer with both a review and a status is one green —
     counted once, not twice."""
@@ -2153,6 +2176,19 @@ def test_an_architect_status_from_a_non_owner_account_is_refused():
         assert ok is False, (repo, reason)
 
 
+def test_missing_architect_creator_is_not_an_owner_match():
+    from src import neo_worker
+
+    cfg = dataclasses.replace(Config(), owner_install_id="")
+    with_empty_login = _status("architect/l1-reviews", login="")
+    without_creator = {key: value for key, value in with_empty_login.items() if key != "creator"}
+    for status in (with_empty_login, without_creator):
+        greens = neo_worker._green_fields(
+            cfg, W1_LANE_REPO, SHA1, [_review("APPROVED")], [status], [], ())
+        assert greens["green2_ok"] is False, greens
+        assert "owner's account" in greens["green2_reason"], greens["green2_reason"]
+
+
 def test_a_review_with_no_author_is_never_apollos():
     """Defect 5 (MEDIUM): an empty/missing review author fell open — the
     green-1 loop skipped the Apollo check for a falsy author and chose the
@@ -2240,13 +2276,13 @@ def test_a_refused_merge_posts_no_two_greens_comment():
         f"a refused merge must leave no comment, got: {calls}"
 
 
-def test_unreadable_head_branch_never_merges_under_the_non_lane_rule():
-    """A PR whose head branch could not be read may be a lane PR: the non-lane
-    two-greens rule must refuse it rather than skip the architect/drift gates."""
+def test_lane_or_unreadable_head_branch_never_merges_under_the_non_lane_rule():
+    """A lane or unreadable head branch may never skip the lane architect and
+    drift gates by using the non-lane two-greens rule."""
     greens = _greens(enabled=("CodeAnt",),
                      statuses=[_status("CodeAnt"), _status("rhobear-reviews")],
                      reviews=[_review("APPROVED")])
-    ok, _ = _authority(_bundle(greens, head_ref="l3-kit/buttons"))
-    assert ok is True
+    ok, reason = _authority(_bundle(greens, head_ref="l3-kit/buttons"))
+    assert ok is False and "lane" in reason, reason
     ok, reason = _authority(_bundle(greens, head_ref=""))
     assert ok is False and "head branch unavailable" in reason

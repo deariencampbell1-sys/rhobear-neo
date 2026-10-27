@@ -232,6 +232,24 @@ def test_enabled_reviewers_resolves_the_real_installation_id(monkeypatch):
     assert ("12345",) in selects, selects
 
 
+def test_owner_seed_and_lookup_share_the_resolved_installation_id(monkeypatch):
+    from src import neo_worker
+    from src.config import Config
+    from src import github_app
+
+    app = _FakeApp(install_id=12345)
+    monkeypatch.setattr(github_app, "github_app_for", lambda cfg: app)
+    with recording_db(rows=[("12345", "*", "CodeAnt", True, "")]) as conn:
+        got = neo_worker._enabled_reviewers(Config(), _state(), f"{OWNER}/rhobear-neo")
+        selects = [p for sql, p in conn.cur.calls
+                   if sql.strip().upper().startswith("SELECT") and p]
+        seeds = [p for sql, p in conn.cur.calls
+                 if "INSERT" in sql.upper() and "ON CONFLICT" in sql.upper()]
+    assert got == ("CodeAnt",), got
+    assert selects == [("12345",)], selects
+    assert seeds == [("12345", "CodeAnt")], seeds
+
+
 def test_enabled_reviewers_fail_closed_when_the_installation_cannot_resolve(
         monkeypatch, caplog):
     """A resolver failure logs a WARNING naming the repo and returns no
