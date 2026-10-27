@@ -527,3 +527,36 @@ def test_lane_merge_denies_unresolved_critical_high_through_shared_executor():
     assert not any("PUT" in c for c in calls)
     assert state.rows[-1][3] == "lane_hold"
     assert "critical" in state.rows[-1][5]["reason"].lower()
+
+
+def test_lane_wake_collects_reviewers_and_evidence_once():
+    state = FakeState()
+    ev = evidence(statuses=[architect()])
+    cfg = dataclasses.replace(Config(), lane_merge=True)
+    with mock.patch.object(neo_worker, "repo_token", return_value="tok"), \
+         mock.patch.object(neo_worker, "resolve_pr", return_value=51), \
+         mock.patch.object(neo_worker, "_enabled_reviewers", return_value=()) as enabled, \
+         mock.patch.object(neo_worker, "_review_evidence", return_value=ev) as collect, \
+         mock.patch("src.merge_executor.merge",
+                    return_value={"merged": True, "sha": HEAD}) as shared:
+        neo_worker.run_neo(cfg, state, mock.MagicMock(),
+                           {"job_id": 1, "repo": REPO, "sha": HEAD, "green": True,
+                            "context": "rhobear-reviews"})
+    assert enabled.call_count == 1
+    assert collect.call_count == 1
+    shared.assert_called_once()
+    assert shared.call_args.args[3] is ev
+    assert state.rows[-1][3] == "merged"
+
+
+def test_lane_gate_records_hold_on_unexpected_executor_error():
+    state = FakeState()
+    ev = evidence(statuses=[architect()])
+    with mock.patch.object(neo_worker, "_enabled_reviewers", return_value=()), \
+         mock.patch.object(neo_worker, "_review_evidence", return_value=ev), \
+         mock.patch("src.merge_executor.merge", side_effect=RuntimeError("boom")):
+        neo_worker.run_lane_gate(
+            "tok", dataclasses.replace(Config(), lane_merge=True),
+            state, REPO, 51, HEAD, "l3-kit")
+    assert state.rows[-1][3] == "lane_hold"
+    assert "RuntimeError" in state.rows[-1][5]["reason"]

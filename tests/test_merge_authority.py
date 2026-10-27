@@ -2362,3 +2362,52 @@ def test_merge_refuses_a_non_mergeable_pr_before_api():
             merge("o/r", 5, SHA1, {"ok": True}, "tok")
     assert not any("PUT" in c for c in calls)
     assert not any(c[:2] == ("pr", "comment") for c in calls)
+
+
+def test_every_check_run_from_a_trusted_app_decides_red():
+    passed = {"name": "CodeAnt Review", "conclusion": "SUCCESS",
+              "app": {"slug": "codeant-ai"}}
+    failed = {"name": "CodeAnt Security", "conclusion": "FAILURE",
+              "app": {"slug": "codeant-ai"}}
+    for runs in ([passed, failed], [failed, passed]):
+        greens = _greens(enabled=("CodeAnt",), check_runs=runs)
+        assert greens["green2_ok"] is False, greens
+        assert any("CodeAnt Security (failure)" in red
+                   for red in greens["trusted_red"]), greens
+
+
+def test_green_one_bot_type_comes_from_the_node_id_match():
+    from src import neo_worker
+    review = {"id": "PRR_real_user", "author": {"login": "rhobear-reviews"}}
+    rows = [
+        {"node_id": "PRR_real_user",
+         "user": {"login": "rhobear-reviews", "type": "User"}},
+        {"node_id": "PRR_real_bot",
+         "user": {"login": "rhobear-reviews[bot]", "type": "Bot"}},
+    ]
+    with patch.object(neo_worker, "_reviewer_rows", return_value=rows):
+        annotated = neo_worker._reviews_with_bot_types(
+            "tok", "acme/a", 5, [review])
+    assert annotated[0]["author"]["type"] == "User"
+
+
+def test_unknown_mergeability_uses_the_exact_head_merge_api():
+    calls = []
+    with patch("src.merge_executor._gh",
+               _refusal_pr_view(calls, mergeable="UNKNOWN")):
+        result = merge("o/r", 5, SHA1, {"ok": True}, "tok")
+    assert result["merged"] is True
+    assert any("PUT" in c for c in calls)
+
+
+def test_merge_authority_without_cfg_honours_lane_exclusion(monkeypatch):
+    from src import neo_worker
+    from src.jev_review import JevAssessment
+    monkeypatch.setenv("NEO_LANE_EXCLUDE", "l1-hotfix")
+    greens = _greens(enabled=("CodeAnt",),
+                     statuses=[_status("CodeAnt"), _status("rhobear-reviews")],
+                     reviews=[_review("APPROVED")])
+    ev = _bundle(greens, head_ref="l1-hotfix/topic")
+    ok, reason = neo_worker.merge_authority(
+        True, ev, JevAssessment(False, reason="no key"))
+    assert ok is True, reason

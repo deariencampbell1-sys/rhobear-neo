@@ -122,3 +122,9 @@ def test_a_changed_pr_state_shape_never_silently_disables_the_lane_skip():
             neo_builder.dispatch_one(Config(), jobs, row)
         prep.assert_not_called()
         jobs.resolve.assert_not_called()   # stays running — never a silent dispatch
+
+
+def test_builder_and_worker_share_the_lane_classifier():
+    from src import neo_worker
+    assert neo_builder.lane_of is neo_worker.lane_of
+    assert neo_builder.LANE_BRANCH is neo_worker.LANE_BRANCH
