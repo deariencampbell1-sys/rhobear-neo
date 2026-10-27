@@ -70,7 +70,7 @@ def _connect(dsn: str):
     return psycopg.connect(dsn)
 
 
-def ensure_schema(dsn: str) -> None:
+def ensure_schema(dsn: str, *, owner_install_id: str | None = DEFAULT_OWNER_INSTALL_ID) -> None:
     """Create the table if missing and seed the owner install's CodeAnt row.
 
     Idempotent and self-healing: the seed is ON CONFLICT DO NOTHING, so this
@@ -79,12 +79,13 @@ def ensure_schema(dsn: str) -> None:
     with _connect(dsn) as conn:
         with conn.cursor() as cur:
             cur.execute(CREATE_TABLE_SQL)
-            cur.execute(SEED_SQL, (DEFAULT_OWNER_INSTALL_ID, SEED_SOURCE))
+            if owner_install_id is not None:
+                cur.execute(SEED_SQL, (owner_install_id, SEED_SOURCE))
         conn.commit()
 
 
 def _rows(dsn: str, install_id: str) -> list[dict]:
-    ensure_schema(dsn)
+    ensure_schema(dsn, owner_install_id=None)
     with _connect(dsn) as conn:
         with conn.cursor() as cur:
             cur.execute(LIST_SQL, (install_id,))
@@ -101,7 +102,7 @@ def list_sources(dsn: str, install_id: str, repo: str = "*") -> list[dict]:
 def set_source(dsn: str, install_id: str, repo: str, source: str,
                enabled: bool = True) -> None:
     """Turn one source on or off for one scope (upsert)."""
-    ensure_schema(dsn)
+    ensure_schema(dsn, owner_install_id=None)
     with _connect(dsn) as conn:
         with conn.cursor() as cur:
             cur.execute(UPSERT_SQL, (install_id, repo, source, bool(enabled)))
@@ -110,7 +111,7 @@ def set_source(dsn: str, install_id: str, repo: str, source: str,
 
 def delete_source(dsn: str, install_id: str, repo: str, source: str) -> None:
     """Remove one source from one scope."""
-    ensure_schema(dsn)
+    ensure_schema(dsn, owner_install_id=None)
     with _connect(dsn) as conn:
         with conn.cursor() as cur:
             cur.execute(DELETE_SQL, (install_id, repo, source))

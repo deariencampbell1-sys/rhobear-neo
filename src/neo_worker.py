@@ -244,9 +244,13 @@ def _green_fields(cfg: Config, repo: str, sha: str, reviews: list, statuses: lis
     from .webhook_server import is_architect_context
 
     owner = repo.split("/", 1)[0]
-    owner_logins = {owner.lower(),
-                    str(getattr(cfg, "owner_install_id", "") or "").lower(),
-                    DEFAULT_OWNER_INSTALL_ID.lower()}
+    owner_logins = {
+        value for value in (
+            owner.lower(),
+            str(getattr(cfg, "owner_install_id", "") or "").lower(),
+            DEFAULT_OWNER_INSTALL_ID.lower(),
+        ) if value
+    }
     contexts = _trusted_contexts(cfg)
     apollo = contexts[0] if contexts else ""
     out: dict = {"trusted_red": [], "trusted_seen": []}
@@ -262,6 +266,8 @@ def _green_fields(cfg: Config, repo: str, sha: str, reviews: list, statuses: lis
         # nameless review as Apollo's ACCEPT.
         if not author or not tr.source_matches(apollo, author):
             continue                              # any other account is ignored
+        if str((r.get("author") or {}).get("type") or "") != "Bot":
+            continue
         chosen = r
     if chosen is None:
         out.update(green1_ok=False, green1_reason="no review by Apollo on this exact head",
@@ -292,63 +298,62 @@ def _green_fields(cfg: Config, repo: str, sha: str, reviews: list, statuses: lis
                    green2_at=str(arch.get("created_at") or ""), green2_reason="")
 
     # --- green 2b: an enabled trusted reviewer's green (either counts) -----
-    if not out.get("green2_ok"):
-        greens_found: list = []
-        for src in enabled_sources:
-            st = next((s for s in latest_statuses
-                       if tr.source_matches(src, str(s.get("context") or ""))
-                       and tr.source_matches(src, str((s.get("creator") or {}).get("login") or ""))
-                       and str((s.get("creator") or {}).get("type") or "") == "Bot"), None)
-            rv = next((r for r in reversed(reviews or [])
-                       if _review_oid(r) == sha and _review_author(r)
-                       and tr.source_matches(src, _review_author(r))
-                       and str((r.get("author") or {}).get("type") or "") == "Bot"), None)
-            ck = next((c for c in (rollup or [])
-                       if tr.source_matches(src, str((c.get("app") or {}).get("slug") or ""))), None)
-            signals = []
-            if st is not None:
-                signals.append((str(st.get("context") or ""),
-                                str(st.get("state") or "").lower(), "status",
-                                st.get("target_url") or "", st.get("created_at") or ""))
-            if ck is not None:
-                signals.append((str(ck.get("context") or ck.get("name") or ""),
-                                str(ck.get("conclusion") or ck.get("state") or "").lower(),
-                                "check", ck.get("detailsUrl") or "",
-                                ck.get("completedAt") or ck.get("createdAt") or ""))
-            if rv is not None:
-                signals.append((_review_author(rv), str(rv.get("state") or "").lower(),
-                                "review", rv.get("html_url") or "",
-                                rv.get("submitted_at") or ""))
-            if not signals:
-                continue
-            # Red stands (a REQUEST CHANGES or a failing run blocks until it is
-            # re-run); the newest status of a context decides (defect 3).
-            red = [s for s in signals
-                   if s[1] in ("failure", "error", "cancelled", "timed_out",
-                               "changes_requested", "request_changes", "changes request")]
-            green = [s for s in signals if s[1] in ("success", "accept", "accepted", "approved")]
-            pick = red[0] if red else (green[0] if green else signals[0])
-            out["trusted_seen"].append({"source": src, "match": pick[0],
-                                        "state": pick[1], "login": pick[0]})
-            if red:
-                label, state = red[0][0], red[0][1]
-                out["trusted_red"].append(
-                    f"{label} (" + ("requested changes" if "changes" in state or
-                                   "request" in state else state) + ")")
-            elif green:
-                greens_found.append(green[0])
-        # Rule (d) is decided only after EVERY enabled source is collected
-        # (W1-07-r2 defect 2): `break` on the first green hid a red reviewer
-        # sorted after it, so "no enabled trusted reviewer is red on this
-        # head" failed open on merge authority.  Any red refuses; a green
-        # counts only when nothing is red.
-        if greens_found and not out["trusted_red"]:
-            match, _, kind, url, at = greens_found[0]
-            word = "accepted" if kind == "review" else "passed"
-            out.update(green2_ok=True, green2_kind="trusted",
-                       green2_label=f"{match} {word} (trusted)",
-                       green2_url=str(url or ""), green2_at=str(at or ""),
-                       green2_reason="")
+    greens_found: list = []
+    for src in enabled_sources:
+        st = next((s for s in latest_statuses
+                   if tr.source_matches(src, str(s.get("context") or ""))
+                   and tr.source_matches(src, str((s.get("creator") or {}).get("login") or ""))
+                   and str((s.get("creator") or {}).get("type") or "") == "Bot"), None)
+        rv = next((r for r in reversed(reviews or [])
+                   if _review_oid(r) == sha and _review_author(r)
+                   and tr.source_matches(src, _review_author(r))
+                   and str((r.get("author") or {}).get("type") or "") == "Bot"), None)
+        ck = next((c for c in (rollup or [])
+                   if tr.source_matches(src, str((c.get("app") or {}).get("slug") or ""))), None)
+        signals = []
+        if st is not None:
+            signals.append((str(st.get("context") or ""),
+                            str(st.get("state") or "").lower(), "status",
+                            st.get("target_url") or "", st.get("created_at") or ""))
+        if ck is not None:
+            signals.append((str(ck.get("context") or ck.get("name") or ""),
+                            str(ck.get("conclusion") or ck.get("state") or "").lower(),
+                            "check", ck.get("detailsUrl") or "",
+                            ck.get("completedAt") or ck.get("createdAt") or ""))
+        if rv is not None:
+            signals.append((_review_author(rv), str(rv.get("state") or "").lower(),
+                            "review", rv.get("html_url") or "",
+                            rv.get("submitted_at") or ""))
+        if not signals:
+            continue
+        # Red stands (a REQUEST CHANGES or a failing run blocks until it is
+        # re-run); the newest status of a context decides (defect 3).
+        red = [s for s in signals
+               if s[1] in ("failure", "error", "cancelled", "timed_out",
+                           "changes_requested", "request_changes", "changes request")]
+        green = [s for s in signals if s[1] in ("success", "accept", "accepted", "approved")]
+        pick = red[0] if red else (green[0] if green else signals[0])
+        out["trusted_seen"].append({"source": src, "match": pick[0],
+                                    "state": pick[1], "login": pick[0]})
+        if red:
+            label, state = red[0][0], red[0][1]
+            out["trusted_red"].append(
+                f"{label} (" + ("requested changes" if "changes" in state or
+                               "request" in state else state) + ")")
+        elif green:
+            greens_found.append(green[0])
+    # Rule (d) is decided only after EVERY enabled source is collected
+    # (W1-07-r2 defect 2): `break` on the first green hid a red reviewer
+    # sorted after it, so "no enabled trusted reviewer is red on this
+    # head" failed open on merge authority.  Any red refuses; a green
+    # counts only when nothing is red.
+    if not out.get("green2_ok") and greens_found and not out["trusted_red"]:
+        match, _, kind, url, at = greens_found[0]
+        word = "accepted" if kind == "review" else "passed"
+        out.update(green2_ok=True, green2_kind="trusted",
+                   green2_label=f"{match} {word} (trusted)",
+                   green2_url=str(url or ""), green2_at=str(at or ""),
+                   green2_reason="")
 
     if not out.get("green2_ok"):
         out.update(green2_ok=False, green2_kind="", green2_label="", green2_url="",
@@ -386,8 +391,10 @@ def _enabled_reviewers(cfg: Config, state, repo: str) -> tuple[str, ...]:
         app = _gh_app.github_app_for(cfg)
         if app is None:
             raise _gh_app.AppNotConfigured("no GitHub App identity configured")
-        install_id = app.installation_for_repo(repo)
-        return trusted_reviewers.enabled_sources(dsn, str(install_id), repo)
+        install_id = str(app.installation_for_repo(repo))
+        if repo.split("/", 1)[0].lower() == DEFAULT_OWNER_INSTALL_ID.lower():
+            trusted_reviewers.ensure_schema(dsn, owner_install_id=install_id)
+        return trusted_reviewers.enabled_sources(dsn, install_id, repo)
     except Exception as exc:  # noqa: BLE001 — fail closed, never strand the wake
         log.warning("trusted_reviewers: installation id for %s unresolvable "
                     "(%s) — no outside reviewer counts (fail closed)",
@@ -514,6 +521,7 @@ def _review_evidence(token: str, cfg: Config, repo: str, pr: int, sha: str,
     ev["rollup_green"] = all_success
     ev["head_ref"] = head_ref
     ev["reviews"] = reviews
+    ev["statuses"] = statuses
     # W1-07-r1: the two greens + trusted red for this exact head (the merge rule).
     ev.update(_green_fields(cfg, repo, sha, reviews, statuses, rollup, enabled_sources))
     return ev
@@ -554,6 +562,8 @@ def merge_authority(install_auto_merge: bool, evidence: dict,
     # never be merged under the non-lane rule (which skips architect and drift).
     if "head_ref" in evidence and not evidence.get("head_ref"):
         return False, "PR head branch unavailable — cannot rule out a lane PR"
+    if lane_of(str(evidence.get("head_ref") or "")):
+        return False, "lane PR head must use the lane merge gate"
     if evidence.get("head_sha") != evidence.get("decided_sha"):
         return False, "head moved since the wake — stale evidence cannot authorize this SHA"
     if not evidence.get("review_bound_ok", True):
@@ -609,10 +619,12 @@ def lane_merge_authority(lane_merge: bool, evidence: dict, lane: str,
         return False, "Apollo's status is not success on this exact head SHA"
     if not evidence.get("required_checks_pass"):
         return False, "required checks have not passed on this exact head SHA"
-    for r in reviews:
-        oid = str((r.get("commit") or {}).get("oid") or r.get("commit_id") or "")
-        if oid == head and str(r.get("state") or "").upper() == "CHANGES_REQUESTED":
-            return False, "Apollo requested changes on this exact head SHA"
+    if evidence.get("green1_ok") is not True:
+        return False, ("green 1 missing: Apollo's review is not ACCEPT on this exact head SHA "
+                       f"({evidence.get('green1_reason') or 'no review by Apollo on this head'})")
+    if evidence.get("trusted_red"):
+        return False, ("a trusted reviewer is red on this exact head: "
+                       + ", ".join(str(x) for x in evidence["trusted_red"]))
     latest_statuses = _newest_status_per_context(statuses).values()
     latest = next((s for s in latest_statuses
                    if str(s.get("context") or "").lower() == ARCHITECT_CONTEXT + lane), None)
@@ -627,6 +639,9 @@ def lane_merge_authority(lane_merge: bool, evidence: dict, lane: str,
             return False, "waiting for L0's drift check (l0/drift) on this exact head"
         if str(drift.get("state") or "").lower() != "success":
             return False, f"L0's drift check fails on this exact head ({drift.get('description') or 'see the PR'})"
+        drift_login = str((drift.get("creator") or {}).get("login") or "").lower()
+        if not drift_login or drift_login != owner.lower():
+            return False, "l0/drift status was not set from the owner's account"
     return True, "Apollo and the lane architect both passed this exact head"
 
 
@@ -638,17 +653,16 @@ def run_lane_gate(token: str, cfg: Config, state: NeoState, repo: str, pr: int, 
         return
     org = repo.split("/", 1)[0]
     try:
-        evidence = _review_evidence(token, cfg, repo, pr, sha)
-        rc, raw = _gh(token, "api", f"repos/{repo}/commits/{sha}/statuses?per_page=100", timeout=30)
+        enabled_sources = _enabled_reviewers(cfg, state, repo)
+        evidence = _review_evidence(token, cfg, repo, pr, sha,
+                                    enabled_sources=enabled_sources)
     except Exception as exc:  # noqa: BLE001 — edge 5: a broken read fails CLOSED
         reason = f"lane gate: evidence read broke ({type(exc).__name__}) — fail closed"
         state.record(repo, pr, sha, "lane_hold", verdict="HOLD",
                      detail={"lane": lane, "reason": reason})
         return
-    try:
-        statuses = json.loads(raw) if rc == 0 else []
-    except (TypeError, ValueError):
-        statuses = []
+    statuses = evidence.get("statuses") or []
+    fresh_reviews = evidence.get("reviews") or []
     # Defect 1: the gate's conditions dropped review_bound_ok — an ACCEPT on an
     # older commit passed. The reviewed commit must be this head SHA (belt
     # semantics as in merge_authority: a bundle without the key is legacy
@@ -656,9 +670,11 @@ def run_lane_gate(token: str, cfg: Config, state: NeoState, repo: str, pr: int, 
     if not evidence.get("review_bound_ok", True):
         ok, reason = False, "lane gate: the reviewed commit is not this head SHA"
     else:
-        ok, reason = lane_merge_authority(bool(getattr(cfg, "lane_merge", False)), evidence, lane,
-                                          statuses if isinstance(statuses, list) else [], reviews, org,
-                                          require_drift=getattr(cfg, "lane_require_drift", False) is True)
+        ok, reason = lane_merge_authority(
+            bool(getattr(cfg, "lane_merge", False)), evidence, lane,
+            statuses if isinstance(statuses, list) else [],
+            fresh_reviews if isinstance(fresh_reviews, list) else [], org,
+            require_drift=getattr(cfg, "lane_require_drift", False) is True)
     log.info("%s#%s@%s lane=%s merge authority=%s (%s)", repo, pr, sha[:8], lane, ok, reason)
     if ok:
         rc, out = _gh(token, "pr", "merge", str(pr), "-R", repo, "--squash",
