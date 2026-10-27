@@ -1772,8 +1772,8 @@ def _review(state, oid=SHA1, author="rhobear-reviews[bot]",
             at="2026-10-26T11:52:00Z", author_type="Bot"):
     return {"state": state, "commit": {"oid": oid},
             "author": {"login": author, "type": author_type},
-            "submitted_at": at, "body": "verdict: ACCEPT",
-            "html_url": f"https://github.com/acme/a/pull/5#pullrequestreview-{state}"}
+            "submittedAt": at, "body": "verdict: ACCEPT",
+            "url": f"https://github.com/acme/a/pull/5#pullrequestreview-{state}"}
 
 
 def _status(context, state="success", login=None, created="2026-10-26T11:50:00Z",
@@ -2317,3 +2317,45 @@ def test_a_partial_rule_bundle_still_runs_the_gate_before_the_merge():
     with patch("src.merge_executor._gh", fake_gh):
         with pytest.raises(MergeDenied, match="trusted reviewer is red"):
             merge("o/r", 5, SHA1, ev, "tok")
+
+
+def test_customer_architect_is_enabled_without_a_trusted_reviewer_row():
+    greens = _greens(repo="acme/a", enabled=(), reviews=[_review("APPROVED")],
+                     statuses=[_status("architect/l1-reviews", login="acme")])
+    assert greens["green2_ok"] is True
+    assert greens["green2_kind"] == "architect"
+
+
+def _refusal_pr_view(calls, **over):
+    data = {"headRefOid": SHA1, "state": "OPEN", "mergeable": "MERGEABLE",
+            "headRefName": "topic", "isCrossRepository": False}
+    data.update(over)
+
+    def fake_gh(token, *args, timeout=30):
+        calls.append(args)
+        if args[:3] == ("pr", "view", "5"):
+            return 0, json.dumps(data)
+        if args[:2] == ("api", "-X") and "PUT" in args:
+            return 0, json.dumps({"merged": True, "sha": SHA1})
+        if args[:2] == ("pr", "comment"):
+            return 0, "{}"
+        return 0, "main"
+    return fake_gh
+
+
+def test_merge_refuses_a_fork_before_api():
+    calls = []
+    with patch("src.merge_executor._gh", _refusal_pr_view(calls, isCrossRepository=True)):
+        with pytest.raises(MergeDenied, match="fork"):
+            merge("o/r", 5, SHA1, {"ok": True}, "tok")
+    assert not any("PUT" in c for c in calls)
+    assert not any(c[:2] == ("pr", "comment") for c in calls)
+
+
+def test_merge_refuses_a_non_mergeable_pr_before_api():
+    calls = []
+    with patch("src.merge_executor._gh", _refusal_pr_view(calls, mergeable="CONFLICTING")):
+        with pytest.raises(MergeDenied, match="mergeable"):
+            merge("o/r", 5, SHA1, {"ok": True}, "tok")
+    assert not any("PUT" in c for c in calls)
+    assert not any(c[:2] == ("pr", "comment") for c in calls)

@@ -416,3 +416,94 @@ def test_lane_of_honours_the_operator_lane_exclusion():
     assert neo_worker.lane_of("l1-hotfix/x") == "l1-hotfix"
     assert neo_builder.is_lane_branch("l1-hotfix/x", cfg) is False
     assert neo_builder.is_lane_branch("l3-kit/x", cfg) is True
+
+
+def test_failed_evidence_still_reads_lane_head_independently_and_never_runs_agent():
+    state = FakeState()
+    transient = {"ok": False, "reason": "pr view unavailable",
+                 "decided_sha": HEAD, "head_ref": ""}
+
+    def gh(token, *args, timeout=30):
+        if args[:2] == ("pr", "view") and args[-1] == "headRefName":
+            return 0, json.dumps({"headRefName": "l3-kit/package-tokens"})
+        raise AssertionError(f"unexpected gh call {args}")
+
+    with mock.patch.object(neo_worker, "_gh", gh), \
+         mock.patch.object(neo_worker, "repo_token", return_value="tok"), \
+         mock.patch.object(neo_worker, "resolve_pr", return_value=51), \
+         mock.patch.object(neo_worker, "_review_evidence", side_effect=[transient, transient]), \
+         mock.patch.object(neo_worker, "_run_agent", return_value=(None, "", 0, "")), \
+         mock.patch.object(neo_worker.ClaudeAgent, "from_config") as agent:
+        neo_worker.run_neo(Config(), state, mock.MagicMock(),
+                           {"job_id": 1, "repo": REPO, "sha": HEAD, "green": True,
+                            "context": "rhobear-reviews"})
+    agent.assert_not_called()
+    assert state.rows[-1][3] == "lane_hold"
+
+
+def test_unknown_head_ref_holds_without_agent():
+    state = FakeState()
+    transient = {"ok": False, "reason": "pr view unavailable",
+                 "decided_sha": HEAD, "head_ref": ""}
+    with mock.patch.object(neo_worker, "_gh", return_value=(1, "unavailable")), \
+         mock.patch.object(neo_worker, "repo_token", return_value="tok"), \
+         mock.patch.object(neo_worker, "resolve_pr", return_value=51), \
+         mock.patch.object(neo_worker, "_review_evidence", return_value=transient), \
+         mock.patch.object(neo_worker, "_run_agent", return_value=(None, "", 0, "")), \
+         mock.patch.object(neo_worker.ClaudeAgent, "from_config") as agent:
+        neo_worker.run_neo(Config(), state, mock.MagicMock(),
+                           {"job_id": 1, "repo": REPO, "sha": HEAD, "green": True,
+                            "context": "rhobear-reviews"})
+    agent.assert_not_called()
+    assert len(state.rows) == 1
+    assert state.rows[0][3] == "lane_hold"
+    assert state.rows[0][5]["lane"] == "unknown"
+    assert "head branch unavailable" in state.rows[0][5]["reason"]
+
+
+def test_lane_merge_uses_shared_executor():
+    state = FakeState()
+    ev = evidence(statuses=[architect()])
+    with mock.patch.object(neo_worker, "_enabled_reviewers", return_value=()), \
+         mock.patch.object(neo_worker, "_review_evidence", return_value=ev), \
+         mock.patch.object(neo_worker, "_gh") as direct_gh, \
+         mock.patch("src.merge_executor.merge", return_value={"merged": True, "sha": HEAD}) as shared:
+        neo_worker.run_lane_gate(
+            "tok", dataclasses.replace(Config(), lane_merge=True),
+            state, REPO, 51, HEAD, "l3-kit")
+    shared.assert_called_once()
+    args = shared.call_args.args
+    assert args[:3] == (REPO, 51, HEAD)
+    assert args[3] is ev and args[3]["green2_kind"] == "architect"
+    assert args[4] == "tok"
+    assert not any(c.args[:2] == ("pr", "merge") for c in direct_gh.call_args_list)
+    assert state.rows[-1][3] == "merged"
+
+
+def test_lane_merge_denies_unresolved_critical_high_through_shared_executor():
+    state = FakeState()
+    ev = evidence(statuses=[architect()], trusted_producer_ok=True,
+                  review_sha_match=True, unresolved_critical_high=2,
+                  coverage_complete=True, auto_merge=True)
+    calls = []
+
+    def gh(token, *args, timeout=30):
+        calls.append(args)
+        if args[:2] == ("pr", "view"):
+            return 0, json.dumps({"headRefOid": HEAD, "state": "OPEN",
+                                  "mergeable": "MERGEABLE", "headRefName": "l3-kit/package-tokens",
+                                  "isCrossRepository": False})
+        if args[:2] == ("api", "-X") and "PUT" in args:
+            return 0, json.dumps({"merged": True, "sha": HEAD})
+        raise AssertionError(f"unexpected gh call {args}")
+
+    with mock.patch.object(neo_worker, "_enabled_reviewers", return_value=()), \
+         mock.patch.object(neo_worker, "_review_evidence", return_value=ev), \
+         mock.patch.object(neo_worker, "_gh", gh), \
+         mock.patch("src.merge_executor._gh", gh):
+        neo_worker.run_lane_gate(
+            "tok", dataclasses.replace(Config(), lane_merge=True),
+            state, REPO, 51, HEAD, "l3-kit")
+    assert not any("PUT" in c for c in calls)
+    assert state.rows[-1][3] == "lane_hold"
+    assert "critical" in state.rows[-1][5]["reason"].lower()
