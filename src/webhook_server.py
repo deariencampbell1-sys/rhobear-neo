@@ -28,6 +28,26 @@ from .config import Config
 
 log = logging.getLogger("rhobear_neo.webhook")
 
+# Status contexts are matched case-insensitively (defect 4): "Architect/l3-kit"
+# and "architect/L3-Kit" are the same context.  One normaliser for the webhook
+# dispatch and for neo_worker's green evaluation.
+DRIFT_CONTEXT = "l0/drift"   # L0 sentinel, SPRINT.md section 9
+
+
+def _norm_context(context: str) -> str:
+    return str(context or "").strip().lower()
+
+
+def is_architect_context(context: str) -> bool:
+    """"architect/<lane>" is a lane architect accepting an exact head — it
+    wakes the lane gate only and is never review evidence."""
+    return _norm_context(context).startswith("architect/")
+
+
+def is_drift_context(context: str) -> bool:
+    """L0's drift check turning green wakes the lane gate too."""
+    return _norm_context(context) == DRIFT_CONTEXT
+
 
 def verify_github_signature(body: bytes, header_sig: str, secret: str) -> bool:
     if not header_sig or not header_sig.startswith("sha256="):
@@ -74,7 +94,11 @@ class NeoDispatcher:
             sha = payload.get("sha") or ""
             if state == "pending":
                 return DispatchOutcome(204, f"status pending ({context})")
-            if not self._trusted(context):
+            # "architect/<lane>" is a lane architect accepting an exact head; it wakes the lane
+            # gate only and is never review evidence (neo_worker.run_lane_gate checks its author).
+            # Case-insensitive (defect 4): "Architect/L3-Kit" is the same context.
+            if not self._trusted(context) and not is_architect_context(context) \
+                    and not is_drift_context(context):   # L0 drift check turning green wakes the lane gate too
                 return DispatchOutcome(204, f"untrusted status context={context!r}")
             # A commit status carries no PR number — resolve via the head SHA.
             self.on_verdict({

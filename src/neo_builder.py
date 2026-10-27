@@ -314,11 +314,36 @@ def pr_state(token: str, repo: str, pr: int) -> str:
     or parse), and dispatch_one treated that as "not open/closed" and skipped.
     Now we only treat explicit CLOSED/MERGED as terminal; empty/garbage leaves
     the job queued for retry.
+
+    Contract (W1-07-r2 defect 8): one line, exactly TWO fields separated by a
+    single TAB (the @tsv of [state, head.ref]) — "<state>\t<head ref>"; an
+    empty head ref yields no tab.  Parse ONLY via parse_pr_state, which
+    enforces this shape and fails closed on anything else.
     """
     rc, out = gh(token, "api", f"repos/{repo}/pulls/{pr}", "--jq", "[.state, .head.ref] | @tsv")
     if rc != 0:
         return ""  # transient failure — caller should retry
     return out.strip()
+
+
+def parse_pr_state(full_state: str) -> tuple[str, str] | None:
+    """Parse pr_state's "<state>\t<head ref>" line into (state, head_ref).
+
+    Documented delimiter (one TAB) with a length check (defect 8): exactly
+    two fields, the state a single bare word.  Anything else — including a
+    shape change in the upstream jq — is UNPARSEABLE (None) and the caller
+    fails closed (the job stays running / the lane skip is never silently
+    disabled).  An empty head ref is legal (gh's trailing tab is stripped).
+    """
+    s = str(full_state or "")
+    parts = s.split("\t")
+    if len(parts) > 2:
+        return None
+    state = parts[0].strip()
+    if not state or not re.fullmatch(r"[A-Za-z_]+", state):
+        return None                     # a format change — never guess
+    head_ref = parts[1].strip() if len(parts) == 2 else ""
+    return state, head_ref
 
 
 def prepare_worktree(token: str, repo: str, pr: int) -> tuple[str, str]:
@@ -618,6 +643,37 @@ No markdown fences, nothing after the VERDICT line.
 """
 
 
+# North Star lane branches belong to their lane's worker (one writer per branch): Builder never pushes to one.
+# Conservative on purpose: the full `l8d-engine-mcps/` form and the short `l8b/` form both count.
+# This is the single classifier shared with neo_worker; the two paths must never drift.
+LANE_BRANCH = re.compile(r"^(l\d+[a-d]?(?:-[a-z0-9-]+)?)/", re.IGNORECASE)
+LANE_HEAD = LANE_BRANCH  # compatibility alias for existing imports
+
+
+def lane_of(branch: str, cfg: Config | None = None) -> str:
+    """Return the lane, unless an operator explicitly excludes its name."""
+    m = LANE_BRANCH.match(branch or "")
+    if not m:
+        return ""
+    lane = m.group(1).lower()
+    if cfg is not None:
+        excluded = {str(x).strip().lower()
+                    for x in (getattr(cfg, "lane_exclude", ()) or ())}
+        if lane in excluded:
+            return ""
+    return lane
+
+
+def is_lane_branch(branch: str, cfg: Config | None = None) -> bool:
+    """True for a lane branch, unless its lane name is operator-excluded."""
+    return bool(lane_of(branch, cfg))
+
+
+def lane_skip_payload(head_ref: str) -> dict:
+    """One terminal receipt for a lane row skipped without dispatching a brief."""
+    return {"skipped_lane": head_ref, "lane_skip": True, "brief_dispatched": False}
+
+
 def dispatch_one(cfg: Config, jobs: Jobs, row: dict) -> None:
     """Dispatch one builder round. Uses Jobs for atomic claim and lifecycle.
 
@@ -681,7 +737,21 @@ def dispatch_one(cfg: Config, jobs: Jobs, row: dict) -> None:
                     "(lease recovery)", repo, pr, exc)
         return
 
-    state = pr_state(token, repo, pr).split("\t")[0]
+    full_state = pr_state(token, repo, pr)
+    parsed = parse_pr_state(full_state)
+    if parsed is None:
+        # Empty (transient gh failure) OR a shape this parser does not know —
+        # fail closed (defect 8): never proceed when the lane skip could be
+        # silently disabled.  The job stays running for lease recovery.
+        log.warning("pr_state empty or unparseable for %s#%s — job stays running",
+                    repo, pr)
+        return
+    state, head_ref = parsed
+    if is_lane_branch(head_ref, cfg):
+        log.info("skip (lane branch %s, its lane's worker fixes it): %s#%s", head_ref, repo, pr)
+        jobs.resolve(row["id"], "no_change", worker_token=wtoken,
+                     payload=lane_skip_payload(head_ref))
+        return
     if state.upper() == "CLOSED" or state.upper() == "MERGED":
         log.info("skip (closed/merged): %s#%s", repo, pr)
         jobs.resolve(row["id"], "no_change", worker_token=wtoken,
@@ -920,8 +990,18 @@ def main() -> int:
             rows = jobs.peek_queued("builder", repo_filter=repo_filter,
                                     allowlist=cfg.repo_allowlist)
             for row in rows:
-                log.info("dry-run: would dispatch %s#%s round=%s attempt=%s",
-                         row["repo"], row["pr_number"], row["builder_round"], row["attempt"])
+                try:
+                    tok = repo_token(cfg, row["repo"],
+                                     (row.get("payload") or {}).get("installation_id"))
+                    parsed = parse_pr_state(
+                        pr_state(tok, row["repo"], row["pr_number"]))
+                    head_ref = parsed[1] if parsed else ""
+                except Exception:  # noqa: BLE001 — the dry run is read-only and never crashes
+                    head_ref = ""
+                verb = "would SKIP (lane branch)" if is_lane_branch(head_ref, cfg) else "would dispatch"
+                log.info("dry-run: %s %s#%s@%s round=%s branch=%s model=%s", verb,
+                         row["repo"], row["pr_number"], row.get("head_sha", "")[:8],
+                         row["builder_round"], head_ref, cfg.hermes_model)
             if once:
                 break
             time.sleep(POLL_SECS)  # sleep every iteration, not just when empty
@@ -1016,7 +1096,15 @@ def main() -> int:
 
             # Check PR is still open (defect 2 fix: empty = transient, retry;
             # GLM 8: never resolve transient failure as terminal 'failed').
-            state = pr_state(token, repo, pr).split("\t")[0]
+            parsed = parse_pr_state(pr_state(token, repo, pr))
+            state = parsed[0] if parsed else ""
+            head_ref = parsed[1] if parsed else ""
+            if is_lane_branch(head_ref, cfg):
+                jobs.resolve(row["id"], "no_change",
+                             worker_token=row.get("worker_token"),
+                             payload=lane_skip_payload(head_ref))
+                log.info("skip lane branch %s for %s#%s before pool submit", head_ref, repo, pr)
+                continue
             if state.upper() in ("CLOSED", "MERGED"):
                 jobs.resolve(row["id"], "no_change",
                              worker_token=row.get("worker_token"),

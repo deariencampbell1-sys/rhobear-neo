@@ -34,5 +34,20 @@ the product boundary: Reviews only reads + posts a verdict; Neo **writes and mer
 - `src/__main__.py` — webhook server + background worker queue.
 - `deploy/` — systemd unit, installer, Caddy snippet.
 
+## Environment
+Env-driven (`src/config.py`, no secrets baked in). The lane switches:
+- `NEO_LANE_MERGE` (default `false`) — under the default, lane PRs (`l<n>-<lane>/...`) HOLD without
+  an agent run or merge. To enable lane merges, the operator must set `NEO_LANE_MERGE=true` in the
+  Neo service environment and restart/reload Neo. A lane merge then requires Apollo's pass plus the
+  lane architect's acceptance of the exact head (an `architect/<lane>` commit status set from the
+  owner's account). This switch is independent of the per-install auto-merge toggle (L0, 2026-10-25).
+- `NEO_LANE_REQUIRE_DRIFT` (default `false`) — before restarting/reloading Neo, the operator may also
+  set `NEO_LANE_REQUIRE_DRIFT=true`; lane PRs then need L0's drift check (`l0/drift`) green on the
+  exact head as well (SPRINT section 9).
+- `NEO_LANE_EXCLUDE` (default empty) — comma-separated lane names that are NOT North Star lane
+  branches. The escape hatch for a branch that collides with the lane shape (`l1-hotfix/...`): an
+  excluded name gets the agent, the builder and the ordinary two-green merge authority instead of
+  being frozen with no writer.
+
 ## Deploy (on rhobear-vps)
 `.env` + `app-key.pem` must be present (chmod 600). Then: `bash deploy/install.sh`.

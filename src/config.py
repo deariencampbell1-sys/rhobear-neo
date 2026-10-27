@@ -204,6 +204,18 @@ class Config:
     # Off  -> drive to green, fix-forward, dispatch builder, label neo:ready, STOP.
     # On   -> also run the squash-merge itself.
     auto_merge_default: bool = field(default_factory=lambda: _get_bool("NEO_AUTO_MERGE", False))
+    # Lane PRs (l<n>-<lane>/...) merge on Apollo's pass plus the lane architect's acceptance of the exact
+    # head (lane_merge_authority), independent of the install switch above (L0, 2026-10-25).
+    lane_merge: bool = field(default_factory=lambda: _get_bool("NEO_LANE_MERGE", False))
+    # Lane PRs also need L0's drift check (status l0/drift) green on the exact head (SPRINT section 9).
+    lane_require_drift: bool = field(default_factory=lambda: _get_bool("NEO_LANE_REQUIRE_DRIFT", False))
+    # Operator escape hatch for non-lane branches that collide with the lane shape.
+    lane_exclude: tuple[str, ...] = field(
+        default_factory=lambda: tuple(
+            name.strip().lower() for name in _get("NEO_LANE_EXCLUDE", "").split(",")
+            if name.strip()
+        )
+    )
 
     # --- safety floors ---
     # Defaults to bounces_before_escalation (5): a smaller default would make

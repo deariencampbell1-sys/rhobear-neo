@@ -47,6 +47,73 @@ class MergeFailed(MergeError):
     """The merge API call failed for another reason."""
 
 
+class EvidenceReadError(MergeError):
+    """A paginated evidence read failed or could not prove completeness."""
+
+
+def read_evidence_pages(gh, token: str, endpoint: str, item_key: str | None, *,
+                        max_pages: int = 50) -> list[dict]:
+    """Read every item from a GitHub REST list, failing closed on gaps.
+
+    ``total_count`` is authoritative when present: only an exact item count
+    completes the read.  Without it, GitHub's short-page convention terminates
+    the list.  A full final page at ``max_pages`` is never treated as complete.
+    """
+    items: list[dict] = []
+    for page in range(1, max_pages + 1):
+        separator = "&" if "?" in endpoint else "?"
+        url = f"{endpoint}{separator}per_page=100&page={page}"
+        try:
+            rc, raw = gh(token, "api", url, timeout=30)
+        except Exception as exc:  # noqa: BLE001 — normalize transport failures
+            raise EvidenceReadError(
+                f"{endpoint} page {page}: exit/read failure ({type(exc).__name__})") from exc
+        if rc != 0:
+            raise EvidenceReadError(
+                f"{endpoint} page {page}: exit={rc}: {str(raw)[:200]}")
+        try:
+            parsed = json.loads(raw)
+            if item_key is None:
+                batch = parsed
+                # Compatibility with the former `gh --paginate --slurp` shape.
+                if batch and all(isinstance(entry, list) for entry in batch):
+                    batch = [entry for page_items in batch for entry in page_items]
+                total = None
+            else:
+                if not isinstance(parsed, dict):
+                    raise TypeError("response must be an object")
+                batch = parsed.get(item_key)
+                total = parsed.get("total_count")
+            if not isinstance(batch, list):
+                raise TypeError(f"{item_key or 'response'} must be a list")
+            if not all(isinstance(item, dict) for item in batch):
+                raise TypeError("every evidence item must be an object")
+            if total is not None and (
+                    isinstance(total, bool) or not isinstance(total, int) or total < 0):
+                raise TypeError("total_count must be a nonnegative integer")
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise EvidenceReadError(
+                f"{endpoint} page {page}: malformed response ({exc})") from exc
+
+        items.extend(batch)
+        if total is not None:
+            if len(items) > total:
+                raise EvidenceReadError(
+                    f"{endpoint} page {page}: incomplete read (over total_count={total})")
+            if len(items) == total:
+                return items
+            if not batch or len(batch) < 100:
+                raise EvidenceReadError(
+                    f"{endpoint} page {page}: incomplete read before total_count={total}")
+        elif len(batch) < 100:
+            return items
+
+        if page == max_pages:
+            raise EvidenceReadError(
+                f"{endpoint} page {page}: capped before completion was proven")
+    raise EvidenceReadError(f"{endpoint}: capped with an invalid page limit")
+
+
 def _gh(token: str, *args: str, timeout: int = 30) -> tuple[int, str]:
     """Run `gh` as the repo's installation token (never a personal token)."""
     import os
@@ -55,6 +122,92 @@ def _gh(token: str, *args: str, timeout: int = 30) -> tuple[int, str]:
         ["gh", *args], capture_output=True, text=True, env=env, timeout=timeout
     )
     return p.returncode, (p.stdout or p.stderr).strip()
+
+
+#: W1-07-r1: the two greens + the trusted red (the merge rule (b)-(d)).
+_RULE_FIELDS = ("green1_ok", "green2_ok", "trusted_red")
+
+
+def two_green_gate(evidence: dict) -> tuple[bool, str]:
+    """The merge rule (b)-(d) on the exact head SHA. Fails closed.
+
+    (b) green 1 — Apollo's review state is ACCEPT on this head SHA: a commit
+    status or check-run success is never enough, COMMENTED is not approval;
+    (c) green 2 — the architect's approval bound to this head SHA, or an
+    enabled trusted reviewer's success on it (either counts); (d) no enabled
+    trusted reviewer is failing or requesting changes on it.  Every fact is
+    bound to the head SHA, so any new push resets all three.
+    """
+    problems: list[str] = []
+    if evidence.get("trusted_reviewers_unreadable"):
+        problems.append("trusted reviewers unreadable — cannot prove no trusted reviewer is red")
+    if not evidence.get("green1_ok"):
+        problems.append("green 1 missing: Apollo's review is not ACCEPT on this "
+                        "exact head SHA (%s)" % (evidence.get("green1_reason")
+                                                 or "no review by Apollo on this head"))
+    red = [str(x) for x in (evidence.get("trusted_red") or [])]
+    if red:
+        problems.append("a trusted reviewer is red on this exact head: " + ", ".join(red))
+    if not evidence.get("green2_ok"):
+        problems.append("green 2 missing: " + (evidence.get("green2_reason")
+                        or "no architect approval and no enabled trusted reviewer "
+                           "green on this exact head"))
+    return (not problems, "; ".join(problems) or "two greens on this exact head")
+
+
+def has_rule_fields(evidence: dict) -> bool:
+    """One predicate for a bundle carrying any two-green rule fields."""
+    return any(k in evidence for k in _RULE_FIELDS)
+
+
+def pre_merge_belts(evidence: dict) -> tuple[bool, str]:
+    """The evidence belts EVERY merge path runs immediately before merging."""
+    if not evidence.get("ok"):
+        return False, f"evidence unavailable ({evidence.get('reason') or 'unknown'})"
+    if has_rule_fields(evidence):
+        ok, why = two_green_gate(evidence)
+        if not ok:
+            return False, why
+    if evidence.get("trusted_producer_ok") is False:
+        return False, "no trusted check run from the Reviews App on this exact head"
+    return True, "two greens on this exact head"
+
+
+def post_merge_comment(token: str, repo: str, pr: int, evidence: dict) -> None:
+    """Post the one merge comment AFTER a confirmed merge; never raises."""
+    if not has_rule_fields(evidence):
+        return
+    try:
+        rc, out = _gh(token, "pr", "comment", str(pr), "-R", repo,
+                      "--body", two_green_comment(evidence), timeout=30)
+    except Exception as exc:  # noqa: BLE001 — the merge stands regardless
+        log.warning("merge comment failed after the merge (%s) — the merge stands",
+                    type(exc).__name__)
+        return
+    if rc != 0:
+        log.warning("merge comment refused by GitHub after the merge: %s", out[:200])
+
+
+def two_green_comment(evidence: dict) -> str:
+    """The one merge comment (board `verdicts` 02): the two greens with links
+    and the CI summary — "Two greens on a91d2e0 / 1: Apollo ACCEPT / 2: Zeus
+    ACCEPT / CI: 6 of 6 checks passed" — posted right AFTER a successful
+    merge (W1-07-r2 defect 9)."""
+    head = str(evidence.get("head_sha") or evidence.get("decided_sha") or "")
+
+    def _line(n: int, label: str, url: str, at: str) -> str:
+        text = f"[{label}]({url})" if url else str(label)
+        when = f" · {str(at)[11:16]}" if at else ""
+        return f"{n}: {text}{when}"
+
+    return "\n".join([
+        f"Two greens on {head[:7]}",
+        _line(1, evidence.get("green1_label") or "Apollo ACCEPT",
+              str(evidence.get("green1_url") or ""), str(evidence.get("green1_at") or "")),
+        _line(2, evidence.get("green2_label") or "architect ACCEPT",
+              str(evidence.get("green2_url") or ""), str(evidence.get("green2_at") or "")),
+        f"CI: {evidence.get('ci_green', 0)} of {evidence.get('ci_total', 0)} checks passed",
+    ])
 
 
 def merge(
@@ -123,6 +276,13 @@ def merge(
         )
     if state != "open":
         raise MergeDenied(f"PR is not open (state={state})")
+    mergeable = str(data.get("mergeable") or "")
+    # UNKNOWN is GitHub recomputing mergeability, not a permanent refusal.
+    # Continue through the exact-head REST merge; its response is authoritative.
+    if mergeable not in ("MERGEABLE", "UNKNOWN"):
+        raise MergeDenied(f"PR is not mergeable (mergeable={data.get('mergeable')})")
+    if data.get("isCrossRepository") is not False:
+        raise MergeDenied("PR head is a fork or its repository is unknown")
 
     # --- Step 3: Verify evidence supports the merge ------------------------
     # Safety net (W1-13-r1 defect 6): run the SAME merge_authority gate the
@@ -153,6 +313,19 @@ def merge(
             raise MergeDenied(f"merge authority denied: {reason}")
     elif not evidence.get("ok"):
         raise MergeDenied(f"evidence unavailable ({evidence.get('reason', 'unknown')})")
+
+    # W1-07-r1 steps 3/5: the two-green merge rule runs AGAIN immediately
+    # before the merge API call (a new push since the wake resets both greens
+    # and is denied here).  The one merge comment (the two greens with links +
+    # the CI summary) is posted AFTER a successful merge (W1-07-r2 defect 9:
+    # posting it first left a stale "Two greens on <sha>" comment on every
+    # refused or moved-head merge, and a retry posted a duplicate).  A bundle
+    # without the rule's fields is the legacy {"ok", shas} mechanics shape
+    # contract-pinned in tests/test_merge_authority: nothing to consult here,
+    # so the W1-13 belt above applies unchanged.
+    granted, why = pre_merge_belts(evidence)
+    if not granted:
+        raise MergeDenied(f"merge authority denied: {why}")
 
     # --- Step 4: Execute the merge -----------------------------------------
     # REST merge API with sha=expected_sha: GitHub rejects with 422 if the
@@ -189,6 +362,12 @@ def merge(
 
     log.info("merged %s#%s at %s", repo, pr, expected_sha[:12])
 
+    # --- the one merge comment, post-merge (defect 9) ---------------------
+    # Only now, so a refused or moved-head merge leaves no stale comment.
+    # The merge is already confirmed: a refused comment is logged, never a
+    # failed merge.
+    post_merge_comment(token, repo, pr, evidence)
+
     # --- Step 5: delete the head branch -----------------------------------
     # The REST merge API never deletes the branch; gh's --delete-branch did it
     # client-side.  Best-effort only: the merge is already confirmed, so nothing
@@ -218,12 +397,9 @@ def _delete_head_branch(token: str, repo: str, pr: int, head_ref: str, cross_rep
             return
         if head_ref == default.strip():
             return
-        rc, others = _gh(token, "pr", "list", "-R", repo, "--head", head_ref, "--state", "open",
-                         "--limit", "1000", "--json", "number", "--jq", ".[].number", timeout=30)
-        if rc != 0:
-            log.warning("head branch %s for %s#%s kept: open-PR check failed", head_ref, repo, pr)
-            return
-        if any(line.strip() and line.strip() != str(pr) for line in others.splitlines()):
+        others = read_evidence_pages(
+            _gh, token, f"repos/{repo}/pulls?head={head_ref}&state=open", None)
+        if any(row.get("number") != pr for row in others):
             log.info("head branch %s for %s#%s kept: another open PR uses it", head_ref, repo, pr)
             return
         rc_del, out_del = _gh(token, "api", "-X", "DELETE",

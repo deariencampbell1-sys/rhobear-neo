@@ -22,6 +22,7 @@ No real GitHub / provider calls: all subprocesses and HTTP are fakes.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
@@ -71,6 +72,10 @@ def _branch_lookups(gh_args, default="main", other_prs=""):
         return 0, default
     if gh_args[:2] == ("pr", "list"):
         return 0, other_prs
+    if gh_args[:1] == ("api",) and len(gh_args) > 1 and \
+            gh_args[1].startswith("repos/acme/a/pulls?head="):
+        numbers = [int(line) for line in other_prs.splitlines() if line.strip()]
+        return 0, json.dumps([{"number": number} for number in numbers])
     return None
 
 
@@ -88,6 +93,7 @@ def _fake_gh_success(*args, **kw):
             "state": "OPEN",
             "mergeable": "MERGEABLE",
             "headRefName": "topic-branch",
+            "isCrossRepository": False,
             "reviews": [
                 {"body": "Looks good. COVERAGE: COMPLETE",
                  "commit_id": SHA1,
@@ -485,7 +491,7 @@ class TestMergeExecutor:
             if gh_args[:3] == ("pr", "view", "1"):
                 data = {"headRefOid": SHA1, "state": "OPEN",
                         "mergeable": "MERGEABLE",
-                        "headRefName": "topic-branch"}
+                        "headRefName": "topic-branch", "isCrossRepository": False}
                 return 0, json.dumps(data)
             if gh_args[0] == "api" and gh_args[3] == "repos/acme/a/pulls/1/merge":
                 calls.append(list(gh_args))
@@ -514,7 +520,7 @@ class TestMergeExecutor:
             gh_args = args
             if gh_args[:3] == ("pr", "view", "1"):
                 data = {"headRefOid": SHA1, "state": "OPEN",
-                        "mergeable": "MERGEABLE"}
+                        "mergeable": "MERGEABLE", "isCrossRepository": False}
                 return 0, json.dumps(data)
             if gh_args[0] == "api" and gh_args[3] == "repos/acme/a/pulls/1/merge":
                 return 1, "422: The provided sha is not the head sha of the pull request"
@@ -542,7 +548,7 @@ class TestMergeExecutor:
             if args[:3] == ("pr", "view", "1"):
                 return 0, json.dumps({"headRefOid": SHA1, "state": "OPEN",
                                       "mergeable": "MERGEABLE",
-                                      "headRefName": "topic-branch"})
+                                      "headRefName": "topic-branch", "isCrossRepository": False})
             if args[0] == "api" and args[3] == "repos/acme/a/pulls/1/merge":
                 raise subprocess.TimeoutExpired(cmd="gh", timeout=60)
             raise AssertionError(f"unexpected call: {args}")
@@ -569,7 +575,7 @@ class TestMergeBranchDeletion:
             if gh_args[:3] == ("pr", "view", "1"):
                 data = {"headRefOid": SHA1, "state": "OPEN",
                         "mergeable": "MERGEABLE",
-                        "headRefName": "topic-branch"}
+                        "headRefName": "topic-branch", "isCrossRepository": False}
                 return 0, json.dumps(data)
             if gh_args[0] == "api" and gh_args[3] == "repos/acme/a/pulls/1/merge":
                 return 0, json.dumps({"merged": True, "sha": "M" * 40})
@@ -598,7 +604,7 @@ class TestMergeBranchDeletion:
             if gh_args[:3] == ("pr", "view", "1"):
                 data = {"headRefOid": SHA1, "state": "OPEN",
                         "mergeable": "MERGEABLE",
-                        "headRefName": "topic-branch"}
+                        "headRefName": "topic-branch", "isCrossRepository": False}
                 return 0, json.dumps(data)
             if gh_args[0] == "api" and gh_args[3] == "repos/acme/a/pulls/1/merge":
                 return 0, json.dumps({"merged": True, "sha": "M" * 40})
@@ -647,31 +653,28 @@ class TestMergeBranchDeletion:
         assert result["merged"] is True
         assert deletes == []
 
-    def test_fork_pr_branch_is_not_deleted(self):
-        result, deletes = self._run(head_ref="someone:topic", cross=True)
-        assert result["merged"] is True
-        assert deletes == []
+    def test_fork_pr_is_refused_before_merge_or_deletion(self):
+        with pytest.raises(MergeDenied, match="fork"):
+            self._run(head_ref="someone:topic", cross=True)
 
     def test_unknown_default_branch_keeps_the_branch(self):
         result, deletes = self._run(default="")
         assert result["merged"] is True
         assert deletes == []
 
-    def test_open_pr_check_is_not_capped_at_30(self):
-        """gh pr list returns 30 rows by default; a shared branch's older PR
-        beyond that cap must still be seen, so the check asks for more."""
+    def test_open_pr_check_uses_complete_pagination(self):
+        """The shared-branch safety read uses the same 100-row pager as evidence."""
         seen: list = []
         orig = _branch_lookups
 
         def spy(args, *a, **k):
-            if args[:2] == ("pr", "list"):
+            if args[:1] == ("api",) and len(args) > 1 and "/pulls?head=" in args[1]:
                 seen.append(args)
             return orig(args, *a, **k)
 
         with patch(f"{__name__}._branch_lookups", side_effect=spy):
             self._run()
-        assert seen and "--limit" in seen[0], seen
-        assert int(seen[0][seen[0].index("--limit") + 1]) >= 1000, seen
+        assert seen and "per_page=100&page=1" in seen[0][1], seen
 
     def test_own_branch_is_deleted_when_only_this_pr_uses_it(self):
         result, deletes = self._run(other_prs="1")
@@ -694,7 +697,8 @@ class TestMergeBranchDeletion:
             gh_args = args
             if gh_args[:3] == ("pr", "view", "1"):
                 data = {"headRefOid": SHA1, "state": "OPEN",
-                        "mergeable": "MERGEABLE", "headRefName": ""}
+                        "mergeable": "MERGEABLE", "headRefName": "",
+                        "isCrossRepository": False}
                 return 0, json.dumps(data)
             if gh_args[0] == "api" and gh_args[3] == "repos/acme/a/pulls/1/merge":
                 return 0, json.dumps({"merged": True, "sha": "M" * 40})
@@ -1751,3 +1755,836 @@ class TestConfigDefaults:
         except ValueError as exc:
             assert "max_builder_rounds" not in str(exc).lower()
             assert "NEO_MAX_BUILDER_ROUNDS" not in str(exc)
+
+
+# ---------------------------------------------------------------------------
+# W1-07-r1 — the two greens on the exact head (the merge rule (b)-(d))
+#
+# Board `merge-authority` v7 / `trusted` / `verdicts`:
+#   green 1: Apollo ACCEPT on the head commit — always required
+#   green 2: the repo's own merge authority — architect approval bound to the
+#            exact head, OR a trusted reviewer's green. Either one counts.
+#   a trusted reviewer that is red always blocks; a new push resets all of it.
+# ---------------------------------------------------------------------------
+
+W1_OWNER = "deariencampbell1-sys"
+W1_LANE_REPO = f"{W1_OWNER}/rhobear-neo"
+
+
+def _review(state, oid=SHA1, author="rhobear-reviews[bot]",
+            at="2026-10-26T11:52:00Z", author_type="Bot"):
+    return {"state": state, "commit": {"oid": oid},
+            "author": {"login": author, "type": author_type},
+            "submittedAt": at, "body": "verdict: ACCEPT",
+            "url": f"https://github.com/acme/a/pull/5#pullrequestreview-{state}"}
+
+
+def _status(context, state="success", login=None, created="2026-10-26T11:50:00Z",
+            creator_type="Bot"):
+    if login is None:
+        login = (W1_OWNER if context == "rhobear-reviews" or context.startswith("architect/")
+                 else f"{context}[bot]")
+    return {"context": context, "state": state,
+            "creator": {"login": login, "type": creator_type},
+            "created_at": created, "target_url": f"https://ci.example/{context}"}
+
+
+def _greens(*, repo="acme/a", reviews=None, statuses=None, rollup=None,
+            enabled=(), sha=SHA1, check_runs=None):
+    from src import neo_worker
+    return neo_worker._green_fields(Config(), repo, sha,
+                                    reviews or [], statuses or [], rollup or [], enabled,
+                                    check_runs or [])
+
+
+def _bundle(greens, **over):
+    ev = {"ok": True, "head_sha": SHA1, "decided_sha": SHA1, "review_bound_ok": True,
+          "trusted_green": True, "trusted_states": ["success"],
+          "trusted_producer_ok": True, "review_sha_match": True,
+          "required_checks_pass": True, "unresolved_critical_high": 0,
+          "coverage_complete": True, "auto_merge": True,
+          "failing_checks": 0}
+    ev.update(greens)
+    ev.update(over)
+    return ev
+
+
+def _authority(ev, install_auto_merge=True):
+    from src import neo_worker
+    from src.jev_review import JevAssessment
+    return neo_worker.merge_authority(install_auto_merge, ev,
+                                      JevAssessment(False, reason="no key"))
+
+
+@pytest.mark.parametrize(("signal", "expected"), [
+    ({"name": "CodeAnt", "conclusion": "SUCCESS",
+      "app": {"slug": "codeant-ai"}}, True),
+    ({"name": "CodeAnt", "conclusion": "SUCCESS",
+      "app": {"slug": "mallory"}}, False),
+    (_status("CodeAnt", login="CodeAnt[bot]", creator_type="Bot"), True),
+    (_status("CodeAnt", login="CodeAnt", creator_type="User"), False),
+    (_review("APPROVED", author="CodeAnt[bot]", author_type="Bot"), True),
+    (_review("APPROVED", author="CodeAnt", author_type="User"), False),
+], ids=("real-app-check", "user-look-alike-check", "bot-status",
+        "user-status", "bot-review", "user-review"))
+def test_green2b_requires_reviewer_identity_not_just_name(signal, expected):
+    kind = "review" if "author" in signal else "status" if "context" in signal else "check"
+    greens = _greens(enabled=("CodeAnt",),
+                     reviews=[signal] if kind == "review" else [],
+                     statuses=[signal] if kind == "status" else [],
+                     check_runs=[signal] if kind == "check" else [])
+    assert greens["green2_ok"] is expected, greens
+
+
+def test_user_codeant_status_never_makes_pr_green_end_to_end():
+    greens = _greens(enabled=("CodeAnt",),
+                     statuses=[_status("CodeAnt", login="CodeAnt", creator_type="User"),
+                               _status("rhobear-reviews")],
+                     reviews=[_review("APPROVED")])
+    assert greens["green1_ok"] is True
+    assert greens["green2_ok"] is False
+    ok, reason = _authority(_bundle(greens))
+    assert not ok and "green 2" in reason
+
+
+def test_green2b_uses_newest_status_per_context():
+    statuses = [_status("CodeAnt", login="CodeAnt[bot]", created="2026-10-26T11:50:00Z"),
+                _status("CodeAnt", "failure", login="CodeAnt[bot]",
+                        created="2026-10-26T12:00:00Z")]
+    greens = _greens(enabled=("CodeAnt",), statuses=statuses)
+    assert greens["green2_ok"] is False
+    assert any("CodeAnt" in red for red in greens["trusted_red"])
+
+
+def test_two_greens_codeant_and_apollo_merge():
+    """CodeAnt green + Apollo ACCEPT on the exact head merges (owner Q5)."""
+    greens = _greens(enabled=("CodeAnt",),
+                     statuses=[_status("CodeAnt"), _status("rhobear-reviews")],
+                     reviews=[_review("APPROVED")])
+    ok, reason = _authority(_bundle(greens))
+    assert ok is True, reason
+
+
+def test_apollo_alone_is_not_enough():
+    """Apollo ACCEPT is green 1 — never enough on its own."""
+    greens = _greens(enabled=(), statuses=[_status("rhobear-reviews")],
+                     reviews=[_review("APPROVED")])
+    ok, reason = _authority(_bundle(greens))
+    assert ok is False
+    assert "green 2" in reason, reason
+
+
+def test_disabled_codeant_does_not_count():
+    """A disabled trusted reviewer's green does not count (the toggle)."""
+    greens = _greens(enabled=(), statuses=[_status("CodeAnt"), _status("rhobear-reviews")],
+                     reviews=[_review("APPROVED")])
+    assert greens["green2_ok"] is False
+    ok, reason = _authority(_bundle(greens))
+    assert ok is False and "green 2" in reason, reason
+    # ...and the same green counts the moment the customer turns it on.
+    on = _greens(enabled=("CodeAnt",),
+                 statuses=[_status("CodeAnt"), _status("rhobear-reviews")],
+                 reviews=[_review("APPROVED")])
+    assert _authority(_bundle(on))[0] is True
+
+
+def test_trusted_reviewer_red_blocks():
+    """A trusted reviewer that is red always blocks, even with Apollo's ACCEPT
+    (board `verdicts`: "Zeus will not merge #46 even with Apollo's ACCEPT")."""
+    greens = _greens(enabled=("CodeAnt",),
+                     statuses=[_status("CodeAnt", "failure"), _status("rhobear-reviews")],
+                     reviews=[_review("APPROVED")])
+    ok, reason = _authority(_bundle(greens))
+    assert ok is False and "red" in reason and "CodeAnt" in reason, reason
+    # REQUEST CHANGES from a trusted reviewer blocks too.
+    greens = _greens(enabled=("Greptile",),
+                     statuses=[_status("rhobear-reviews")],
+                     reviews=[_review("APPROVED"),
+                              _review("CHANGES_REQUESTED", author="greptile[bot]")])
+    ok, reason = _authority(_bundle(greens))
+    assert ok is False and "red" in reason and "greptile" in reason, reason
+
+
+def test_new_push_resets_the_greens():
+    """Any new push resets both greens: everything here is bound to the head."""
+    greens = _greens(enabled=("CodeAnt",), statuses=[],
+                     reviews=[_review("APPROVED", oid=SHA2)])
+    assert greens["green1_ok"] is False and greens["green2_ok"] is False
+    ok, reason = _authority(_bundle(greens))
+    assert ok is False, reason
+
+
+def test_production_74_is_refused_naming_the_missing_green():
+    """Production #74 (reviews-app, f0820bc, 2026-10-25): Apollo's review was
+    COMMENTED and the only green was one rhobear-reviews status — Zeus merged
+    it on a bare status green. Refused here, and the reason names the missing
+    green(s)."""
+    greens = _greens(enabled=(), reviews=[_review("COMMENTED")],
+                     statuses=[_status("rhobear-reviews")],
+                     rollup=[{"context": "rhobear-reviews", "state": "success"}])
+    ok, reason = _authority(_bundle(greens, trusted_producer_ok=False))
+    assert ok is False
+    assert "green 1" in reason and "green 2" in reason, reason
+    assert "COMMENTED" in reason, reason
+
+
+def test_lane_repo_never_merges_without_architect_approval_on_the_exact_head():
+    """A lane repo (rhobear-neo) with auto-merge ON still refuses without
+    architect approval on the exact head — no bare status green, ever."""
+    greens = _greens(repo=W1_LANE_REPO, reviews=[_review("APPROVED")], statuses=[],
+                     enabled=())
+    ok, reason = _authority(_bundle(greens), install_auto_merge=True)
+    assert ok is False
+    assert "architect" in reason, reason
+
+
+def test_absent_check_is_not_green():
+    """Apollo green, architect status absent — no merge; the reason names the
+    missing status. A missing check counts as NOTHING (never as passing)."""
+    greens = _greens(reviews=[_review("APPROVED")], statuses=[], enabled=())
+    assert greens["green2_ok"] is False
+    assert "architect" in greens["green2_reason"], greens["green2_reason"]
+    ok, reason = _authority(_bundle(greens))
+    assert ok is False and "green 2" in reason, reason
+
+
+def test_merge_requires_exact_head():
+    """A review on a parent commit is not green for the head."""
+    greens = _greens(reviews=[_review("APPROVED", oid=SHA2)],
+                     statuses=[_status("architect/l3-kit")], enabled=())
+    assert greens["green1_ok"] is False
+    ok, reason = _authority(_bundle(greens))
+    assert ok is False and "green 1" in reason, reason
+
+
+def test_architect_approval_counts_as_green_2_on_the_exact_head():
+    """The architect's ACCEPT bound to the exact head is green 2 on its own
+    (board `merge-authority` v7: "either one counts")."""
+    greens = _greens(repo=W1_LANE_REPO, reviews=[_review("APPROVED")],
+                     statuses=[_status("architect/l1-reviews")], enabled=())
+    assert greens["green2_ok"] is True and greens["green2_kind"] == "architect"
+    ok, reason = _authority(_bundle(greens), install_auto_merge=True)
+    assert ok is True, reason
+
+
+def test_architect_green_never_hides_a_red_trusted_reviewer():
+    greens = _greens(repo=W1_LANE_REPO, reviews=[_review("APPROVED")],
+                     statuses=[_status("architect/l1-reviews"), _status("CodeAnt", "failure")],
+                     enabled=("CodeAnt",))
+    assert greens["green2_ok"] is True
+    assert greens["green2_kind"] == "architect"
+    assert len(greens["trusted_red"]) == 1
+    assert "CodeAnt" in greens["trusted_red"][0]
+    ok, reason = _authority(_bundle(greens))
+    assert ok is False and "CodeAnt" in reason, reason
+
+
+def test_apollo_green_one_requires_the_real_bot_identity():
+    greens = _greens(repo=W1_LANE_REPO,
+                     reviews=[_review("APPROVED", author="rhobear-reviews", author_type="User")],
+                     statuses=[_status("architect/l1-reviews")])
+    assert greens["green1_ok"] is False
+    assert greens["green2_ok"] is True
+    ok, reason = _authority(_bundle(greens))
+    assert ok is False and "green 1" in reason, reason
+
+
+def test_a_reviewer_with_review_and_status_counts_once():
+    """An outside reviewer with both a review and a status is one green —
+    counted once, not twice."""
+    greens = _greens(enabled=("CodeAnt",),
+                     statuses=[_status("CodeAnt")],
+                     reviews=[_review("APPROVED", author="CodeAnt[bot]")])
+    assert greens["green2_ok"] is True
+    assert len(greens["trusted_seen"]) == 1, greens["trusted_seen"]
+    comment_lines = [ln for ln in _merge_comment(_bundle(greens)).splitlines()
+                     if ln.startswith(("1:", "2:"))]
+    assert len(comment_lines) == 2, comment_lines
+
+
+def _merge_comment(evidence):
+    from src import merge_executor
+    return merge_executor.two_green_comment(evidence)
+
+
+def test_merge_comment_lists_both_greens_with_links_and_ci_summary():
+    """The one merge comment (board `verdicts` 02): the two greens with links
+    and the CI summary, posted AFTER the merge (W1-07-r2 defect 9)."""
+    greens = _greens(enabled=("CodeAnt",),
+                     statuses=[_status("CodeAnt"), _status("rhobear-reviews")],
+                     reviews=[_review("APPROVED")],
+                     rollup=[{"context": "rhobear-reviews", "state": "success"},
+                             {"name": "CodeAnt", "conclusion": "SUCCESS"}])
+    body = _merge_comment(_bundle(greens))
+    assert body.startswith(f"Two greens on {SHA1[:7]}"), body
+    assert "1: " in body and "Apollo ACCEPT" in body
+    assert "2: " in body and "CodeAnt passed (trusted)" in body
+    assert "CI: 2 of 2 checks passed" in body, body
+    assert "#pullrequestreview-APPROVED" in body, body          # green 1 link
+    assert "https://ci.example/CodeAnt" in body, body           # green 2 link
+    assert "11:52" in body and "11:50" in body, body            # times
+
+
+def test_merge_rechecks_the_two_green_gate_immediately_before_the_merge():
+    """merge() re-runs the same gate immediately before the merge API call —
+    a bundle missing a green never reaches the merge call (step 5)."""
+    greens = _greens(enabled=(), statuses=[_status("rhobear-reviews")],
+                     reviews=[_review("COMMENTED")])
+    ev = _bundle(greens)
+    calls = []
+
+    def fake_gh(token, *args, **kw):
+        calls.append(args)
+        if args[:3] == ("pr", "view", "5"):
+            return 0, json.dumps({"headRefOid": SHA1, "state": "OPEN",
+                                  "mergeable": "MERGEABLE", "headRefName": "topic",
+                                  "isCrossRepository": False})
+        raise AssertionError(f"unexpected call: {args}")
+
+    with patch("src.merge_executor._gh", side_effect=fake_gh):
+        with pytest.raises(MergeDenied) as exc:
+            merge("o/r", 5, SHA1, ev, "tok")
+    assert "green 1" in str(exc.value), exc.value
+    assert not [c for c in calls if "PUT" in c], calls
+    assert not [c for c in calls if c[:2] == ("pr", "comment")], calls
+
+
+def test_merge_merges_then_posts_the_comment():
+    """Two greens present: the merge goes first, then the one comment is
+    posted (W1-07-r2 defect 9: posting the comment first left a stale
+    'Two greens on <sha>' comment on every refused merge)."""
+    greens = _greens(enabled=("CodeAnt",),
+                     statuses=[_status("CodeAnt"), _status("rhobear-reviews")],
+                     reviews=[_review("APPROVED")])
+    ev = _bundle(greens)
+    calls = []
+
+    def fake_gh(token, *args, **kw):
+        calls.append(args)
+        if args[:3] == ("pr", "view", "5"):
+            return 0, json.dumps({"headRefOid": SHA1, "state": "OPEN",
+                                  "mergeable": "MERGEABLE", "headRefName": "topic",
+                                  "isCrossRepository": False})
+        if args[:2] == ("pr", "comment"):
+            return 0, "{}"
+        if args[:2] == ("api", "-X") and "PUT" in args:
+            return 0, json.dumps({"merged": True, "sha": "M" * 40})
+        if args[:2] == ("api", "-X") and "DELETE" in args:
+            return 0, ""
+        return 0, "main"
+
+    with patch("src.merge_executor._gh", side_effect=fake_gh):
+        result = merge("o/r", 5, SHA1, ev, "tok")
+    assert result["merged"] is True
+    kinds = ["comment" if c[:2] == ("pr", "comment") else
+             "merge" if ("PUT" in c and "-X" in c) else "other" for c in calls]
+    assert "comment" in kinds and "merge" in kinds
+    assert kinds.index("merge") < kinds.index("comment"), kinds
+
+
+def test_newest_status_per_trusted_context_decides():
+    """Defect 3: the collector took the UNION of every trusted status on the
+    head — one failing status that a later re-run drove to success kept the PR
+    red forever. The newest status per trusted context decides."""
+    from src import neo_worker
+
+    cfg = Config()
+    cfg.trusted_reviewer_app_id = "12345"
+    statuses = [
+        {"context": "rhobear-reviews", "state": "success",
+         "created_at": "2026-10-26T11:55:00Z"},
+        {"context": "rhobear-reviews", "state": "failure",
+         "created_at": "2026-10-26T11:50:00Z"},   # the run that was re-driven
+    ]
+
+    def fake_gh(token, *args, timeout=30):
+        if args[:2] == ("pr", "view"):
+            return 0, json.dumps({"headRefOid": SHA1, "headRefName": "topic",
+                                  "reviews": [],
+                                  "statusCheckRollup": [
+                                      {"__typename": "StatusContext",
+                                       "context": "rhobear-reviews", "state": "SUCCESS",
+                                       "createdAt": "2026-10-26T11:55:00Z"}]})
+        if args[0] == "api" and "/check-runs" in args[1]:
+            return 0, json.dumps({"total_count": 0, "check_runs": []})
+        if args[0] == "api" and "/pulls/5/reviews" in args[1]:
+            return 0, "[]"
+        if args[0] == "api" and "/status" in args[1]:
+            return 0, json.dumps({"total_count": len(statuses), "statuses": statuses})
+        raise AssertionError(f"unexpected gh call {args}")
+
+    with patch("src.neo_worker._gh", side_effect=fake_gh):
+        ev = neo_worker._review_evidence("tok", cfg, "acme/a", 5, SHA1)
+    assert ev["trusted_states"] == ["success"], ev["trusted_states"]
+    assert ev["trusted_green"] is True
+
+    # ...and a fresh failure on top of an old success keeps it red (the newest
+    # status of the context decides in both directions).
+    statuses[:] = [
+        {"context": "rhobear-reviews", "state": "failure",
+         "created_at": "2026-10-26T12:00:00Z"},
+        {"context": "rhobear-reviews", "state": "success",
+         "created_at": "2026-10-26T11:50:00Z"},
+    ]
+    with patch("src.neo_worker._gh", side_effect=fake_gh):
+        ev = neo_worker._review_evidence("tok", cfg, "acme/a", 5, SHA1)
+    assert ev["trusted_states"] == ["failure"], ev["trusted_states"]
+    assert ev["trusted_green"] is False
+
+
+def test_a_review_by_a_prefix_login_is_never_a_trusted_green():
+    """End-to-end (W1-07-r2 defect 1, CRITICAL): a review by GitHub login
+    `apol` on the exact head, with no architect status, must leave
+    green2_ok False. A prefix of the trusted source's name is a DIFFERENT
+    GitHub account — it must never produce the green that authorises a merge."""
+    greens = _greens(enabled=("apollo",),
+                     reviews=[_review("APPROVED", author="apol")],
+                     statuses=[])
+    assert greens["green2_ok"] is False, greens
+    assert greens["green1_ok"] is False, greens
+    ok, reason = _authority(_bundle(greens))
+    assert ok is False, reason
+
+
+def test_a_red_reviewer_after_a_green_one_still_refuses_the_merge():
+    """Defect 2 (HIGH): green 2b `break`ed on the first enabled green, so a
+    red reviewer sorted after a green one was never collected into
+    trusted_red and rule (d) ("no enabled trusted reviewer is red on this
+    head") failed open on merge authority.  Both source orders refuse and
+    name z-red."""
+    for sources in (("a-green", "z-red"), ("z-red", "a-green")):
+        greens = _greens(enabled=sources,
+                         statuses=[_status("a-green"),
+                                   _status("z-red", "failure")],
+                         reviews=[_review("APPROVED")])
+        assert any("z-red" in r for r in greens["trusted_red"]), (sources, greens)
+        assert greens["green2_ok"] is False, (sources, greens)
+        ok, reason = _authority(_bundle(greens))
+        assert ok is False, (sources, reason)
+        assert "z-red" in reason, (sources, reason)
+
+
+def test_an_architect_status_from_a_non_owner_account_is_refused():
+    """Defect 4 (HIGH): the "architect status from the owner's account" branch
+    had only a positive test. On the non-lane merge path, an architect status
+    success set by a NON-OWNER account is refused: green2_ok False with a
+    reason naming the creator rule (it must be set from the owner's account).
+    Both the always-architect lane repo and the enabled-source route refuse.
+    The positive case (test_architect_approval_counts_as_green_2_on_the_exact_head)
+    stays green."""
+    for repo, enabled in ((W1_LANE_REPO, ()), ("acme/a", ("architect",))):
+        greens = _greens(repo=repo, reviews=[_review("APPROVED")],
+                         statuses=[_status("architect/l1-reviews", login="mallory")],
+                         enabled=enabled)
+        assert greens["green2_ok"] is False, (repo, greens)
+        assert "owner's account" in greens["green2_reason"], greens["green2_reason"]
+        ok, reason = _authority(_bundle(greens), install_auto_merge=True)
+        assert ok is False, (repo, reason)
+
+
+def test_missing_architect_creator_is_not_an_owner_match():
+    from src import neo_worker
+
+    cfg = dataclasses.replace(Config(), owner_install_id="")
+    with_empty_login = _status("architect/l1-reviews", login="")
+    without_creator = {key: value for key, value in with_empty_login.items() if key != "creator"}
+    for status in (with_empty_login, without_creator):
+        greens = neo_worker._green_fields(
+            cfg, W1_LANE_REPO, SHA1, [_review("APPROVED")], [status], [], ())
+        assert greens["green2_ok"] is False, greens
+        assert "owner's account" in greens["green2_reason"], greens["green2_reason"]
+
+
+def test_a_review_with_no_author_is_never_apollos():
+    """Defect 5 (MEDIUM): an empty/missing review author fell open — the
+    green-1 loop skipped the Apollo check for a falsy author and chose the
+    nameless review as Apollo's ACCEPT. Empty, None and whitespace authors
+    never match any source."""
+    for author in ("", None, "   "):
+        greens = _greens(enabled=(),
+                         statuses=[_status("rhobear-reviews")],
+                         reviews=[_review("APPROVED", author=author)])
+        assert greens["green1_ok"] is False, (repr(author), greens)
+        ok, reason = _authority(_bundle(greens))
+        assert ok is False, (repr(author), reason)
+
+
+def test_created_at_instants_are_compared_as_instants_not_strings():
+    """Defect 7 (MEDIUM): the newest-status-per-context collector compared
+    created_at as strings, so mixed Z / +offset timestamps sorted
+    lexicographically wrong and the OLDER status could win.  Parse to aware
+    datetimes (Z -> +00:00) and compare those; a value that cannot be parsed
+    sorts LAST (never wins).  12:00+05:00 is 07:00Z — older than 10:00Z."""
+    from src import neo_worker
+
+    cfg = Config()
+    cfg.trusted_reviewer_app_id = "12345"
+    newer = {"context": "rhobear-reviews", "state": "success",
+             "created_at": "2026-10-26T10:00:00Z"}
+    older = {"context": "rhobear-reviews", "state": "failure",
+             "created_at": "2026-10-26T12:00:00+05:00"}
+    unparsable = {"context": "rhobear-reviews", "state": "failure",
+                  "created_at": "not-a-timestamp"}
+
+    def run(statuses):
+        def fake_gh(token, *args, timeout=30):
+            if args[:2] == ("pr", "view"):
+                return 0, json.dumps({"headRefOid": SHA1, "headRefName": "topic",
+                                      "reviews": [], "statusCheckRollup": []})
+            if args[0] == "api" and "/check-runs" in args[1]:
+                return 0, json.dumps({"total_count": 0, "check_runs": []})
+            if args[0] == "api" and "/pulls/5/reviews" in args[1]:
+                return 0, "[]"
+            if args[0] == "api" and "/status" in args[1]:
+                return 0, json.dumps({"total_count": len(statuses),
+                                      "statuses": statuses})
+            raise AssertionError(f"unexpected gh call {args}")
+
+        with patch("src.neo_worker._gh", side_effect=fake_gh):
+            return neo_worker._review_evidence("tok", cfg, "acme/a", 5, SHA1)
+
+    # Mixed timezones, both orders: the true newest (10:00Z) wins.
+    for statuses in ([newer, older], [older, newer]):
+        ev = run(statuses)
+        assert ev["trusted_states"] == ["success"], (statuses, ev["trusted_states"])
+
+    # An unparseable created_at sorts last and never wins, both orders.
+    for statuses in ([unparsable, newer], [newer, unparsable]):
+        ev = run(statuses)
+        assert ev["trusted_states"] == ["success"], (statuses, ev["trusted_states"])
+
+
+def test_a_refused_merge_posts_no_two_greens_comment():
+    """Defect 9 (LOW): the merge comment was posted BEFORE the merge, so a
+    refused or moved-head merge left a stale "Two greens on <sha>" comment
+    and a retry posted a duplicate.  Decision (W1-07-r2): the comment is
+    posted AFTER a successful merge — a refused merge leaves NO comment."""
+    greens = _greens(enabled=("CodeAnt",),
+                     statuses=[_status("CodeAnt"), _status("rhobear-reviews")],
+                     reviews=[_review("APPROVED")])
+    ev = _bundle(greens)
+    calls = []
+
+    def fake_gh(token, *args, **kw):
+        calls.append(args)
+        if args[:3] == ("pr", "view", "5"):
+            return 0, json.dumps({"headRefOid": SHA1, "state": "OPEN",
+                                  "mergeable": "MERGEABLE", "headRefName": "topic",
+                                  "isCrossRepository": False})
+        if args[:2] == ("pr", "comment"):
+            return 0, "{}"
+        if args[:2] == ("api", "-X") and "PUT" in args:
+            return 1, "Protected branch hook declined: pull request is not mergeable"
+        raise AssertionError(f"unexpected call: {args}")
+
+    with patch("src.merge_executor._gh", side_effect=fake_gh):
+        with pytest.raises((MergeDenied, MergeFailed)):
+            merge("o/r", 5, SHA1, ev, "tok")
+    assert not [c for c in calls if c[:2] == ("pr", "comment")], \
+        f"a refused merge must leave no comment, got: {calls}"
+
+
+def test_lane_or_unreadable_head_branch_never_merges_under_the_non_lane_rule():
+    """A lane or unreadable head branch may never skip the lane architect and
+    drift gates by using the non-lane two-greens rule."""
+    greens = _greens(enabled=("CodeAnt",),
+                     statuses=[_status("CodeAnt"), _status("rhobear-reviews")],
+                     reviews=[_review("APPROVED")])
+    ok, reason = _authority(_bundle(greens, head_ref="l3-kit/buttons"))
+    assert ok is False and "lane" in reason, reason
+    ok, reason = _authority(_bundle(greens, head_ref=""))
+    assert ok is False and "head branch unavailable" in reason
+
+def test_platform_owner_install_id_never_counts_on_a_customer_repo():
+    greens = _greens(repo="acme/a", enabled=("architect",), reviews=[_review("APPROVED")],
+                     statuses=[_status("architect/l1-reviews", login=W1_OWNER)])
+    assert greens["green2_ok"] is False
+    assert "owner's account" in greens["green2_reason"]
+    ok, reason = _authority(_bundle(greens))
+    assert ok is False and "green 2" in reason
+    positive = _greens(repo=W1_LANE_REPO, enabled=("architect",), reviews=[_review("APPROVED")],
+                       statuses=[_status("architect/l1-reviews", login=W1_OWNER)])
+    assert positive["green2_ok"] is True
+    assert positive["green2_kind"] == "architect"
+
+def test_green_one_is_order_independent_across_review_lists():
+    older = _review("APPROVED", at="2026-10-26T11:00:00Z")
+    newer = _review("CHANGES_REQUESTED", at="2026-10-26T12:00:00Z")
+    for order in ([older, newer], [newer, older]):
+        greens = _greens(reviews=order, statuses=[], enabled=())
+        assert greens["green1_ok"] is False
+        assert greens["green1_reason"] == "CHANGES_REQUESTED"
+
+def test_a_partial_rule_bundle_still_runs_the_gate_before_the_merge():
+    ev = {"ok": True, "head_sha": SHA1, "decided_sha": SHA1,
+          "trusted_red": ["CodeAnt (failure)"]}
+    def fake_gh(token, *args, timeout=30):
+        if args[:3] == ("pr", "view", "5"):
+            return 0, json.dumps({"headRefOid": SHA1, "state": "OPEN",
+                                  "mergeable": "MERGEABLE", "isCrossRepository": False})
+        raise AssertionError(f"unexpected gh call {args}")
+    with patch("src.merge_executor._gh", fake_gh):
+        with pytest.raises(MergeDenied, match="trusted reviewer is red"):
+            merge("o/r", 5, SHA1, ev, "tok")
+
+
+def test_customer_architect_is_enabled_without_a_trusted_reviewer_row():
+    greens = _greens(repo="acme/a", enabled=(), reviews=[_review("APPROVED")],
+                     statuses=[_status("architect/l1-reviews", login="acme")])
+    assert greens["green2_ok"] is True
+    assert greens["green2_kind"] == "architect"
+
+
+def _refusal_pr_view(calls, **over):
+    data = {"headRefOid": SHA1, "state": "OPEN", "mergeable": "MERGEABLE",
+            "headRefName": "topic", "isCrossRepository": False}
+    data.update(over)
+
+    def fake_gh(token, *args, timeout=30):
+        calls.append(args)
+        if args[:3] == ("pr", "view", "5"):
+            return 0, json.dumps(data)
+        if args[:2] == ("api", "-X") and "PUT" in args:
+            return 0, json.dumps({"merged": True, "sha": SHA1})
+        if args[:2] == ("pr", "comment"):
+            return 0, "{}"
+        return 0, "main"
+    return fake_gh
+
+
+def test_merge_refuses_a_fork_before_api():
+    calls = []
+    with patch("src.merge_executor._gh", _refusal_pr_view(calls, isCrossRepository=True)):
+        with pytest.raises(MergeDenied, match="fork"):
+            merge("o/r", 5, SHA1, {"ok": True}, "tok")
+    assert not any("PUT" in c for c in calls)
+    assert not any(c[:2] == ("pr", "comment") for c in calls)
+
+
+def test_merge_refuses_a_non_mergeable_pr_before_api():
+    calls = []
+    with patch("src.merge_executor._gh", _refusal_pr_view(calls, mergeable="CONFLICTING")):
+        with pytest.raises(MergeDenied, match="mergeable"):
+            merge("o/r", 5, SHA1, {"ok": True}, "tok")
+    assert not any("PUT" in c for c in calls)
+    assert not any(c[:2] == ("pr", "comment") for c in calls)
+
+
+def test_every_check_run_from_a_trusted_app_decides_red():
+    passed = {"name": "CodeAnt Review", "conclusion": "SUCCESS",
+              "app": {"slug": "codeant-ai"}}
+    failed = {"name": "CodeAnt Security", "conclusion": "FAILURE",
+              "app": {"slug": "codeant-ai"}}
+    for runs in ([passed, failed], [failed, passed]):
+        greens = _greens(enabled=("CodeAnt",), check_runs=runs)
+        assert greens["green2_ok"] is False, greens
+        assert any("CodeAnt Security (failure)" in red
+                   for red in greens["trusted_red"]), greens
+
+
+def test_green_one_bot_type_comes_from_the_node_id_match():
+    from src import neo_worker
+    review = {"id": "PRR_real_user", "author": {"login": "rhobear-reviews"}}
+    rows = [
+        {"node_id": "PRR_real_user",
+         "user": {"login": "rhobear-reviews", "type": "User"}},
+        {"node_id": "PRR_real_bot",
+         "user": {"login": "rhobear-reviews[bot]", "type": "Bot"}},
+    ]
+    with patch.object(neo_worker, "_reviewer_rows", return_value=rows):
+        annotated = neo_worker._reviews_with_bot_types(
+            "tok", "acme/a", 5, [review])
+    assert annotated[0]["author"]["type"] == "User"
+
+
+def test_unknown_mergeability_uses_the_exact_head_merge_api():
+    calls = []
+    with patch("src.merge_executor._gh",
+               _refusal_pr_view(calls, mergeable="UNKNOWN")):
+        result = merge("o/r", 5, SHA1, {"ok": True}, "tok")
+    assert result["merged"] is True
+    assert any("PUT" in c for c in calls)
+
+
+def test_merge_authority_without_cfg_honours_lane_exclusion(monkeypatch):
+    from src import neo_worker
+    from src.jev_review import JevAssessment
+    monkeypatch.setenv("NEO_LANE_EXCLUDE", "l1-hotfix")
+    greens = _greens(enabled=("CodeAnt",),
+                     statuses=[_status("CodeAnt"), _status("rhobear-reviews")],
+                     reviews=[_review("APPROVED")])
+    ev = _bundle(greens, head_ref="l1-hotfix/topic")
+    ok, reason = neo_worker.merge_authority(
+        True, ev, JevAssessment(False, reason="no key"))
+    assert ok is True, reason
+
+
+@pytest.mark.parametrize("surface", ("check-runs", "combined-status", "reviews"))
+def test_every_paginated_evidence_read_sees_page_two_red(surface):
+    """A trusted red item beyond page one must refuse an otherwise green head."""
+    from src import neo_worker
+
+    cfg = Config()
+    cfg.trusted_reviewer_app_id = TRUSTED_APP
+    cfg.trusted_review_contexts = ("rhobear-reviews",)
+    cfg.auto_merge_default = True
+
+    apollo_graphql = _review("APPROVED")
+    apollo_graphql["id"] = "PRR_apollo"
+    apollo_rest = {
+        "node_id": "PRR_apollo", "state": "APPROVED", "commit_id": SHA1,
+        "body": "verdict: ACCEPT", "submitted_at": "2026-10-26T11:52:00Z",
+        "html_url": "https://github.com/acme/a/pull/5#pullrequestreview-apollo",
+        "user": {"login": "rhobear-reviews[bot]", "type": "Bot", "node_id": "U_apollo"},
+    }
+
+    check_page1 = [_check_run(SHA1)] + [
+        {"name": f"other-{i}", "head_sha": SHA1, "status": "completed",
+         "conclusion": "success", "app": {"id": UNTRUSTED_APP},
+         "output": {"summary": "{}"}}
+        for i in range(99)
+    ]
+    status_page1 = [
+        _status("rhobear-reviews"), _status("architect/l1-reviews"),
+        *[_status(f"ci/{i}", login=f"ci-{i}[bot]") for i in range(98)],
+    ]
+    review_page1 = [apollo_rest] + [
+        {"node_id": f"PRR_other_{i}", "state": "COMMENTED", "commit_id": SHA1,
+         "user": {"login": f"other-{i}", "type": "User", "node_id": f"U_other_{i}"}}
+        for i in range(99)
+    ]
+    red_check = {"name": "CodeAnt Security", "head_sha": SHA1, "status": "completed",
+                 "conclusion": "failure", "app": {"id": 151821869, "slug": "codeant-ai"}}
+    red_status = _status("security/deep-scan", "failure", login="CodeAnt[bot]")
+    red_status["creator"]["node_id"] = "U_codeant"
+    red_review = {"node_id": "PRR_codeant_red", "state": "CHANGES_REQUESTED",
+                  "commit_id": SHA1, "body": "security blocker",
+                  "submitted_at": "2026-10-26T12:00:00Z",
+                  "user": {"login": "CodeAnt[bot]", "type": "Bot", "node_id": "U_codeant"}}
+
+    pages = {"check-runs": [], "combined-status": [], "reviews": []}
+
+    def fake_gh(token, *args, timeout=30):
+        if args[:2] == ("pr", "view"):
+            return 0, json.dumps({"headRefOid": SHA1, "headRefName": "topic",
+                                  "reviews": [apollo_graphql], "statusCheckRollup": []})
+        if args[0] == "api" and any("/check-runs" in a for a in args):
+            url = next(a for a in args if "/check-runs" in a)
+            page = int(url.split("page=")[-1]) if "page=" in url else 1
+            pages["check-runs"].append(page)
+            batch = check_page1 if page == 1 else [red_check] if surface == "check-runs" else []
+            return 0, json.dumps({"total_count": len(check_page1) + (surface == "check-runs"),
+                                  "check_runs": batch})
+        if args[0] == "api" and any("/pulls/5/reviews" in a for a in args):
+            if "--paginate" in args:
+                return 0, json.dumps([review_page1] + ([[red_review]] if surface == "reviews" else []))
+            url = next(a for a in args if "/pulls/5/reviews" in a)
+            page = int(url.split("page=")[-1]) if "page=" in url else 1
+            pages["reviews"].append(page)
+            return 0, json.dumps(review_page1 if page == 1 else [red_review] if surface == "reviews" else [])
+        if args[0] == "api" and any(f"/commits/{SHA1}/status" in a for a in args):
+            url = next(a for a in args if f"/commits/{SHA1}/status" in a)
+            page = int(url.split("page=")[-1]) if "page=" in url else 1
+            pages["combined-status"].append(page)
+            batch = status_page1 if page == 1 else [red_status] if surface == "combined-status" else []
+            return 0, json.dumps({"state": "success", "total_count": len(status_page1) + (surface == "combined-status"),
+                                  "statuses": batch})
+        raise AssertionError(f"unexpected gh call {args}")
+
+    with patch.object(neo_worker, "_gh", side_effect=fake_gh):
+        ev = neo_worker._review_evidence("tok", cfg, W1_LANE_REPO, 5, SHA1,
+                                         enabled_sources=("CodeAnt",))
+    assert ev["ok"] is True, ev
+    assert ev["green1_ok"] is True and ev["green2_ok"] is True, ev
+    assert pages[surface] == [1, 2], pages
+    ok, reason = _authority(_bundle(ev))
+    assert ok is False and "CodeAnt" in reason, (surface, reason, ev)
+
+
+@pytest.mark.parametrize(("mode", "message"), (
+    ("error", "exit"), ("incomplete", "incomplete"), ("capped", "capped"),
+))
+def test_shared_evidence_reader_fails_closed(mode, message):
+    from src.merge_executor import EvidenceReadError, read_evidence_pages
+
+    def fake_gh(token, *args, timeout=30):
+        url = args[1]
+        page = int(url.split("page=")[-1])
+        if mode == "error" and page == 2:
+            return 1, "gh: HTTP 503"
+        if mode == "incomplete" and page == 2:
+            return 0, json.dumps({"total_count": 150, "check_runs": []})
+        total = 300 if mode == "capped" else 150
+        return 0, json.dumps({"total_count": total,
+                              "check_runs": [_check_run(SHA1) for _ in range(100)]})
+
+    with pytest.raises(EvidenceReadError, match=message):
+        read_evidence_pages(fake_gh, "tok", "repos/acme/a/commits/x/check-runs",
+                            "check_runs", max_pages=2)
+
+
+def test_trusted_status_uses_creator_node_id_not_context():
+    trusted_review = _review("APPROVED", author="CodeAnt[bot]")
+    trusted_review["author"]["node_id"] = "U_codeant"
+    red = _status("security/deep-scan", "failure", login="CodeAnt[bot]")
+    red["creator"]["node_id"] = "U_codeant"
+    foreign = _status("CodeAnt", "success", login="CodeAnt[bot]")
+    foreign["creator"]["node_id"] = "U_mallory"
+    greens = _greens(repo=W1_LANE_REPO, enabled=("CodeAnt",),
+                     reviews=[_review("APPROVED"), trusted_review],
+                     statuses=[_status("architect/l1-reviews"), red, foreign])
+    assert greens["green2_ok"] is True and greens["green2_kind"] == "architect"
+    assert len(greens["trusted_seen"]) == 1, greens
+    assert any("CodeAnt" in red for red in greens["trusted_red"]), greens
+    ok, reason = _authority(_bundle(greens))
+    assert ok is False and "CodeAnt" in reason, reason
+
+
+def test_unreadable_reviewers_refuse_two_green_gate():
+    from src import merge_executor
+    greens = _greens(repo=W1_LANE_REPO, reviews=[_review("APPROVED")],
+                     statuses=[_status("architect/l1-reviews")])
+    ev = _bundle(greens, trusted_reviewers_unreadable=True)
+    expected = "trusted reviewers unreadable — cannot prove no trusted reviewer is red"
+    ok, reason = merge_executor.two_green_gate(ev)
+    assert ok is False and expected in reason, reason
+    ok, reason = merge_executor.pre_merge_belts(ev)
+    assert ok is False and expected in reason, reason
+
+
+@pytest.mark.parametrize("comment_failure", ("raise", "rc1"))
+def test_post_merge_comment_failures_do_not_undo_merge(comment_failure, caplog):
+    greens = _greens(enabled=("CodeAnt",),
+                     statuses=[_status("CodeAnt"), _status("rhobear-reviews")],
+                     reviews=[_review("APPROVED")])
+    calls = []
+    base = _refusal_pr_view(calls)
+
+    def fake_gh(token, *args, timeout=30):
+        if args[:2] == ("pr", "comment"):
+            if comment_failure == "raise":
+                raise subprocess.TimeoutExpired(cmd="gh", timeout=30)
+            return 1, "comment refused"
+        return base(token, *args, timeout=timeout)
+
+    with caplog.at_level(logging.WARNING, logger="rhobear_neo.merge"):
+        with patch("src.merge_executor._gh", side_effect=fake_gh):
+            result = merge("o/r", 5, SHA1, _bundle(greens), "tok")
+    assert result["merged"] is True
+    if comment_failure == "rc1":
+        assert "comment refused" in caplog.text
+
+
+def test_pre_merge_belts_refuse_false_trusted_producer():
+    from src import merge_executor
+    greens = _greens(enabled=("CodeAnt",),
+                     statuses=[_status("CodeAnt"), _status("rhobear-reviews")],
+                     reviews=[_review("APPROVED")])
+    ev = _bundle(greens, trusted_producer_ok=False)
+    ok, reason = merge_executor.pre_merge_belts(ev)
+    assert ok is False and "trusted check run" in reason
+    calls = []
+    with patch("src.merge_executor._gh", _refusal_pr_view(calls)):
+        with pytest.raises(MergeDenied, match="trusted check run"):
+            merge("o/r", 5, SHA1, ev, "tok")
+    assert not any("PUT" in c for c in calls)
