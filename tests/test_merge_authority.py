@@ -2286,3 +2286,34 @@ def test_lane_or_unreadable_head_branch_never_merges_under_the_non_lane_rule():
     assert ok is False and "lane" in reason, reason
     ok, reason = _authority(_bundle(greens, head_ref=""))
     assert ok is False and "head branch unavailable" in reason
+
+def test_platform_owner_install_id_never_counts_on_a_customer_repo():
+    greens = _greens(repo="acme/a", enabled=("architect",), reviews=[_review("APPROVED")],
+                     statuses=[_status("architect/l1-reviews", login=W1_OWNER)])
+    assert greens["green2_ok"] is False
+    assert "owner's account" in greens["green2_reason"]
+    ok, reason = _authority(_bundle(greens))
+    assert ok is False and "green 2" in reason
+    positive = _greens(repo=W1_LANE_REPO, enabled=("architect",), reviews=[_review("APPROVED")],
+                       statuses=[_status("architect/l1-reviews", login=W1_OWNER)])
+    assert positive["green2_ok"] is True
+    assert positive["green2_kind"] == "architect"
+
+def test_green_one_is_order_independent_across_review_lists():
+    older = _review("APPROVED", at="2026-10-26T11:00:00Z")
+    newer = _review("CHANGES_REQUESTED", at="2026-10-26T12:00:00Z")
+    for order in ([older, newer], [newer, older]):
+        greens = _greens(reviews=order, statuses=[], enabled=())
+        assert greens["green1_ok"] is False
+        assert greens["green1_reason"] == "CHANGES_REQUESTED"
+
+def test_a_partial_rule_bundle_still_runs_the_gate_before_the_merge():
+    ev = {"ok": True, "head_sha": SHA1, "decided_sha": SHA1,
+          "trusted_red": ["CodeAnt (failure)"]}
+    def fake_gh(token, *args, timeout=30):
+        if args[:3] == ("pr", "view", "5"):
+            return 0, json.dumps({"headRefOid": SHA1, "state": "OPEN"})
+        raise AssertionError(f"unexpected gh call {args}")
+    with patch("src.merge_executor._gh", fake_gh):
+        with pytest.raises(MergeDenied, match="trusted reviewer is red"):
+            merge("o/r", 5, SHA1, ev, "tok")

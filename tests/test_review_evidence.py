@@ -7,6 +7,9 @@ Defect 4: build_evidence must fail closed on an empty rollup.
 """
 from __future__ import annotations
 
+import json
+from unittest import mock
+
 import pytest
 
 from src.config import Config
@@ -296,3 +299,78 @@ def test_trusted_reviewer_outside_org_counts():
         ev = neo_worker._review_evidence("tok", cfg, "acme/checkout", 5, sha,
                                          enabled_sources=())
     assert ev["green2_ok"] is False, ev
+
+# --- W1-07-r5: green 1 Bot identity comes from real GitHub output --------
+CAPTURED_PR_VIEW_REVIEW = {
+    "id": "PRR_kwDOTtWIb88AAAABUYbtcA",
+    "author": {"login": "rhobear-reviews"},
+    "authorAssociation": "NONE",
+    "submittedAt": "2026-10-27T05:47:36Z",
+    "state": "CHANGES_REQUESTED",
+    "commit": {"oid": "938f3ddfa9c5a1025bbd9ee4c7e3c455e47a411d"},
+}
+CAPTURED_REST_REVIEW_ROW = {
+    "id": 5662764400,
+    "user": {"login": "rhobear-reviews[bot]", "type": "Bot"},
+    "state": "CHANGES_REQUESTED",
+    "commit_id": "938f3ddfa9c5a1025bbd9ee4c7e3c455e47a411d",
+}
+SHA1 = "a" * 40
+
+def _captured_accept():
+    rec = json.loads(json.dumps(CAPTURED_PR_VIEW_REVIEW))
+    rec["state"] = "APPROVED"
+    rec["commit"]["oid"] = SHA1
+    return rec
+
+def _ev_fake_gh(pr_view_reviews, rest_rows, rest_rc=0):
+    def fake_gh(token, *args, timeout=30):
+        if args[:2] == ("pr", "view"):
+            return 0, json.dumps({"headRefOid": SHA1, "headRefName": "topic",
+                                  "reviews": pr_view_reviews, "statusCheckRollup": []})
+        if args[0] == "api" and "/check-runs" in args[1]:
+            return 0, json.dumps({"total_count": 0, "check_runs": []})
+        if args[0] == "api" and args[1].endswith("/status"):
+            return 0, json.dumps({"total_count": 0, "statuses": []})
+        if args[0] == "api" and any("/pulls/5/reviews" in a for a in args):
+            if rest_rc != 0:
+                return rest_rc, "gh: HTTP 503"
+            return 0, json.dumps([rest_rows])
+        raise AssertionError(f"unexpected gh call {args}")
+    return fake_gh
+
+def test_captured_real_gh_review_json_has_no_author_type():
+    assert CAPTURED_PR_VIEW_REVIEW["author"] == {"login": "rhobear-reviews"}
+    assert "type" not in CAPTURED_PR_VIEW_REVIEW["author"]
+    assert CAPTURED_REST_REVIEW_ROW["user"]["type"] == "Bot"
+
+def test_rest_reviews_annotate_the_bot_type_for_green_one():
+    from src import neo_worker
+    with mock.patch.object(neo_worker, "_gh", _ev_fake_gh([_captured_accept()], [CAPTURED_REST_REVIEW_ROW])):
+        ev = neo_worker._review_evidence("tok", Config(), "acme/a", 5, SHA1)
+    assert ev["reviews"][0]["author"]["type"] == "Bot"
+    assert ev["green1_ok"] is True
+    assert ev["green1_reason"] == ""
+
+def test_a_failed_rest_reviews_read_fails_green_one_closed():
+    from src import neo_worker
+    from src.jev_review import JevAssessment
+    with mock.patch.object(neo_worker, "_gh", _ev_fake_gh([_captured_accept()], [CAPTURED_REST_REVIEW_ROW], rest_rc=1)):
+        ev = neo_worker._review_evidence("tok", Config(), "acme/a", 5, SHA1)
+    assert ev["reviews"][0]["author"]["type"] == "User"
+    assert ev["green1_ok"] is False
+    bundle = {**ev, "trusted_producer_ok": True, "review_sha_match": True,
+              "required_checks_pass": True, "unresolved_critical_high": 0,
+              "coverage_complete": True, "auto_merge": True,
+              "review_bound_ok": True, "trusted_green": True,
+              "trusted_states": ["success"], "failing_checks": 0}
+    ok, reason = neo_worker.merge_authority(True, bundle, JevAssessment(False, reason="no key"))
+    assert ok is False and "green 1" in reason, reason
+
+def test_a_user_account_reviewing_as_apollo_is_not_green_one():
+    from src import neo_worker
+    row = dict(CAPTURED_REST_REVIEW_ROW, user={"login": "rhobear-reviews", "type": "User"})
+    with mock.patch.object(neo_worker, "_gh", _ev_fake_gh([_captured_accept()], [row])):
+        ev = neo_worker._review_evidence("tok", Config(), "acme/a", 5, SHA1)
+    assert ev["reviews"][0]["author"]["type"] == "User"
+    assert ev["green1_ok"] is False

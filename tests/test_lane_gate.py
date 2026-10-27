@@ -124,16 +124,18 @@ def fake_gh(statuses, merge_rc=0):
                                   "reviews": []})
         if args[:2] == ("pr", "merge"):
             return merge_rc, "merged" if merge_rc == 0 else "Head branch was modified"
+        if args[:2] == ("pr", "comment"):
+            return 0, "commented"
         if args[0] == "api" and args[1].endswith("/statuses?per_page=100"):
             return 0, json.dumps(statuses)
         raise AssertionError(f"unexpected gh call {args}")
     return gh, calls
 
 
-def run(statuses, merge_rc=0, evidence_dict=None):
+def run(statuses, merge_rc=0, evidence_dict=None, cfg=None):
     state = FakeState()
     gh, calls = fake_gh(statuses, merge_rc)
-    cfg = dataclasses.replace(Config(), lane_merge=True)
+    cfg = dataclasses.replace(Config(), lane_merge=True) if cfg is None else cfg
     ev = evidence(statuses=statuses) if evidence_dict is None else {
         **evidence_dict, "statuses": evidence_dict.get("statuses", statuses)}
     with mock.patch.object(neo_worker, "_gh", gh), \
@@ -198,6 +200,11 @@ def test_lane_gate_reads_evidence_through_the_real_collector():
             return 0, json.dumps({"total_count": len(statuses), "statuses": statuses})
         if args[:2] == ("pr", "merge"):
             return 0, "merged"
+        if args[:2] == ("pr", "comment"):
+            return 0, "commented"
+        if args[0] == "api" and any("/pulls/51/reviews" in a for a in args):
+            return 0, json.dumps([[
+                {"user": {"login": "rhobear-reviews[bot]", "type": "Bot"}}]])
         raise AssertionError(f"unexpected gh call {args}")
 
     cfg = dataclasses.replace(Config(), lane_merge=True,
@@ -218,15 +225,13 @@ def test_lane_gate_uses_fresh_reviews_not_the_stale_outer_list():
                     "author": {"login": "rhobear-reviews[bot]", "type": "Bot"}}
     fresh = evidence(reviews=[fresh_review], statuses=[architect()],
                      green1_ok=False, green1_reason="CHANGES_REQUESTED")
-    outer = [{"state": "APPROVED", "commit_id": HEAD,
-              "author": {"login": "rhobear-reviews[bot]", "type": "Bot"}}]
     state = FakeState()
     gh, calls = fake_gh([architect()])
     cfg = dataclasses.replace(Config(), lane_merge=True)
     with mock.patch.object(neo_worker, "_gh", gh), \
          mock.patch.object(neo_worker, "_review_evidence", return_value=fresh), \
          mock.patch.object(neo_worker, "_enabled_reviewers", return_value=()):
-        neo_worker.run_lane_gate("tok", cfg, state, REPO, 51, HEAD, "l3-kit", outer)
+        neo_worker.run_lane_gate("tok", cfg, state, REPO, 51, HEAD, "l3-kit")
     assert not any(c[:2] == ("pr", "merge") for c in calls), calls
     assert not any(c[0] == "api" and c[1].endswith("/statuses?per_page=100") for c in calls), calls
     assert state.rows[-1][3] == "lane_hold", state.rows
@@ -376,3 +381,32 @@ def test_transient_evidence_failure_does_not_skip_agent_on_non_lane_pr():
                            {"job_id": 1, "repo": REPO, "sha": HEAD, "green": True,
                             "context": "rhobear-reviews"})
     agent.assert_called_once()
+
+def test_lane_merge_disabled_by_default_records_a_lane_hold():
+    state, calls = run([architect()], cfg=Config())
+    assert Config().lane_merge is False
+    assert not any(c[:2] == ("pr", "merge") for c in calls)
+    assert state.rows[-1][3] == "lane_hold"
+    assert "lane merges disabled" in state.rows[-1][5]["reason"]
+
+def test_lane_gate_runs_the_same_belts_then_posts_the_comment():
+    state, calls = run([architect()])
+    comment = next((c for c in calls if c[:2] == ("pr", "comment")), None)
+    assert comment is not None
+    body = comment[comment.index("--body") + 1]
+    assert body.startswith("Two greens on " + HEAD[:7])
+    assert "CI:" in body
+    assert state.rows[-1][3] == "merged"
+    state, calls = run([architect()], evidence_dict=evidence(trusted_red=["CodeAnt (failure)"]))
+    assert not any(c[:2] == ("pr", "merge") for c in calls)
+    assert not any(c[:2] == ("pr", "comment") for c in calls)
+    assert state.rows[-1][3] == "lane_hold"
+
+def test_lane_of_honours_the_operator_lane_exclusion():
+    from src import neo_builder
+    cfg = dataclasses.replace(Config(), lane_exclude=("l1-hotfix",))
+    assert neo_worker.lane_of("l1-hotfix/x", cfg) == ""
+    assert neo_worker.lane_of("l3-kit/x", cfg) == "l3-kit"
+    assert neo_worker.lane_of("l1-hotfix/x") == "l1-hotfix"
+    assert neo_builder.is_lane_branch("l1-hotfix/x", cfg) is False
+    assert neo_builder.is_lane_branch("l3-kit/x", cfg) is True

@@ -50,6 +50,7 @@ class FakeConn:
     def __init__(self, rows=()):
         self.cur = FakeCursor(rows)
         self.commits = 0
+        self.connects = 0
 
     def __enter__(self):
         return self
@@ -74,11 +75,18 @@ def recording_db(rows=()):
     from src import trusted_reviewers as tr
     conn = FakeConn(rows)
     original = tr._connect
-    tr._connect = lambda dsn: conn
+    tr.reset_schema_memo()
+
+    def _connect(dsn):
+        conn.connects += 1
+        return conn
+
+    tr._connect = _connect
     try:
         yield conn
     finally:
         tr._connect = original
+        tr.reset_schema_memo()
 
 
 def test_ensure_schema_creates_the_table_and_seeds_the_owner_install_once():
@@ -330,3 +338,18 @@ def test_integration_real_sql_roundtrip():
     tr.ensure_schema(dsn)
     assert tr.enabled_sources(dsn, tr.DEFAULT_OWNER_INSTALL_ID, "any/repo") == ()
     tr.set_source(dsn, tr.DEFAULT_OWNER_INSTALL_ID, "*", tr.SEED_SOURCE, enabled=True)
+
+def test_one_read_connection_and_no_repeat_ddl_per_wake(monkeypatch):
+    from src import neo_worker, github_app
+    from src.config import Config
+    app = _FakeApp(install_id=12345)
+    monkeypatch.setattr(github_app, "github_app_for", lambda cfg: app)
+    with recording_db(rows=[("12345", "*", "Greptile", True, "")]) as conn:
+        got = neo_worker._enabled_reviewers(Config(), _state(), "acme/checkout")
+        assert got == ("Greptile",)
+        assert conn.connects == 2
+        got = neo_worker._enabled_reviewers(Config(), _state(), "acme/checkout")
+        assert got == ("Greptile",)
+        assert conn.connects == 3
+        creates = [sql for sql, _ in conn.cur.calls if "CREATE TABLE" in sql.upper()]
+        assert len(creates) == 1
