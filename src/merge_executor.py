@@ -86,6 +86,39 @@ def two_green_gate(evidence: dict) -> tuple[bool, str]:
     return (not problems, "; ".join(problems) or "two greens on this exact head")
 
 
+def has_rule_fields(evidence: dict) -> bool:
+    """One predicate for a bundle carrying any two-green rule fields."""
+    return any(k in evidence for k in _RULE_FIELDS)
+
+
+def pre_merge_belts(evidence: dict) -> tuple[bool, str]:
+    """The evidence belts EVERY merge path runs immediately before merging."""
+    if not evidence.get("ok"):
+        return False, f"evidence unavailable ({evidence.get('reason') or 'unknown'})"
+    if has_rule_fields(evidence):
+        ok, why = two_green_gate(evidence)
+        if not ok:
+            return False, why
+    if evidence.get("trusted_producer_ok") is False:
+        return False, "no trusted check run from the Reviews App on this exact head"
+    return True, "two greens on this exact head"
+
+
+def post_merge_comment(token: str, repo: str, pr: int, evidence: dict) -> None:
+    """Post the one merge comment AFTER a confirmed merge; never raises."""
+    if not has_rule_fields(evidence):
+        return
+    try:
+        rc, out = _gh(token, "pr", "comment", str(pr), "-R", repo,
+                      "--body", two_green_comment(evidence), timeout=30)
+    except Exception as exc:  # noqa: BLE001 — the merge stands regardless
+        log.warning("merge comment failed after the merge (%s) — the merge stands",
+                    type(exc).__name__)
+        return
+    if rc != 0:
+        log.warning("merge comment refused by GitHub after the merge: %s", out[:200])
+
+
 def two_green_comment(evidence: dict) -> str:
     """The one merge comment (board `verdicts` 02): the two greens with links
     and the CI summary — "Two greens on a91d2e0 / 1: Apollo ACCEPT / 2: Zeus
@@ -214,10 +247,9 @@ def merge(
     # without the rule's fields is the legacy {"ok", shas} mechanics shape
     # contract-pinned in tests/test_merge_authority: nothing to consult here,
     # so the W1-13 belt above applies unchanged.
-    if all(k in evidence for k in _RULE_FIELDS):
-        ok, why = two_green_gate(evidence)
-        if not ok:
-            raise MergeDenied(f"merge authority denied: {why}")
+    granted, why = pre_merge_belts(evidence)
+    if not granted:
+        raise MergeDenied(f"merge authority denied: {why}")
 
     # --- Step 4: Execute the merge -----------------------------------------
     # REST merge API with sha=expected_sha: GitHub rejects with 422 if the
@@ -258,12 +290,7 @@ def merge(
     # Only now, so a refused or moved-head merge leaves no stale comment.
     # The merge is already confirmed: a refused comment is logged, never a
     # failed merge.
-    if all(k in evidence for k in _RULE_FIELDS):
-        rc, out = _gh(token, "pr", "comment", str(pr), "-R", repo,
-                      "--body", two_green_comment(evidence), timeout=30)
-        if rc != 0:
-            log.warning("merge comment refused by GitHub after the merge: %s",
-                        out[:200])
+    post_merge_comment(token, repo, pr, evidence)
 
     # --- Step 5: delete the head branch -----------------------------------
     # The REST merge API never deletes the branch; gh's --delete-branch did it

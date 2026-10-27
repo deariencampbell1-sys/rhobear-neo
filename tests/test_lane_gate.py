@@ -139,6 +139,7 @@ def run(statuses, merge_rc=0, evidence_dict=None, cfg=None):
     ev = evidence(statuses=statuses) if evidence_dict is None else {
         **evidence_dict, "statuses": evidence_dict.get("statuses", statuses)}
     with mock.patch.object(neo_worker, "_gh", gh), \
+         mock.patch("src.merge_executor._gh", gh), \
          mock.patch.object(neo_worker, "repo_token", return_value="tok"), \
          mock.patch.object(neo_worker, "resolve_pr", return_value=51), \
          mock.patch.object(neo_worker, "_review_evidence", return_value=ev), \
@@ -210,6 +211,7 @@ def test_lane_gate_reads_evidence_through_the_real_collector():
     cfg = dataclasses.replace(Config(), lane_merge=True,
                               trusted_reviewer_app_id="17265050")
     with mock.patch.object(neo_worker, "_gh", gh), \
+         mock.patch("src.merge_executor._gh", gh), \
          mock.patch.object(neo_worker, "repo_token", return_value="tok"), \
          mock.patch.object(neo_worker, "resolve_pr", return_value=51), \
          mock.patch.object(neo_worker.ClaudeAgent, "from_config") as agent:
@@ -229,6 +231,7 @@ def test_lane_gate_uses_fresh_reviews_not_the_stale_outer_list():
     gh, calls = fake_gh([architect()])
     cfg = dataclasses.replace(Config(), lane_merge=True)
     with mock.patch.object(neo_worker, "_gh", gh), \
+         mock.patch("src.merge_executor._gh", gh), \
          mock.patch.object(neo_worker, "_review_evidence", return_value=fresh), \
          mock.patch.object(neo_worker, "_enabled_reviewers", return_value=()):
         neo_worker.run_lane_gate("tok", cfg, state, REPO, 51, HEAD, "l3-kit")
@@ -296,6 +299,7 @@ def test_drift_status_wakes_the_lane_gate_but_never_the_agent():
     state = FakeState()
     gh, calls = fake_gh([])
     with mock.patch.object(neo_worker, "_gh", gh), \
+         mock.patch("src.merge_executor._gh", gh), \
          mock.patch.object(neo_worker, "repo_token", return_value="tok"), \
          mock.patch.object(neo_worker, "resolve_pr", return_value=51), \
          mock.patch.object(neo_worker, "_review_evidence",
@@ -352,6 +356,7 @@ def test_lane_gate_fails_closed_with_a_lane_hold_when_the_evidence_read_breaks()
     cfg = dataclasses.replace(Config(), lane_merge=True)
     ev = evidence()
     with mock.patch.object(neo_worker, "_gh", gh), \
+         mock.patch("src.merge_executor._gh", gh), \
          mock.patch.object(neo_worker, "repo_token", return_value="tok"), \
          mock.patch.object(neo_worker, "resolve_pr", return_value=51), \
          mock.patch.object(neo_worker, "_review_evidence",
@@ -372,6 +377,7 @@ def test_transient_evidence_failure_does_not_skip_agent_on_non_lane_pr():
     transient = {"ok": False, "reason": "pr view unavailable",
                  "decided_sha": HEAD, "head_ref": ""}
     with mock.patch.object(neo_worker, "_gh", gh), \
+         mock.patch("src.merge_executor._gh", gh), \
          mock.patch.object(neo_worker, "repo_token", return_value="tok"), \
          mock.patch.object(neo_worker, "resolve_pr", return_value=51), \
          mock.patch.object(neo_worker, "_review_evidence", return_value=transient), \

@@ -285,6 +285,8 @@ def test_trusted_reviewer_outside_org_counts():
             return 0, json.dumps({"total_count": 0, "check_runs": []})
         if args[0] == "api" and args[1].endswith("/status"):
             return 0, json.dumps({"total_count": len(statuses), "statuses": statuses})
+        if args[0] == "api" and any("/pulls/5/reviews" in a for a in args):
+            return 0, json.dumps([[{"user": {"login": "rhobear-reviews[bot]", "type": "Bot"}}]])
         raise AssertionError(f"unexpected gh call {args}")
 
     cfg = dataclasses.replace(_cfg(), trusted_reviewer_app_id=TRUSTED_APP)
@@ -356,7 +358,7 @@ def test_a_failed_rest_reviews_read_fails_green_one_closed():
     from src import neo_worker
     from src.jev_review import JevAssessment
     with mock.patch.object(neo_worker, "_gh", _ev_fake_gh([_captured_accept()], [CAPTURED_REST_REVIEW_ROW], rest_rc=1)):
-        ev = neo_worker._review_evidence("tok", Config(), "acme/a", 5, SHA1)
+        ev = neo_worker._review_evidence("tok", _cfg(), "acme/a", 5, SHA1)
     assert ev["reviews"][0]["author"]["type"] == "User"
     assert ev["green1_ok"] is False
     bundle = {**ev, "trusted_producer_ok": True, "review_sha_match": True,

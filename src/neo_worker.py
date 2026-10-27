@@ -23,7 +23,7 @@ import os
 import re
 import secrets
 import subprocess
-from datetime import datetime
+from datetime import datetime, timezone
 
 from .config import Config, DEFAULT_OWNER_INSTALL_ID
 from .jobs import Jobs
@@ -230,6 +230,60 @@ def _review_author(r: dict) -> str:
     return str((r.get("author") or {}).get("login") or r.get("author_login") or "")
 
 
+_OLDEST_INSTANT = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _review_submitted_key(r: dict):
+    return _parse_instant(str(r.get("submitted_at") or "")) or _OLDEST_INSTANT
+
+
+def _reviewer_types(token: str, repo: str, pr: int) -> dict[str, str]:
+    """Read Bot identities from REST; pr-view GraphQL has no author.type."""
+    try:
+        rc, raw = _gh(token, "api", "--paginate", "--slurp",
+                      f"repos/{repo}/pulls/{pr}/reviews?per_page=100", timeout=45)
+        if rc != 0:
+            return {}
+        pages = json.loads(raw)
+        if isinstance(pages, list) and pages and all(isinstance(p, list) for p in pages):
+            rows = [r for page in pages for r in page if isinstance(r, dict)]
+        elif isinstance(pages, list):
+            rows = [r for r in pages if isinstance(r, dict)]
+        else:
+            rows = []
+    except Exception:  # noqa: BLE001 — fail closed
+        return {}
+    types: dict[str, str] = {}
+    for row in rows:
+        user = row.get("user") or {}
+        login = str(user.get("login") or "").lower()
+        if not login:
+            continue
+        kind = "Bot" if str(user.get("type") or "") == "Bot" else "User"
+        types[login] = kind
+        types.setdefault(login.removesuffix("[bot]"), kind)
+        types.setdefault(f"{login}[bot]", kind)
+    return types
+
+
+def _reviews_with_bot_types(token: str, repo: str, pr: int, reviews: list) -> list:
+    """Annotate pr-view reviews with identities from the REST reviews list."""
+    if not reviews:
+        return reviews
+    types = _reviewer_types(token, repo, pr)
+    for r in reviews:
+        if not isinstance(r, dict):
+            continue
+        login = str((r.get("author") or {}).get("login")
+                    or r.get("author_login") or "").lower()
+        if not login:
+            continue
+        author = dict(r.get("author") or {})
+        author["type"] = types.get(login, "User")
+        r["author"] = author
+    return reviews
+
+
 def _green_fields(cfg: Config, repo: str, sha: str, reviews: list, statuses: list,
                   rollup: list, enabled_sources: tuple = ()) -> dict:
     """The two greens + the trusted red for ONE head SHA. Fails closed.
@@ -244,20 +298,19 @@ def _green_fields(cfg: Config, repo: str, sha: str, reviews: list, statuses: lis
     from .webhook_server import is_architect_context
 
     owner = repo.split("/", 1)[0]
-    owner_logins = {
-        value for value in (
-            owner.lower(),
-            str(getattr(cfg, "owner_install_id", "") or "").lower(),
-            DEFAULT_OWNER_INSTALL_ID.lower(),
-        ) if value
-    }
+    owner_logins = {owner.lower()}
+    if repo in ARCHITECT_ALWAYS_REPOS:
+        owner_logins |= ({str(getattr(cfg, "owner_install_id", "") or "").lower(),
+                          DEFAULT_OWNER_INSTALL_ID.lower()} - {""})
     contexts = _trusted_contexts(cfg)
     apollo = contexts[0] if contexts else ""
     out: dict = {"trusted_red": [], "trusted_seen": []}
 
     # --- green 1: Apollo ACCEPT on this exact head (always required) -------
+    ordered = sorted((r for r in (reviews or []) if isinstance(r, dict)),
+                     key=_review_submitted_key)
     chosen = None
-    for r in reviews or []:                       # oldest first — newest wins
+    for r in ordered:                             # oldest first — newest wins
         if _review_oid(r) != sha:                 # bound to this head only
             continue
         author = _review_author(r)
@@ -392,8 +445,11 @@ def _enabled_reviewers(cfg: Config, state, repo: str) -> tuple[str, ...]:
         if app is None:
             raise _gh_app.AppNotConfigured("no GitHub App identity configured")
         install_id = str(app.installation_for_repo(repo))
-        if repo.split("/", 1)[0].lower() == DEFAULT_OWNER_INSTALL_ID.lower():
-            trusted_reviewers.ensure_schema(dsn, owner_install_id=install_id)
+        owner_install_id = (
+            install_id
+            if repo.split("/", 1)[0].lower() == DEFAULT_OWNER_INSTALL_ID.lower()
+            else None)
+        trusted_reviewers.ensure_schema(dsn, owner_install_id=owner_install_id)
         return trusted_reviewers.enabled_sources(dsn, install_id, repo)
     except Exception as exc:  # noqa: BLE001 — fail closed, never strand the wake
         log.warning("trusted_reviewers: installation id for %s unresolvable "
@@ -466,7 +522,7 @@ def _review_evidence(token: str, cfg: Config, repo: str, pr: int, sha: str,
         return {"ok": False, "reason": f"check-runs read failed ({type(exc).__name__})",
                 "decided_sha": sha, "head_ref": head_ref}
 
-    reviews = data.get("reviews") or []
+    reviews = _reviews_with_bot_types(token, repo, pr, data.get("reviews") or [])
     review_sha = next((str(r.get("commit_id") or "") for r in reversed(reviews)
                        if r.get("body")), "")
 
@@ -552,7 +608,7 @@ def resolve_auto_merge(install_auto_merge, cfg: Config) -> bool:
 
 
 def merge_authority(install_auto_merge: bool, evidence: dict,
-                    jev: JevAssessment) -> tuple[bool, str]:
+                    jev: JevAssessment, cfg: Config | None = None) -> tuple[bool, str]:
     """Exact-SHA merge authority. Fails closed; never a veto by adjective."""
     if not install_auto_merge:
         return False, "auto-merge disabled for this install"
@@ -562,7 +618,7 @@ def merge_authority(install_auto_merge: bool, evidence: dict,
     # never be merged under the non-lane rule (which skips architect and drift).
     if "head_ref" in evidence and not evidence.get("head_ref"):
         return False, "PR head branch unavailable — cannot rule out a lane PR"
-    if lane_of(str(evidence.get("head_ref") or "")):
+    if lane_of(str(evidence.get("head_ref") or ""), cfg):
         return False, "lane PR head must use the lane merge gate"
     if evidence.get("head_sha") != evidence.get("decided_sha"):
         return False, "head moved since the wake — stale evidence cannot authorize this SHA"
@@ -572,8 +628,8 @@ def merge_authority(install_auto_merge: bool, evidence: dict,
     # reviewer red (board `merge-authority` v7).  Presence-gated like the
     # W1-13 belt above: a bundle without the keys is older/patched evidence
     # and keeps the legacy behaviour; production evidence always carries them.
-    if "green1_ok" in evidence or "green2_ok" in evidence or "trusted_red" in evidence:
-        from . import merge_executor as _merge_executor
+    from . import merge_executor as _merge_executor
+    if _merge_executor.has_rule_fields(evidence):
         ok, why = _merge_executor.two_green_gate(evidence)
         if not ok:
             return False, why
@@ -599,9 +655,18 @@ ARCHITECT_CONTEXT = "architect/"
 DRIFT_CONTEXT = "l0/drift"   # L0 sentinel, SPRINT.md section 9
 
 
-def lane_of(branch: str) -> str:
+def lane_of(branch: str, cfg: Config | None = None) -> str:
+    """Return the lane, unless an operator explicitly excludes its name."""
     m = LANE_BRANCH.match(branch or "")
-    return m.group(1).lower() if m else ""
+    if not m:
+        return ""
+    lane = m.group(1).lower()
+    if cfg is not None:
+        excluded = {str(x).strip().lower()
+                    for x in (getattr(cfg, "lane_exclude", ()) or ())}
+        if lane in excluded:
+            return ""
+    return lane
 
 
 def lane_merge_authority(lane_merge: bool, evidence: dict, lane: str,
@@ -646,7 +711,7 @@ def lane_merge_authority(lane_merge: bool, evidence: dict, lane: str,
 
 
 def run_lane_gate(token: str, cfg: Config, state: NeoState, repo: str, pr: int, sha: str,
-                  lane: str, reviews: list[dict]) -> None:
+                  lane: str) -> None:
     """Decide a lane PR without the agent: merge the exact head, or hold and say why."""
     if state.already_acted(repo, pr, sha, "merged"):
         log.info("%s#%s@%s already merged by Neo — skip", repo, pr, sha[:8])
@@ -677,31 +742,34 @@ def run_lane_gate(token: str, cfg: Config, state: NeoState, repo: str, pr: int, 
             require_drift=getattr(cfg, "lane_require_drift", False) is True)
     log.info("%s#%s@%s lane=%s merge authority=%s (%s)", repo, pr, sha[:8], lane, ok, reason)
     if ok:
-        rc, out = _gh(token, "pr", "merge", str(pr), "-R", repo, "--squash",
-                      "--match-head-commit", sha, timeout=60)
-        if rc == 0:
-            state.record(repo, pr, sha, "merged", verdict="ACCEPT-MERGED",
-                         detail={"lane": lane, "reason": reason})
-            return
-        ok, reason = False, f"merge refused by GitHub: {out[:200]}"
+        evidence["green2_ok"] = True
+        evidence["green2_kind"] = "architect"
+        evidence["green2_label"] = f"{ARCHITECT_CONTEXT}{lane} ACCEPT"
+        evidence["green2_url"] = ""
+        evidence["green2_at"] = ""
+        evidence["green2_reason"] = ""
+        from . import merge_executor as _merge_executor
+        granted, belt = _merge_executor.pre_merge_belts(evidence)
+        if not granted:
+            ok, reason = False, belt
+        else:
+            rc, out = _gh(token, "pr", "merge", str(pr), "-R", repo, "--squash",
+                          "--match-head-commit", sha, timeout=60)
+            if rc == 0:
+                state.record(repo, pr, sha, "merged", verdict="ACCEPT-MERGED",
+                             detail={"lane": lane, "reason": reason})
+                _merge_executor.post_merge_comment(token, repo, pr, evidence)
+                return
+            ok, reason = False, f"merge refused by GitHub: {out[:200]}"
     state.record(repo, pr, sha, "lane_hold", verdict="HOLD", detail={"lane": lane, "reason": reason})
 
 
-def _lane_pr(evidence: dict) -> tuple[str, list[dict]] | None:
-    """(lane, reviews) when the PR's head branch is a North Star lane branch; None otherwise.
-
-    The head branch comes from the collector's `pr view --json headRefName`
-    read (one read, one source — 0241eaf's separate `_gh(cfg, …)` read is
-    reconciled to this line's `_gh(token, …)` arity by folding it into the
-    evidence read).  A missing/unavailable branch is not evidence of a lane:
-    continue ordinary non-merge work, while merge authority still fails closed
-    on any incomplete evidence bundle.
-    """
+def _lane_pr(evidence: dict, cfg: Config | None = None) -> str | None:
+    """Return the PR's North Star lane, or None for an ordinary branch."""
     branch = str(evidence.get("head_ref") or "")
     if not branch:
         return None
-    lane = lane_of(branch)
-    return (lane, evidence.get("reviews") or []) if lane else None
+    return lane_of(branch, cfg) or None
 
 
 def _jev_for_pr(token: str, cfg: Config, repo: str, pr: int, sha: str = "") -> JevAssessment:
@@ -954,12 +1022,12 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict,
 
     # --- North Star lane branches: architect-gated merge, never the agent ---
     try:
-        lane_pr = _lane_pr(evidence)
+        lane_pr = _lane_pr(evidence, cfg)
     except (AgentError, TypeError, ValueError) as exc:
         log.warning("%s#%s@%s %s — skip (fail closed)", repo, pr, sha[:8], exc)
         return
-    if lane_pr:
-        run_lane_gate(token, cfg, state, repo, pr, sha, lane_pr[0], lane_pr[1])
+    if lane_pr is not None:
+        run_lane_gate(token, cfg, state, repo, pr, sha, lane_pr)
         return
     # Same case-insensitive normaliser as the webhook dispatch (defect 4).
     from .webhook_server import is_architect_context, is_drift_context
@@ -969,7 +1037,7 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict,
 
     # Jev never supplies a green verdict.
     jev = _jev_for_pr(token, cfg, repo, pr, sha)
-    auto_merge, authority_reason = merge_authority(install_auto_merge, evidence, jev)
+    auto_merge, authority_reason = merge_authority(install_auto_merge, evidence, jev, cfg)
     log.info("%s#%s@%s Jev available=%s risk=%s quality=%s partial=%s "
              "requires_full_review=%s blockers=%s",
              repo, pr, sha[:8], jev.available, jev.risk, jev.review_quality,

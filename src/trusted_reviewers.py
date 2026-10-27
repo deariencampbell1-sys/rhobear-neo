@@ -21,6 +21,7 @@ database: they replace _connect with a recording fake.
 from __future__ import annotations
 
 import re
+import threading
 
 import psycopg
 
@@ -70,22 +71,39 @@ def _connect(dsn: str):
     return psycopg.connect(dsn)
 
 
+#: (dsn, owner id or None) pairs this process already created/seeded the table
+#: for. DDL on the merge-authority hot path is once-per-process, not once-per-wake.
+_ensured: set[tuple[str, str | None]] = set()
+_ensured_lock = threading.Lock()
+
+
+def reset_schema_memo() -> None:
+    """Forget which DSNs this process already ensured."""
+    with _ensured_lock:
+        _ensured.clear()
+
+
 def ensure_schema(dsn: str, *, owner_install_id: str | None = DEFAULT_OWNER_INSTALL_ID) -> None:
     """Create the table if missing and seed the owner install's CodeAnt row.
 
-    Idempotent and self-healing: the seed is ON CONFLICT DO NOTHING, so this
-    is safe to call on every read/write and never overrides a customer's
-    explicit choice."""
+    Idempotent and self-healing; memoised per process so the merge-authority
+    hot path runs this DDL once, not on every wake."""
+    key = (str(dsn), owner_install_id)
+    with _ensured_lock:
+        if key in _ensured:
+            return
     with _connect(dsn) as conn:
         with conn.cursor() as cur:
             cur.execute(CREATE_TABLE_SQL)
             if owner_install_id is not None:
                 cur.execute(SEED_SQL, (owner_install_id, SEED_SOURCE))
         conn.commit()
+    with _ensured_lock:
+        _ensured.add(key)
 
 
 def _rows(dsn: str, install_id: str) -> list[dict]:
-    ensure_schema(dsn, owner_install_id=None)
+    """This install's rows, over ONE connection; a read never runs DDL."""
     with _connect(dsn) as conn:
         with conn.cursor() as cur:
             cur.execute(LIST_SQL, (install_id,))

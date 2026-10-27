@@ -648,8 +648,17 @@ No markdown fences, nothing after the VERDICT line.
 LANE_HEAD = re.compile(r"^l\d+[a-d]?(-[a-z0-9-]+)?/", re.IGNORECASE)
 
 
-def is_lane_branch(branch: str) -> bool:
-    return bool(LANE_HEAD.match(branch or ""))
+def is_lane_branch(branch: str, cfg: Config | None = None) -> bool:
+    """True for a lane branch, unless its lane name is operator-excluded."""
+    m = LANE_HEAD.match(branch or "")
+    if not m:
+        return False
+    if cfg is not None:
+        excluded = {str(x).strip().lower()
+                    for x in (getattr(cfg, "lane_exclude", ()) or ())}
+        if branch.split("/", 1)[0].lower() in excluded:
+            return False
+    return True
 
 
 def dispatch_one(cfg: Config, jobs: Jobs, row: dict) -> None:
@@ -725,7 +734,7 @@ def dispatch_one(cfg: Config, jobs: Jobs, row: dict) -> None:
                     repo, pr)
         return
     state, head_ref = parsed
-    if is_lane_branch(head_ref):
+    if is_lane_branch(head_ref, cfg):
         log.info("skip (lane branch %s, its lane's worker fixes it): %s#%s", head_ref, repo, pr)
         jobs.resolve(row["id"], "no_change", worker_token=wtoken,
                      payload={"skipped_lane": head_ref, "brief_dispatched": True})
@@ -976,7 +985,7 @@ def main() -> int:
                     head_ref = parsed[1] if parsed else ""
                 except Exception:  # noqa: BLE001 — the dry run is read-only and never crashes
                     head_ref = ""
-                verb = "would SKIP (lane branch)" if is_lane_branch(head_ref) else "would dispatch"
+                verb = "would SKIP (lane branch)" if is_lane_branch(head_ref, cfg) else "would dispatch"
                 log.info("dry-run: %s %s#%s@%s round=%s branch=%s model=%s", verb,
                          row["repo"], row["pr_number"], row.get("head_sha", "")[:8],
                          row["builder_round"], head_ref, cfg.hermes_model)
