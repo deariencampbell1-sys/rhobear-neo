@@ -89,6 +89,7 @@ def _fake_gh_success(*args, **kw):
             "state": "OPEN",
             "mergeable": "MERGEABLE",
             "headRefName": "topic-branch",
+            "isCrossRepository": False,
             "reviews": [
                 {"body": "Looks good. COVERAGE: COMPLETE",
                  "commit_id": SHA1,
@@ -486,7 +487,7 @@ class TestMergeExecutor:
             if gh_args[:3] == ("pr", "view", "1"):
                 data = {"headRefOid": SHA1, "state": "OPEN",
                         "mergeable": "MERGEABLE",
-                        "headRefName": "topic-branch"}
+                        "headRefName": "topic-branch", "isCrossRepository": False}
                 return 0, json.dumps(data)
             if gh_args[0] == "api" and gh_args[3] == "repos/acme/a/pulls/1/merge":
                 calls.append(list(gh_args))
@@ -515,7 +516,7 @@ class TestMergeExecutor:
             gh_args = args
             if gh_args[:3] == ("pr", "view", "1"):
                 data = {"headRefOid": SHA1, "state": "OPEN",
-                        "mergeable": "MERGEABLE"}
+                        "mergeable": "MERGEABLE", "isCrossRepository": False}
                 return 0, json.dumps(data)
             if gh_args[0] == "api" and gh_args[3] == "repos/acme/a/pulls/1/merge":
                 return 1, "422: The provided sha is not the head sha of the pull request"
@@ -543,7 +544,7 @@ class TestMergeExecutor:
             if args[:3] == ("pr", "view", "1"):
                 return 0, json.dumps({"headRefOid": SHA1, "state": "OPEN",
                                       "mergeable": "MERGEABLE",
-                                      "headRefName": "topic-branch"})
+                                      "headRefName": "topic-branch", "isCrossRepository": False})
             if args[0] == "api" and args[3] == "repos/acme/a/pulls/1/merge":
                 raise subprocess.TimeoutExpired(cmd="gh", timeout=60)
             raise AssertionError(f"unexpected call: {args}")
@@ -570,7 +571,7 @@ class TestMergeBranchDeletion:
             if gh_args[:3] == ("pr", "view", "1"):
                 data = {"headRefOid": SHA1, "state": "OPEN",
                         "mergeable": "MERGEABLE",
-                        "headRefName": "topic-branch"}
+                        "headRefName": "topic-branch", "isCrossRepository": False}
                 return 0, json.dumps(data)
             if gh_args[0] == "api" and gh_args[3] == "repos/acme/a/pulls/1/merge":
                 return 0, json.dumps({"merged": True, "sha": "M" * 40})
@@ -599,7 +600,7 @@ class TestMergeBranchDeletion:
             if gh_args[:3] == ("pr", "view", "1"):
                 data = {"headRefOid": SHA1, "state": "OPEN",
                         "mergeable": "MERGEABLE",
-                        "headRefName": "topic-branch"}
+                        "headRefName": "topic-branch", "isCrossRepository": False}
                 return 0, json.dumps(data)
             if gh_args[0] == "api" and gh_args[3] == "repos/acme/a/pulls/1/merge":
                 return 0, json.dumps({"merged": True, "sha": "M" * 40})
@@ -648,10 +649,9 @@ class TestMergeBranchDeletion:
         assert result["merged"] is True
         assert deletes == []
 
-    def test_fork_pr_branch_is_not_deleted(self):
-        result, deletes = self._run(head_ref="someone:topic", cross=True)
-        assert result["merged"] is True
-        assert deletes == []
+    def test_fork_pr_is_refused_before_merge_or_deletion(self):
+        with pytest.raises(MergeDenied, match="fork"):
+            self._run(head_ref="someone:topic", cross=True)
 
     def test_unknown_default_branch_keeps_the_branch(self):
         result, deletes = self._run(default="")
@@ -695,7 +695,8 @@ class TestMergeBranchDeletion:
             gh_args = args
             if gh_args[:3] == ("pr", "view", "1"):
                 data = {"headRefOid": SHA1, "state": "OPEN",
-                        "mergeable": "MERGEABLE", "headRefName": ""}
+                        "mergeable": "MERGEABLE", "headRefName": "",
+                        "isCrossRepository": False}
                 return 0, json.dumps(data)
             if gh_args[0] == "api" and gh_args[3] == "repos/acme/a/pulls/1/merge":
                 return 0, json.dumps({"merged": True, "sha": "M" * 40})
@@ -1787,10 +1788,11 @@ def _status(context, state="success", login=None, created="2026-10-26T11:50:00Z"
 
 
 def _greens(*, repo="acme/a", reviews=None, statuses=None, rollup=None,
-            enabled=(), sha=SHA1):
+            enabled=(), sha=SHA1, check_runs=None):
     from src import neo_worker
     return neo_worker._green_fields(Config(), repo, sha,
-                                    reviews or [], statuses or [], rollup or [], enabled)
+                                    reviews or [], statuses or [], rollup or [], enabled,
+                                    check_runs or [])
 
 
 def _bundle(greens, **over):
@@ -1828,7 +1830,7 @@ def test_green2b_requires_reviewer_identity_not_just_name(signal, expected):
     greens = _greens(enabled=("CodeAnt",),
                      reviews=[signal] if kind == "review" else [],
                      statuses=[signal] if kind == "status" else [],
-                     rollup=[signal] if kind == "check" else [])
+                     check_runs=[signal] if kind == "check" else [])
     assert greens["green2_ok"] is expected, greens
 
 
@@ -2312,7 +2314,8 @@ def test_a_partial_rule_bundle_still_runs_the_gate_before_the_merge():
           "trusted_red": ["CodeAnt (failure)"]}
     def fake_gh(token, *args, timeout=30):
         if args[:3] == ("pr", "view", "5"):
-            return 0, json.dumps({"headRefOid": SHA1, "state": "OPEN"})
+            return 0, json.dumps({"headRefOid": SHA1, "state": "OPEN",
+                                  "mergeable": "MERGEABLE", "isCrossRepository": False})
         raise AssertionError(f"unexpected gh call {args}")
     with patch("src.merge_executor._gh", fake_gh):
         with pytest.raises(MergeDenied, match="trusted reviewer is red"):

@@ -234,58 +234,68 @@ _OLDEST_INSTANT = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
 def _review_submitted_key(r: dict):
-    return _parse_instant(str(r.get("submitted_at") or "")) or _OLDEST_INSTANT
+    return _parse_instant(str(r.get("submittedAt") or r.get("submitted_at") or "")) \
+        or _OLDEST_INSTANT
 
 
-def _reviewer_types(token: str, repo: str, pr: int) -> dict[str, str]:
-    """Read Bot identities from REST; pr-view GraphQL has no author.type."""
+def _reviewer_rows(token: str, repo: str, pr: int) -> list[dict]:
+    """Read complete REST review rows; pr-view omits identity and often links."""
     try:
         rc, raw = _gh(token, "api", "--paginate", "--slurp",
                       f"repos/{repo}/pulls/{pr}/reviews?per_page=100", timeout=45)
         if rc != 0:
-            return {}
+            return []
         pages = json.loads(raw)
         if isinstance(pages, list) and pages and all(isinstance(p, list) for p in pages):
-            rows = [r for page in pages for r in page if isinstance(r, dict)]
-        elif isinstance(pages, list):
-            rows = [r for r in pages if isinstance(r, dict)]
-        else:
-            rows = []
+            return [r for page in pages for r in page if isinstance(r, dict)]
+        if isinstance(pages, list):
+            return [r for r in pages if isinstance(r, dict)]
     except Exception:  # noqa: BLE001 — fail closed
-        return {}
-    types: dict[str, str] = {}
-    for row in rows:
-        user = row.get("user") or {}
-        login = str(user.get("login") or "").lower()
-        if not login:
-            continue
-        kind = "Bot" if str(user.get("type") or "") == "Bot" else "User"
-        types[login] = kind
-        types.setdefault(login.removesuffix("[bot]"), kind)
-        types.setdefault(f"{login}[bot]", kind)
-    return types
+        pass
+    return []
 
 
 def _reviews_with_bot_types(token: str, repo: str, pr: int, reviews: list) -> list:
-    """Annotate pr-view reviews with identities from the REST reviews list."""
+    """Annotate GraphQL reviews using exact REST identities and matching node ids."""
     if not reviews:
         return reviews
-    types = _reviewer_types(token, repo, pr)
+    rows = _reviewer_rows(token, repo, pr)
+    types: dict[str, str] = {}
+    by_node: dict[str, dict] = {}
+    for row in rows:
+        user = row.get("user") or {}
+        login = str(user.get("login") or "").lower()
+        if login:
+            types[login] = "Bot" if str(user.get("type") or "") == "Bot" else "User"
+        node_id = str(row.get("node_id") or "")
+        if node_id:
+            by_node[node_id] = row
     for r in reviews:
         if not isinstance(r, dict):
             continue
         login = str((r.get("author") or {}).get("login")
                     or r.get("author_login") or "").lower()
-        if not login:
-            continue
         author = dict(r.get("author") or {})
-        author["type"] = types.get(login, "User")
+        exact_bot = types.get(f"{login}[bot]") if login and not login.endswith("[bot]") else None
+        if exact_bot == "Bot":
+            if types.get(login) == "User":
+                log.warning("%s#%s ambiguous reviewer login %s: exact [bot] identity wins",
+                            repo, pr, login)
+            author["type"] = "Bot"
+        else:
+            author["type"] = types.get(login, "User")
         r["author"] = author
+        rest = by_node.get(str(r.get("id") or ""))
+        if rest is not None:
+            if not r.get("html_url") and rest.get("html_url"):
+                r["html_url"] = rest["html_url"]
+            if not r.get("submitted_at") and rest.get("submitted_at"):
+                r["submitted_at"] = rest["submitted_at"]
     return reviews
 
 
 def _green_fields(cfg: Config, repo: str, sha: str, reviews: list, statuses: list,
-                  rollup: list, enabled_sources: tuple = ()) -> dict:
+                  rollup: list, enabled_sources: tuple = (), check_runs=()) -> dict:
     """The two greens + the trusted red for ONE head SHA. Fails closed.
 
     green 1 is Apollo's review state on `sha` (the newest one wins); green 2 is
@@ -331,18 +341,15 @@ def _green_fields(cfg: Config, repo: str, sha: str, reviews: list, statuses: lis
         out.update(green1_ok=accepted,
                    green1_reason="" if accepted else (state or "no verdict state"),
                    green1_label="Apollo ACCEPT",
-                   green1_url=str(chosen.get("html_url") or ""),
-                   green1_at=str(chosen.get("submitted_at") or ""))
+                   green1_url=str(chosen.get("url") or chosen.get("html_url") or ""),
+                   green1_at=str(chosen.get("submittedAt") or chosen.get("submitted_at") or ""))
 
     latest_statuses = _newest_status_per_context(statuses).values()
 
     # --- green 2a: the architect's approval on this exact head -------------
     arch = next((s for s in latest_statuses
                  if is_architect_context(str(s.get("context") or ""))), None)
-    architect_on = repo in ARCHITECT_ALWAYS_REPOS or any(
-        str(src or "").strip().lower().startswith("architect")
-        for src in enabled_sources)
-    if (architect_on and arch is not None
+    if (arch is not None
             and str(arch.get("state") or "").lower() == "success"
             and str((arch.get("creator") or {}).get("login") or "").lower() in owner_logins):
         out.update(green2_ok=True, green2_kind="architect",
@@ -361,7 +368,7 @@ def _green_fields(cfg: Config, repo: str, sha: str, reviews: list, statuses: lis
                    if _review_oid(r) == sha and _review_author(r)
                    and tr.source_matches(src, _review_author(r))
                    and str((r.get("author") or {}).get("type") or "") == "Bot"), None)
-        ck = next((c for c in (rollup or [])
+        ck = next((c for c in (check_runs or [])
                    if tr.source_matches(src, str((c.get("app") or {}).get("slug") or ""))), None)
         signals = []
         if st is not None:
@@ -371,12 +378,12 @@ def _green_fields(cfg: Config, repo: str, sha: str, reviews: list, statuses: lis
         if ck is not None:
             signals.append((str(ck.get("context") or ck.get("name") or ""),
                             str(ck.get("conclusion") or ck.get("state") or "").lower(),
-                            "check", ck.get("detailsUrl") or "",
-                            ck.get("completedAt") or ck.get("createdAt") or ""))
+                            "check", ck.get("html_url") or ck.get("details_url") or "",
+                            ck.get("completed_at") or ck.get("started_at") or ""))
         if rv is not None:
             signals.append((_review_author(rv), str(rv.get("state") or "").lower(),
-                            "review", rv.get("html_url") or "",
-                            rv.get("submitted_at") or ""))
+                            "review", rv.get("url") or rv.get("html_url") or "",
+                            rv.get("submittedAt") or rv.get("submitted_at") or ""))
         if not signals:
             continue
         # Red stands (a REQUEST CHANGES or a failing run blocks until it is
@@ -484,22 +491,15 @@ def _review_evidence(token: str, cfg: Config, repo: str, pr: int, sha: str,
         return {"ok": False, "reason": "pr view malformed", "decided_sha": sha, "head_ref": ""}
     head_ref = str(data.get("headRefName") or "")
 
-    # Trusted producer: check runs for EXACTLY this sha.  Only the run from
-    # the configured Reviews App on this exact head authorizes a merge.
-    # Filter by the trusted app id and page through the whole result: the
-    # default response is only the first 30 runs (unfiltered), so the trusted
-    # run of a busy commit can fall off page 1 and silently deny the merge.
+    # Page through every check run. build_evidence selects the trusted producer
+    # by App id; green evaluation also needs other customers' reviewer Apps.
     try:
-        from . import review_evidence as rev_ev
-        app_id = rev_ev._trusted_app_id(cfg)
         check_runs: list = []
         per_page = 100
         page = 1
         while page <= 10:
             url = (f"repos/{repo}/commits/{sha}/check-runs"
                    f"?per_page={per_page}&page={page}")
-            if app_id:
-                url += f"&app_id={app_id}"
             rc, raw_checks = _gh(token, "api", url, timeout=30)
             if rc != 0:
                 # An incomplete list could hide the trusted run — fail closed.
@@ -507,6 +507,8 @@ def _review_evidence(token: str, cfg: Config, repo: str, pr: int, sha: str,
                 break
             parsed_page = json.loads(raw_checks)
             batch = parsed_page.get("check_runs") or []
+            if not isinstance(batch, list):
+                raise TypeError("check_runs must be a list")
             check_runs.extend(batch)
             total = parsed_page.get("total_count")
             if not batch:
@@ -522,10 +524,6 @@ def _review_evidence(token: str, cfg: Config, repo: str, pr: int, sha: str,
         return {"ok": False, "reason": f"check-runs read failed ({type(exc).__name__})",
                 "decided_sha": sha, "head_ref": head_ref}
 
-    reviews = _reviews_with_bot_types(token, repo, pr, data.get("reviews") or [])
-    review_sha = next((str(r.get("commit_id") or "") for r in reversed(reviews)
-                       if r.get("body")), "")
-
     # The reviewer's gate, read straight off the commit (context-based legacy).
     trusted = _trusted_contexts(cfg)
     trusted_states: list[str] = []
@@ -535,6 +533,8 @@ def _review_evidence(token: str, cfg: Config, repo: str, pr: int, sha: str,
         rc, raw_status = _gh(token, "api", f"repos/{repo}/commits/{sha}/status", timeout=30)
         if rc == 0:
             statuses = json.loads(raw_status).get("statuses") or []
+        if not isinstance(statuses, list):
+            raise TypeError("statuses must be a list")
         for item in statuses:
             # Defect 3: the newest status PER TRUSTED CONTEXT decides — a union
             # of every status on the head kept a PR red forever after one
@@ -554,33 +554,46 @@ def _review_evidence(token: str, cfg: Config, repo: str, pr: int, sha: str,
         return {"ok": False, "reason": "no trusted review contexts configured",
                 "decided_sha": sha, "head_ref": head_ref}
 
-    rollup = data.get("statusCheckRollup") or []
-    failing = [c for c in rollup
-               if str(c.get("conclusion") or "").upper() in {"FAILURE", "TIMED_OUT", "CANCELLED"}
-               or str(c.get("state") or "").upper() in {"FAILURE", "ERROR"}]
-    # Compute rollup_green from the rollup data (defect 5 fix).
-    all_success = all(
-        str(c.get("conclusion") or "").upper() == "SUCCESS"
-        or str(c.get("state") or "").upper() == "SUCCESS"
-        for c in rollup
-    ) if rollup else None
+    try:
+        raw_reviews = data.get("reviews") or []
+        rollup = data.get("statusCheckRollup") or []
+        check_runs = data.get("check_runs") or []
+        if not isinstance(raw_reviews, list):
+            raise TypeError("reviews must be a list")
+        if not isinstance(rollup, list):
+            raise TypeError("statusCheckRollup must be a list")
+        if not isinstance(check_runs, list):
+            raise TypeError("check_runs must be a list")
+        reviews = _reviews_with_bot_types(token, repo, pr, raw_reviews)
+        review_sha = next((str(r.get("commit_id") or "") for r in reversed(reviews)
+                           if r.get("body")), "")
+        failing = [c for c in rollup
+                   if str(c.get("conclusion") or "").upper() in {"FAILURE", "TIMED_OUT", "CANCELLED"}
+                   or str(c.get("state") or "").upper() in {"FAILURE", "ERROR"}]
+        all_success = all(
+            str(c.get("conclusion") or "").upper() == "SUCCESS"
+            or str(c.get("state") or "").upper() == "SUCCESS"
+            for c in rollup
+        ) if rollup else None
 
-    # Deterministic evidence (trusted App check run + output summary) plus
-    # the legacy keys the rest of the worker still consumes.
-    from . import review_evidence as rev_ev
-    ev = rev_ev.build_evidence(cfg, data, sha)
-    ev["review_sha"] = review_sha
-    ev["review_bound_ok"] = ev.get("review_sha_match", True)
-    ev["trusted_states"] = trusted_states
-    ev["trusted_green"] = bool(trusted_states) and all(s == "success" for s in trusted_states)
-    ev["failing_checks"] = ev.get("required_checks_failing", len(failing))
-    ev["rollup_green"] = all_success
-    ev["head_ref"] = head_ref
-    ev["reviews"] = reviews
-    ev["statuses"] = statuses
-    # W1-07-r1: the two greens + trusted red for this exact head (the merge rule).
-    ev.update(_green_fields(cfg, repo, sha, reviews, statuses, rollup, enabled_sources))
-    return ev
+        # Deterministic evidence plus the legacy keys the worker consumes.
+        from . import review_evidence as rev_ev
+        ev = rev_ev.build_evidence(cfg, data, sha)
+        ev["review_sha"] = review_sha
+        ev["review_bound_ok"] = ev.get("review_sha_match", True)
+        ev["trusted_states"] = trusted_states
+        ev["trusted_green"] = bool(trusted_states) and all(s == "success" for s in trusted_states)
+        ev["failing_checks"] = ev.get("required_checks_failing", len(failing))
+        ev["rollup_green"] = all_success
+        ev["head_ref"] = head_ref
+        ev["reviews"] = reviews
+        ev["statuses"] = statuses
+        ev.update(_green_fields(cfg, repo, sha, reviews, statuses, rollup,
+                                enabled_sources, check_runs))
+        return ev
+    except Exception as exc:  # noqa: BLE001 — malformed green evidence fails closed
+        return {"ok": False, "reason": "green evaluation failed",
+                "error": type(exc).__name__, "decided_sha": sha, "head_ref": head_ref}
 
 
 #: Verdict → recorded phase for a completed (non-ACCEPT, non-builder-command)
@@ -749,19 +762,30 @@ def run_lane_gate(token: str, cfg: Config, state: NeoState, repo: str, pr: int, 
         evidence["green2_at"] = ""
         evidence["green2_reason"] = ""
         from . import merge_executor as _merge_executor
-        granted, belt = _merge_executor.pre_merge_belts(evidence)
-        if not granted:
-            ok, reason = False, belt
-        else:
-            rc, out = _gh(token, "pr", "merge", str(pr), "-R", repo, "--squash",
-                          "--match-head-commit", sha, timeout=60)
-            if rc == 0:
+        try:
+            result = _merge_executor.merge(repo, pr, sha, evidence, token)
+            if result.get("merged"):
                 state.record(repo, pr, sha, "merged", verdict="ACCEPT-MERGED",
                              detail={"lane": lane, "reason": reason})
-                _merge_executor.post_merge_comment(token, repo, pr, evidence)
                 return
-            ok, reason = False, f"merge refused by GitHub: {out[:200]}"
+            reason = "merge executor returned no merge confirmation"
+        except _merge_executor.MergeError as exc:
+            reason = str(exc)
     state.record(repo, pr, sha, "lane_hold", verdict="HOLD", detail={"lane": lane, "reason": reason})
+
+
+def _read_head_ref(token: str, repo: str, pr: int) -> str:
+    """Independently read the branch name; an unavailable branch stays unknown."""
+    try:
+        rc, raw = _gh(token, "pr", "view", str(pr), "-R", repo,
+                      "--json", "headRefName", timeout=30)
+        if rc != 0:
+            return ""
+        data = json.loads(raw)
+        branch = data.get("headRefName")
+        return str(branch) if isinstance(branch, str) else ""
+    except Exception:  # noqa: BLE001 — unknown must never fall through to the agent
+        return ""
 
 
 def _lane_pr(evidence: dict, cfg: Config | None = None) -> str | None:
@@ -1021,6 +1045,15 @@ def run_neo(cfg: Config, state: NeoState, jobs: Jobs, wake: dict,
         return
 
     # --- North Star lane branches: architect-gated merge, never the agent ---
+    head_unknown = "head_ref" in evidence
+    if head_unknown and not evidence.get("head_ref"):
+        evidence["head_ref"] = (str(wake.get("head_ref") or "")
+                                or _read_head_ref(token, repo, pr))
+    if head_unknown and not evidence.get("head_ref"):
+        state.record(repo, pr, sha, "lane_hold", verdict="HOLD",
+                     detail={"lane": "unknown",
+                             "reason": "PR head branch unavailable — cannot rule out a lane PR"})
+        return
     try:
         lane_pr = _lane_pr(evidence, cfg)
     except (AgentError, TypeError, ValueError) as exc:

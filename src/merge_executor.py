@@ -207,6 +207,10 @@ def merge(
         )
     if state != "open":
         raise MergeDenied(f"PR is not open (state={state})")
+    if str(data.get("mergeable") or "") != "MERGEABLE":
+        raise MergeDenied(f"PR is not mergeable (mergeable={data.get('mergeable')})")
+    if data.get("isCrossRepository") is not False:
+        raise MergeDenied("PR head is a fork or its repository is unknown")
 
     # --- Step 3: Verify evidence supports the merge ------------------------
     # Safety net (W1-13-r1 defect 6): run the SAME merge_authority gate the

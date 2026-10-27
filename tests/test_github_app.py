@@ -710,15 +710,15 @@ class TestWorkerWiring:
                 return 0, json.dumps({"headRefOid": SHA1, "reviews": [],
                                       "statusCheckRollup": []})
             if (args[0] == "api" and "check-runs" in args[1]):
-                assert "app_id=12345" in args[1]
+                assert "app_id=" not in args[1]
                 assert "per_page=100" in args[1]
-                if "&page=1&" in args[1]:
+                if args[1].endswith("page=1"):
                     seen_pages.append(1)
                     return 0, json.dumps({
                         "total_count": 150,
                         "check_runs": [untrusted(i) for i in range(100)],
                     })
-                assert "&page=2&" in args[1]
+                assert args[1].endswith("page=2")
                 seen_pages.append(2)
                 runs = [untrusted(i) for i in range(49)]
                 runs.append({

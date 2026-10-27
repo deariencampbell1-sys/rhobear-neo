@@ -38,7 +38,9 @@ class FakeState:
 def evidence(**over):
     e = {"ok": True, "decided_sha": HEAD, "head_sha": HEAD, "trusted_green": True,
          "required_checks_pass": True, "head_ref": "l3-kit/package-tokens", "reviews": [],
-         "green1_ok": True, "green1_reason": "", "trusted_red": []}
+         "green1_ok": True, "green1_reason": "", "trusted_red": [],
+         "trusted_producer_ok": True, "review_sha_match": True,
+         "unresolved_critical_high": 0, "coverage_complete": True, "auto_merge": True}
     e.update(over)
     return e
 
@@ -119,15 +121,25 @@ def fake_gh(statuses, merge_rc=0):
 
     def gh(token, *args, timeout=30):
         calls.append(args)
-        if args[:2] == ("pr", "view") and "headRefName" in args:
-            return 0, json.dumps({"headRefOid": HEAD, "headRefName": "l3-kit/package-tokens",
-                                  "reviews": []})
-        if args[:2] == ("pr", "merge"):
-            return merge_rc, "merged" if merge_rc == 0 else "Head branch was modified"
+        if args[:2] == ("pr", "view") and args[-1] == "headRefName":
+            return 0, json.dumps({"headRefName": "feature/not-a-lane"})
+        if args[:2] == ("pr", "view"):
+            return 0, json.dumps({"headRefOid": HEAD, "state": "OPEN",
+                                  "mergeable": "MERGEABLE", "isCrossRepository": False,
+                                  "headRefName": "l3-kit/package-tokens", "reviews": []})
+        if args[:2] == ("api", "-X") and "PUT" in args:
+            return merge_rc, (json.dumps({"merged": True, "sha": HEAD}) if merge_rc == 0
+                              else "GitHub refused merge: required checks")
         if args[:2] == ("pr", "comment"):
             return 0, "commented"
         if args[0] == "api" and args[1].endswith("/statuses?per_page=100"):
             return 0, json.dumps(statuses)
+        if args[0] == "api" and args[1] == f"repos/{REPO}":
+            return 0, "main"
+        if args[:2] == ("pr", "list"):
+            return 0, ""
+        if args[:2] == ("api", "-X") and "DELETE" in args:
+            return 0, ""
         raise AssertionError(f"unexpected gh call {args}")
     return gh, calls
 
@@ -153,14 +165,14 @@ def run(statuses, merge_rc=0, evidence_dict=None, cfg=None):
 
 def test_lane_pr_merges_the_exact_head_without_the_agent():
     state, calls = run([architect()])
-    merge = next(c for c in calls if c[:2] == ("pr", "merge"))
-    assert "--match-head-commit" in merge and HEAD in merge
+    merge = next(c for c in calls if c[:2] == ("api", "-X") and "PUT" in c)
+    assert f"sha={HEAD}" in merge
     assert state.rows[-1][3] == "merged"
 
 
 def test_lane_pr_without_architect_accept_holds():
     state, calls = run([])
-    assert not any(c[:2] == ("pr", "merge") for c in calls)
+    assert not any(c[:2] == ("api", "-X") and "PUT" in c for c in calls)
     assert state.rows[-1][3] == "lane_hold" and "architect" in state.rows[-1][5]["reason"]
 
 
@@ -183,6 +195,8 @@ def test_lane_gate_reads_evidence_through_the_real_collector():
     def gh(token, *args, timeout=30):
         if args[:2] == ("pr", "view"):
             return 0, json.dumps({"headRefOid": HEAD, "headRefName": "l8b/fix-usb-macros",
+                                  "state": "OPEN", "mergeable": "MERGEABLE",
+                                  "isCrossRepository": False, "installation_auto_merge": True,
                                   "reviews": [{"state": "APPROVED", "commit_id": HEAD, "body": "",
                                                "author": {"login": "rhobear-reviews[bot]",
                                                           "type": "Bot"}}],
@@ -199,13 +213,19 @@ def test_lane_gate_reads_evidence_through_the_real_collector():
             return 0, json.dumps(statuses)
         if args[0] == "api" and args[1].endswith("/status"):
             return 0, json.dumps({"total_count": len(statuses), "statuses": statuses})
-        if args[:2] == ("pr", "merge"):
-            return 0, "merged"
+        if args[:2] == ("api", "-X") and "PUT" in args:
+            return 0, json.dumps({"merged": True, "sha": HEAD})
         if args[:2] == ("pr", "comment"):
             return 0, "commented"
         if args[0] == "api" and any("/pulls/51/reviews" in a for a in args):
             return 0, json.dumps([[
                 {"user": {"login": "rhobear-reviews[bot]", "type": "Bot"}}]])
+        if args[0] == "api" and args[1] == f"repos/{REPO}":
+            return 0, "main"
+        if args[:2] == ("pr", "list"):
+            return 0, ""
+        if args[:2] == ("api", "-X") and "DELETE" in args:
+            return 0, ""
         raise AssertionError(f"unexpected gh call {args}")
 
     cfg = dataclasses.replace(Config(), lane_merge=True,
@@ -235,7 +255,7 @@ def test_lane_gate_uses_fresh_reviews_not_the_stale_outer_list():
          mock.patch.object(neo_worker, "_review_evidence", return_value=fresh), \
          mock.patch.object(neo_worker, "_enabled_reviewers", return_value=()):
         neo_worker.run_lane_gate("tok", cfg, state, REPO, 51, HEAD, "l3-kit")
-    assert not any(c[:2] == ("pr", "merge") for c in calls), calls
+    assert not any(c[:2] == ("api", "-X") and "PUT" in c for c in calls), calls
     assert not any(c[0] == "api" and c[1].endswith("/statuses?per_page=100") for c in calls), calls
     assert state.rows[-1][3] == "lane_hold", state.rows
     assert "green 1" in state.rows[-1][5]["reason"], state.rows
@@ -310,7 +330,7 @@ def test_drift_status_wakes_the_lane_gate_but_never_the_agent():
                            {"job_id": 1, "repo": REPO, "sha": HEAD, "green": True,
                             "context": "l0/drift"})
     agent.assert_not_called()
-    assert not any(c[:2] == ("pr", "merge") for c in calls)
+    assert not any(c[:2] == ("api", "-X") and "PUT" in c for c in calls)
     assert state.rows == []
 
 
@@ -319,12 +339,12 @@ def test_review_bound_is_required_by_the_lane_gate():
     an older commit passed the lane gate and merged. The reviewed commit must
     be this head SHA, and the hold names it."""
     state, calls = run([architect()], evidence_dict=evidence(review_bound_ok=False))
-    assert not any(c[:2] == ("pr", "merge") for c in calls)
+    assert not any(c[:2] == ("api", "-X") and "PUT" in c for c in calls)
     assert state.rows[-1][3] == "lane_hold"
     assert "reviewed commit" in state.rows[-1][5]["reason"]
     # The same evidence, bound to the head, merges.
     state, calls = run([architect()], evidence_dict=evidence(review_bound_ok=True))
-    assert any(c[:2] == ("pr", "merge") for c in calls)
+    assert any(c[:2] == ("api", "-X") and "PUT" in c for c in calls)
     assert state.rows[-1][3] == "merged"
 
 
@@ -366,7 +386,7 @@ def test_lane_gate_fails_closed_with_a_lane_hold_when_the_evidence_read_breaks()
                            {"job_id": 1, "repo": REPO, "sha": HEAD, "green": True,
                             "context": "rhobear-reviews"})
     agent.assert_not_called()
-    assert not any(c[:2] == ("pr", "merge") for c in calls)
+    assert not any(c[:2] == ("api", "-X") and "PUT" in c for c in calls)
     assert state.rows[-1][3] == "lane_hold"
     assert "evidence" in state.rows[-1][5]["reason"]
 
@@ -391,7 +411,7 @@ def test_transient_evidence_failure_does_not_skip_agent_on_non_lane_pr():
 def test_lane_merge_disabled_by_default_records_a_lane_hold():
     state, calls = run([architect()], cfg=Config())
     assert Config().lane_merge is False
-    assert not any(c[:2] == ("pr", "merge") for c in calls)
+    assert not any(c[:2] == ("api", "-X") and "PUT" in c for c in calls)
     assert state.rows[-1][3] == "lane_hold"
     assert "lane merges disabled" in state.rows[-1][5]["reason"]
 
@@ -404,7 +424,7 @@ def test_lane_gate_runs_the_same_belts_then_posts_the_comment():
     assert "CI:" in body
     assert state.rows[-1][3] == "merged"
     state, calls = run([architect()], evidence_dict=evidence(trusted_red=["CodeAnt (failure)"]))
-    assert not any(c[:2] == ("pr", "merge") for c in calls)
+    assert not any(c[:2] == ("api", "-X") and "PUT" in c for c in calls)
     assert not any(c[:2] == ("pr", "comment") for c in calls)
     assert state.rows[-1][3] == "lane_hold"
 
