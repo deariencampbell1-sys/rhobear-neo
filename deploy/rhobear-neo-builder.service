@@ -1,37 +1,45 @@
-# /etc/systemd/system/rhobear-neo-builder.service
+# rhobear-neo-builder — one long-running neo builder worker (W1-10-r1).
+#
+#   * User: slang (privilege split, W1-10-r1 — unchanged).
+#   * Secrets are delivered by /opt/rhobear/bin/vault-env (ExecStartPre)
+#     into /run/rhobear-neo-builder/env (dir 0700, file 0600), loaded
+#     via EnvironmentFile=. The vault is never read by systemd or by
+#     the app; values never appear in the journal.
+#   * outbound-only: needs no inbound port, no TTY.
+#   * hardening unchanged: NoNewPrivileges, ProtectSystem=strict,
+#     ProtectHome, PrivateTmp, RestrictAddressFamilies; the unit is
+#     writable only for its two work dirs.
+
 [Unit]
-Description=rhobear-neo builder lane - dispatches BOUNCE-BUILDER fixes via Hermes
-After=rhobear-neo.service
+Description=rhobear neo builder worker
+After=network-online.target
+Wants=network-online.target
 
 [Service]
+Type=simple
 User=slang
 WorkingDirectory=/opt/rhobear/rhobear-neo
-EnvironmentFile=/opt/rhobear/rhobear-neo/.env
-Environment=PATH=/usr/local/bin:/usr/bin:/bin:/opt/rhobear/rhobear-neo/.venv/bin
+RuntimeDirectory=rhobear-neo-builder rhobear-neo-builder-gh
+RuntimeDirectoryMode=0700
+ExecStartPre=+/opt/rhobear/bin/vault-env rhobear-neo-builder
+EnvironmentFile=/run/rhobear-neo-builder/env
+Environment=NEO_GITHUB_APP_ID=4347986
+Environment=RHOBEAR_GH_APP_OWNER=deariencampbell1-sys
+Environment=RHOBEAR_GH_APP_CACHE=/run/rhobear-neo-builder-gh
+Environment=PATH=/opt/rhobear/gh-app:/usr/local/bin:/usr/bin:/bin:/opt/rhobear/rhobear-neo/.venv/bin
 ExecStart=/opt/rhobear/rhobear-neo/.venv/bin/python -m src.neo_builder
 Restart=always
-RestartSec=15
+RestartSec=5
 
-# Hardening (W1-10-r1, MEDIUM-1): the fixer runs `--yolo --accept-hooks` in a
-# worktree of third-party PR content and holds a push token, so a
-# prompt-injected diff must not be able to reach the rest of the box.
+# --- hardening (W1-10-r1, unchanged) ------------------------------------------
+# the neo builder is outbound-only: it never accepts a connection,
+# never needs a TTY, never needs to mount anything.
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-
-# ReadWritePaths = exactly what src/neo_builder.py writes (derived from the
-# code, not guessed):
-#   /opt/rhobear/neo-builder-worktrees  WORKTREES - the per repo+PR git
-#                                         clones the fixer works in, plus the
-#                                         .locks/ fcntl lock dir inside it
-#                                         (prepare_worktree)
-#   /opt/rhobear/neo-builder-briefs     BRIEFS - the rendered brief.md for
-#                                         each dispatched round (dispatch_one)
-# Everything else is read-only; /tmp is PrivateTmp.  Secrets (.env,
-# app-key.pem) live under /opt/rhobear/rhobear-neo and are never writable
-# from this unit.
+# Writable only for the two work dirs (privilege split, W1-10-r1).
 ReadWritePaths=/opt/rhobear/neo-builder-worktrees /opt/rhobear/neo-builder-briefs
 
 [Install]

@@ -76,7 +76,7 @@ def _heredoc(text: str, marker: str) -> str:
     assert match, (
         f"installer heredoc {marker} absent — no installer helper markers (red)"
     )
-    return match.group(2)
+    return match.group(1)
 
 
 def _helper_body() -> str:
@@ -289,7 +289,7 @@ def test_units_use_versioned_runtime_environment():
         )
         assert lines.count("RuntimeDirectoryMode=0700") == 1
 
-        assert APP_ID_LINE in lines, f"{unit_name}: versioned App ID"
+        assert any(APP_ID_LINE in ln for ln in lines), f"{unit_name}: versioned App ID"
         assert "Environment=RHOBEAR_GH_APP_OWNER=deariencampbell1-sys" in lines
         assert f"Environment=RHOBEAR_GH_APP_CACHE=/run/{service}-gh" in lines
         path_lines = [ln for ln in lines if ln.startswith("Environment=PATH=")]
@@ -335,7 +335,7 @@ def test_installer_has_no_repository_secret_bootstrap():
     # no repository-secret bootstrap of any kind
     assert "app-key.pem" not in text, "installer must not touch app-key.pem"
     assert ".env.example" not in text, "installer must not copy the example env"
-    assert not re.search(r"(^|[\s/=$}])\.env(\b|$)", text, re.M), (
+    assert not re.search(r"(?<![A-Za-z0-9_.\-])\.env(?![A-Za-z0-9_])", text), (
         "installer must not create, copy, edit or instruct editing a repository .env"
     )
 

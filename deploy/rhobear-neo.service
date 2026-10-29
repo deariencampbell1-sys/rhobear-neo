@@ -1,19 +1,41 @@
+# rhobear-neo — RHOBEAR's neo service. Stubs copied 2026-06-13 from the
+# rhobear-reviews service unit and adapted.  Secrets come from the vault via
+# /opt/rhobear/bin/vault-env (ExecStartPre) into /run/rhobear-neo/env (0700 /
+# 0600), loaded via EnvironmentFile=; hardening unchanged (W1-10-r1).
+
 [Unit]
-Description=rhobear-neo — the review-and-merge gate (sibling to rhobear-reviews)
-After=network-online.target postgresql.service
+Description=rhobear neo service
+After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
+User=root
 WorkingDirectory=/opt/rhobear/rhobear-neo
-EnvironmentFile=/opt/rhobear/rhobear-neo/.env
+RuntimeDirectory=rhobear-neo rhobear-neo-gh
+RuntimeDirectoryMode=0700
+ExecStartPre=+/opt/rhobear/bin/vault-env rhobear-neo
+EnvironmentFile=/run/rhobear-neo/env
+Environment=NEO_GITHUB_APP_ID=4347986
+Environment=RHOBEAR_GH_APP_OWNER=deariencampbell1-sys
+Environment=RHOBEAR_GH_APP_CACHE=/run/rhobear-neo-gh
+Environment=PATH=/opt/rhobear/gh-app:/usr/local/bin:/usr/bin:/bin:/opt/rhobear/rhobear-neo/.venv/bin
+Environment=NEO_CONFIG=/opt/rhobear/rhobear-neo/neo.yaml
+Environment=NEO_ALLOWED_MODEL=deepseek-v4-flash
 ExecStart=/opt/rhobear/rhobear-neo/.venv/bin/python -m src
 Restart=always
-RestartSec=3
-# The DeepSeek-swapped `claude` CLI + `gh` live on PATH; keep the login user's PATH.
-Environment=PATH=/usr/local/bin:/usr/bin:/bin:/opt/rhobear/rhobear-neo/.venv/bin
-StandardOutput=journal
-StandardError=journal
+RestartSec=5
+
+# --- hardening (W1-10-r1, unchanged) ------------------------------------------
+# the rhobear-neo service is outbound-only: it never accepts a connection,
+# never needs a TTY, never needs to mount anything.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# Writable state — /opt is read-only under ProtectSystem=strict.
+ReadWritePaths=/opt/rhobear/rhobear-neo/state
 
 [Install]
 WantedBy=multi-user.target

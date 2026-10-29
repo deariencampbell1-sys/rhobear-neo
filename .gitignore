@@ -2,6 +2,11 @@
 __pycache__/
 *.pyc
 .env
+.dburl
+.dskey
+.ghtoken
+.webhooksecret
 *.pem
+app-key.pem
 .local/
 watch.log
