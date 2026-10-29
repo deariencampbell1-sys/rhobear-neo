@@ -1,6 +1,6 @@
 """W1-03-r1 — vault-backed service environments without unversioned drop-ins.
 
-Six tests over the installer-generated ``vault-env`` helper, the two owned
+Eleven tests over the installer-generated ``vault-env`` helper, the two owned
 units and the secret ignore rules.  Every fixture is fabricated inside the
 test: no real PEM, no real DSN, no real vault file, no network, no write to a
 production path, and no systemd is started — the helper is exercised as a
@@ -10,6 +10,7 @@ plain POSIX ``sh`` script in pytest's tmp_path.  No product code is imported.
 from __future__ import annotations
 
 import base64
+import os
 import re
 import stat
 import subprocess
@@ -94,14 +95,19 @@ def _install_helper(tmp_path: Path) -> Path:
     return helper
 
 
-def _run_helper(helper: Path, service: str, *, vault: Path, run_dir: Path, names_dir: Path):
+def _run_helper(
+    helper: Path, service: str, *, vault: Path, run_dir: Path, names_dir: Path,
+    extra_env=None, path_prefix=None,
+):
     """Run the helper as plain POSIX sh with only the documented overrides."""
     env = {
         "VAULT_FILE": str(vault),
         "RUN_DIR": str(run_dir),
         "NAMES_DIR": str(names_dir),
-        "PATH": "/usr/bin:/bin",
+        "PATH": (f"{path_prefix}:" if path_prefix else "") + "/usr/bin:/bin",
     }
+    if extra_env:
+        env.update(extra_env)
     return subprocess.run(
         ["/bin/sh", str(helper), service],
         env=env,
@@ -203,12 +209,12 @@ def test_aliases_pem_decode_atomic_env_and_modes(tmp_path):
 
         lines = env_file.read_text(encoding="utf-8").splitlines()
         assert lines == [
-            f"NEO_GITHUB_APP_KEY_PATH={expected_pem}",
-            f"RHOBEAR_NEO_WEBHOOK_SECRET={values['RHOBEAR_ZEUS_WEBHOOK_SECRET']}",
-            f"DATABASE_URL={values['REVIEWS_DATABASE_URL']}",
-            f"DEEPSEEK_API_KEY={values['DEEPSEEK_API_KEY']}",
-            f"DEEPINFRA_API_KEY={values['DEEPINFRA_API_KEY']}",
-        ], "the five service-specific aliases must be emitted exactly"
+            f'NEO_GITHUB_APP_KEY_PATH="{expected_pem}"',
+            f'RHOBEAR_NEO_WEBHOOK_SECRET="{_esc(values["RHOBEAR_ZEUS_WEBHOOK_SECRET"])}"',
+            f'DATABASE_URL="{_esc(values["REVIEWS_DATABASE_URL"])}"',
+            f'DEEPSEEK_API_KEY="{_esc(values["DEEPSEEK_API_KEY"])}"',
+            f'DEEPINFRA_API_KEY="{_esc(values["DEEPINFRA_API_KEY"])}"',
+        ], 'the five service-specific aliases must be emitted exactly as NAME="<escaped>"'
         assert not any(re.match(r".*_B64=", ln) for ln in lines), "no _B64 name may be exported"
         for ln in lines:
             key, _, value = ln.partition("=")
@@ -221,10 +227,15 @@ def test_aliases_pem_decode_atomic_env_and_modes(tmp_path):
             }
             assert value, f"empty value for {key}"
 
-        # atomic delivery: the env file is installed via a same-dir temp + rename
+        # atomic delivery: output is staged in a sibling temp dir and renamed
         body = _helper_body()
-        assert ".tmp." in body, "helper must stage output in a same-directory temp file"
-        assert re.search(r"\bmv\b", body), "helper must rename temp output into place"
+        assert "mktemp -d" in body and ".vault-env." in body, (
+            "helper must stage output in a sibling temp dir"
+        )
+        assert "mv -T -f" in body, "helper must rename temp output into place"
+        assert "env.tmp." not in body and ".tmp.$$" not in body, (
+            "no temp file may be created inside the service dir"
+        )
 
     assert not marker.exists(), (
         "a metacharacter value was executed instead of treated as data"
@@ -276,11 +287,18 @@ def test_units_use_versioned_runtime_environment():
         text = (DEPLOY / unit_name).read_text(encoding="utf-8")
         lines = [ln.strip() for ln in text.splitlines()]
 
-        assert lines.count(f"EnvironmentFile=/run/{service}/env") == 1, (
-            f"{unit_name}: /run EnvironmentFile wiring absent (red)"
+        assert lines.count(f"EnvironmentFile=-/run/{service}/env") == 1, (
+            f"{unit_name}: EnvironmentFile=-/run wiring absent (red)"
+        )
+        assert lines.count(f"EnvironmentFile=/run/{service}/env") == 0, (
+            f"{unit_name}: EnvironmentFile without the - fails on a fresh install"
         )
         expected_pre = f"ExecStartPre=+/opt/rhobear/bin/vault-env {service}"
         assert lines.count(expected_pre) == 1, f"{unit_name}: exact {expected_pre} once"
+        pre_lines = [ln for ln in lines if ln.startswith("ExecStartPre=")]
+        assert len(pre_lines) == 1 and pre_lines[0].startswith("ExecStartPre=+/"), (
+            f"{unit_name}: ExecStartPre must start with +/ and never a - (red)"
+        )
         assert not any(ln.startswith("EnvironmentFile=/opt") for ln in lines), (
             f"{unit_name}: unversioned /opt EnvironmentFile must be gone"
         )
@@ -382,3 +400,184 @@ def test_secret_ignore_patterns_and_existing_hardening():
         "RestrictAddressFamilies": ["AF_UNIX AF_INET AF_INET6"],
     }.items():
         assert advisor.get(key) == want, f"advisor hardening changed: {key}"
+
+
+# --- r3: outputs take the runtime directory owner ----------------------------
+
+def _esc(value: str) -> str:
+    """The r3 env-file escaping: every backslash doubled, then every quote
+    backslashed."""
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _systemd_unquote(quoted: str) -> str:
+    r"""Systemd's env-file double-quote rules: strip the outer quotes, then
+    \X yields X."""
+    assert quoted[:1] == quoted[-1:] == '"', repr(quoted)
+    return re.sub(r"\\(.)", r"\1", quoted[1:-1], flags=re.S)
+
+
+def _fake_chown(tmp_path: Path, *, rc: int = 0):
+    """A fake `chown` first on PATH: appends its argv to $CHOWN_LOG (one line
+    per call) and exits `rc`."""
+    bin_dir = tmp_path / "fake-chown-bin"
+    bin_dir.mkdir(exist_ok=True)
+    log = tmp_path / "chown.log"
+    script = _write(bin_dir / "chown",
+                    f'#!/bin/sh\nprintf "%s\\n" "$*" >> "$CHOWN_LOG"\nexit {rc}\n')
+    script.chmod(0o755)
+    return bin_dir, log
+
+
+KEY_BYTES = (b"-----BEGIN FAKE PRIVATE KEY-----\nB64MATERIAL0000\n"
+             b"-----END FAKE PRIVATE KEY-----\n")
+
+
+def _r3_fixture(tmp_path: Path):
+    """Shared r3 fixture: a names file and vault with one ordinary name and one
+    _B64 name, plus the extracted helper and its run dir."""
+    ord_value = "ord-sentinel-7c1e"
+    vault = _write(tmp_path / "vault",
+                   f"ORD_VAULT={ord_value}\nFAKE_KEY_B64={base64.b64encode(KEY_BYTES).decode()}\n")
+    names_dir = tmp_path / "names"
+    names_dir.mkdir()
+    _write(names_dir / "svc.names", "ORD_OUT=ORD_VAULT\nKEY_PATH=FAKE_KEY_B64\n")
+    helper_dir = tmp_path / "bin"
+    helper_dir.mkdir()
+    return _install_helper(helper_dir), tmp_path / "run", vault, names_dir, ord_value
+
+
+def test_outputs_take_runtime_dir_owner(tmp_path):
+    """r3 — the helper chowns every temp to the service dir's owner
+    (``chown --reference=<svc_dir>``) before the rename; the final paths are
+    never chown targets."""
+    helper, run_dir, vault, names_dir, _ = _r3_fixture(tmp_path)
+    bin_dir, log = _fake_chown(tmp_path)
+    proc = _run_helper(helper, "svc", vault=vault, run_dir=run_dir, names_dir=names_dir,
+                       extra_env={"CHOWN_LOG": str(log)}, path_prefix=str(bin_dir))
+    assert proc.returncode == 0, proc.stderr
+    svc_dir = run_dir / "svc"
+    assert log.exists(), "the helper never called chown (red)"
+    calls = [ln for ln in log.read_text().splitlines() if ln.strip()]
+    assert len(calls) == 2, f"chown must run for the env temp and the pem temp: {calls}"
+    targets = []
+    for call in calls:
+        args = call.split()
+        assert args[0] == f"--reference={svc_dir}", \
+            f"chown must take its owner from the service dir: {call}"
+        targets.append(args[1])
+    assert sorted(t.rsplit("/", 1)[1] for t in targets) == ["env", "key_path.pem"], targets
+    for t in targets:
+        assert t.startswith(f"{run_dir}/.vault-env."), \
+            "chown must target the temp file before its rename: " + t
+        assert t not in (str(svc_dir / "env"), str(svc_dir / "key_path.pem")), \
+            "the final path must never be a chown target: " + t
+    assert (svc_dir / "env").is_file() and (svc_dir / "key_path.pem").is_file()
+
+
+def test_chown_failure_fails_closed(tmp_path):
+    """r3 — if the owner cannot be set the helper fails closed: non-zero exit,
+    `cannot set owner`, no final env or pem, no temp files left, and the fake
+    sentinel value never printed."""
+    helper, run_dir, vault, names_dir, sentinel = _r3_fixture(tmp_path)
+    bin_dir, log = _fake_chown(tmp_path, rc=1)
+    proc = _run_helper(helper, "svc", vault=vault, run_dir=run_dir, names_dir=names_dir,
+                       extra_env={"CHOWN_LOG": str(log)}, path_prefix=str(bin_dir))
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode != 0, "a failed chown must fail closed"
+    assert "cannot set owner" in proc.stderr
+    assert sentinel not in combined, "a vault value leaked into the output"
+    assert not (run_dir / "svc" / "env").exists(), "no final env may appear"
+    assert list(run_dir.glob("**/*.pem")) == [], "no pem may appear"
+    assert list(run_dir.glob("**/.vault-env.*")) == [], "no temp file may survive"
+    assert [p.name for p in (run_dir / "svc").iterdir()] == [], "no partial output"
+
+
+def test_env_values_survive_systemd_quoting(tmp_path):
+    """r3 — every env line is exactly NAME="<escaped>", and a parser applying
+    systemd's double-quote rules (strip outer quotes; a backslash escapes
+    the next character) returns
+    every original value byte for byte: a leading quote, an embedded
+    backslash, a trailing space, a mid-line # and an =."""
+    values = {
+        "V_LEAD": '"leading-quote',
+        "V_BACK": "back\\slash",
+        "V_TRAIL": "trailing-space ",
+        "V_HASH": "mid#dle",
+        "V_EQ": "eq=sign",
+    }
+    vault = _write(tmp_path / "vault", "".join(f"Q_{k[2:]}={v}\n" for k, v in values.items()))
+    names_dir = tmp_path / "names"
+    names_dir.mkdir()
+    _write(names_dir / "svc.names", "".join(f"{k}=Q_{k[2:]}\n" for k in values))
+    helper_dir = tmp_path / "bin"
+    helper_dir.mkdir()
+    helper = _install_helper(helper_dir)
+    proc = _run_helper(helper, "svc", vault=vault, run_dir=tmp_path / "run",
+                       names_dir=names_dir)
+    assert proc.returncode == 0, proc.stderr
+    parsed = {}
+    for ln in (tmp_path / "run" / "svc" / "env").read_text(encoding="utf-8").splitlines():
+        name, _, quoted = ln.partition("=")
+        assert name in values, f"unexpected env name {name}"
+        assert quoted == f'"{_esc(values[name])}"', (
+            f'{name}: env line must be exactly NAME="<escaped>", got {quoted!r}'
+        )
+        parsed[name] = _systemd_unquote(quoted)
+    assert parsed == values, "systemd's parser must return every value byte for byte"
+
+
+def test_service_name_dot_rejected(tmp_path):
+    """r3 — `vault-env .` and `vault-env ..` exit non-zero with the
+    `invalid service name` diagnostic and create no files."""
+    vault = _write(tmp_path / "vault", "ORD_VAULT=not-for-dot-names\n")
+    names_dir = tmp_path / "names"
+    names_dir.mkdir()
+    run_dir = tmp_path / "run"
+    helper_dir = tmp_path / "bin"
+    helper_dir.mkdir()
+    helper = _install_helper(helper_dir)
+    for service in (".", ".."):
+        proc = _run_helper(helper, service, vault=vault, run_dir=run_dir,
+                           names_dir=names_dir)
+        combined = proc.stdout + proc.stderr
+        assert proc.returncode != 0, f"vault-env {service} must be rejected"
+        assert "invalid service name" in proc.stderr
+        assert "not-for-dot-names" not in combined, "a vault value leaked into the output"
+    assert not run_dir.exists() or list(run_dir.iterdir()) == [], "no files may appear"
+
+
+def test_preplaced_symlinks_are_not_followed(tmp_path):
+    """r3 — a service pre-placing symlinks at every temp and final name in its
+    own runtime dir gains nothing: every sentinel is byte-identical after the
+    run, and env and the pem are regular 0600 files with the right contents."""
+    helper, run_dir, vault, names_dir, ord_value = _r3_fixture(tmp_path)
+    svc_dir = run_dir / "svc"
+    svc_dir.mkdir(parents=True)
+    sentinels = {}
+    for name, tag in (("env", "env-final"), ("key_path.pem", "pem-final")):
+        s = _write(tmp_path / f"sentinel-{tag}", f"SENTINEL-{tag}")
+        (svc_dir / name).symlink_to(s)
+        sentinels[tag] = s
+    tmp_sentinel = _write(tmp_path / "sentinel-tmp", "SENTINEL-tmp")
+    pids = set(range(1, 2049))
+    pids.update(range(os.getpid() - 32, os.getpid() + 256))
+    for n in sorted(pids):
+        (svc_dir / f"env.tmp.{n}").symlink_to(tmp_sentinel)
+    proc = _run_helper(helper, "svc", vault=vault, run_dir=run_dir, names_dir=names_dir)
+    assert proc.returncode == 0, proc.stderr
+    assert tmp_sentinel.read_text() == "SENTINEL-tmp", "a temp-name sentinel was written through"
+    for tag, s in sentinels.items():
+        assert s.read_text() == f"SENTINEL-{tag}", f"the {tag} sentinel was written through"
+    env_file = svc_dir / "env"
+    assert env_file.is_file() and not env_file.is_symlink(), "env must replace the link"
+    assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
+    assert env_file.read_text(encoding="utf-8").splitlines() == [
+        f'ORD_OUT="{ord_value}"',
+        f'KEY_PATH="{svc_dir / "key_path.pem"}"',
+    ]
+    pem = svc_dir / "key_path.pem"
+    assert pem.is_file() and not pem.is_symlink(), "the pem must replace the link"
+    assert pem.read_bytes() == KEY_BYTES
+    assert stat.S_IMODE(pem.stat().st_mode) == 0o600
+    assert list(run_dir.glob("**/.vault-env.*")) == [], "no temp dir may survive the run"
