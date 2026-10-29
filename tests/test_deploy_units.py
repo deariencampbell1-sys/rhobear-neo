@@ -116,10 +116,12 @@ def test_units_verify_clean():
     if shutil.which("systemd-analyze") is None:
         pytest.skip("systemd-analyze not available")
     for unit in (BUILDER_UNIT, ADVISOR_UNIT):
-        for cmd in _directives(unit.read_text(encoding="utf-8")).get("ExecStart", []):
-            binary = cmd.split()[0]
-            if not os.path.exists(binary):
-                pytest.skip(f"deployed layout not present ({binary})")
+        directives = _directives(unit.read_text(encoding="utf-8"))
+        for key in ("ExecStart", "ExecStartPre"):
+            for cmd in directives.get(key, []):
+                binary = cmd.split()[0].lstrip("-@:+!")
+                if not os.path.exists(binary):
+                    pytest.skip(f"deployed layout not present ({binary})")
     proc = subprocess.run(
         ["systemd-analyze", "verify", str(BUILDER_UNIT), str(ADVISOR_UNIT)],
         capture_output=True, text=True,
