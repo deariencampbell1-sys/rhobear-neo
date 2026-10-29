@@ -24,14 +24,15 @@ install_vault_env() {
 # names decode to 0600 pems whose absolute path is exported. Overrides:
 # VAULT_FILE, RUN_DIR, NAMES_DIR. Diagnostics never carry values.
 set -eu; set +x; umask 077
-ok=0; env_tmp=""; pem_tmps=""; pem_finals=""
-cleanup() { [ "$ok" -eq 1 ] && return 0; rm -f ${env_tmp:-} ${pem_tmps:-} ${pem_finals:-}; return 0; }
+ok=0; tmpd=""; pem_finals=""
+cleanup() { [ "$ok" -eq 1 ] || rm -f ${pem_finals:-}; [ -z "$tmpd" ] || rm -rf "$tmpd"; return 0; }
 trap cleanup EXIT
 fail() { echo "vault-env: $1" >&2; exit 1; }
+esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
 valid_name() { case "$1" in ""|[0-9]*|*[!A-Za-z0-9_]*) return 1 ;; esac; return 0; }
 service="${1:-}"
 [ -n "$service" ] || fail "usage: vault-env <service>"
-case "$service" in */*) fail "invalid service name $service" ;; esac
+case "$service" in ''|.|..|*/*) fail "invalid service name $service" ;; esac
 VAULT_FILE="${VAULT_FILE:-/etc/rhobear/llm-keys.env}"
 RUN_DIR="${RUN_DIR:-/run}"
 NAMES_DIR="${NAMES_DIR:-/etc/rhobear/vault-env.d}"
@@ -63,21 +64,25 @@ for p in $pairs; do
 done
 svc_dir="$RUN_DIR/$service"
 mkdir -p "$svc_dir" && chmod 0700 "$svc_dir" || fail "cannot prepare $svc_dir"
-env_tmp="$svc_dir/env.tmp.$$"; : > "$env_tmp" && chmod 600 "$env_tmp" || fail "cannot write $env_tmp"
+owner_ref="$svc_dir"
+tmpd=$(mktemp -d "$(dirname "$svc_dir")/.vault-env.XXXXXX") || fail "cannot create temp dir"
+env_tmp="$tmpd/env"; : > "$env_tmp" && chmod 600 "$env_tmp" || fail "cannot write $env_tmp"
+chown --reference="$owner_ref" "$env_tmp" || fail "cannot set owner of $env_tmp"
 for p in $pairs; do
   out="${p%%=*}"; vn="${p#*=}"; val="$(vault_value "$vn")"
   case "$vn" in
   *_B64)
     low="$(printf '%s' "$out" | tr 'A-Z' 'a-z')"
-    pem="$svc_dir/$low.pem"; pt="$pem.tmp.$$"; pem_tmps="$pem_tmps $pt"
+    pem="$svc_dir/$low.pem"; pt="$tmpd/$low.pem"
     printf '%s' "$val" | base64 -d > "$pt" 2>/dev/null || { rm -f "$pt"; fail "invalid base64 for vault name $vn"; }
-    chmod 600 "$pt" && mv "$pt" "$pem"; pem_finals="$pem_finals $pem"
-    printf '%s=%s\n' "$out" "$pem" >> "$env_tmp"
+    chmod 600 "$pt"; chown --reference="$owner_ref" "$pt" || fail "cannot set owner of $pt"
+    mv -T -f "$pt" "$pem"; pem_finals="$pem_finals $pem"
+    printf '%s="%s"\n' "$out" "$(esc "$pem")" >> "$env_tmp"
     ;;
-  *) printf '%s=%s\n' "$out" "$val" >> "$env_tmp" ;;
+  *) printf '%s="%s"\n' "$out" "$(esc "$val")" >> "$env_tmp" ;;
   esac
 done
-mv "$env_tmp" "$svc_dir/env" && env_tmp="" || fail "cannot install $svc_dir/env"
+mv -T -f "$env_tmp" "$svc_dir/env" || fail "cannot install $svc_dir/env"
 ok=1
 VAULT_ENV_HELPER
   chmod 0755 /opt/rhobear/bin/vault-env

@@ -15,7 +15,7 @@ WorkingDirectory=/opt/rhobear/rhobear-neo
 RuntimeDirectory=rhobear-neo-builder rhobear-neo-builder-gh
 RuntimeDirectoryMode=0700
 ExecStartPre=+/opt/rhobear/bin/vault-env rhobear-neo-builder
-EnvironmentFile=/run/rhobear-neo-builder/env
+EnvironmentFile=-/run/rhobear-neo-builder/env
 Environment=NEO_GITHUB_APP_ID=4347986
 Environment=RHOBEAR_GH_APP_OWNER=deariencampbell1-sys
 Environment=RHOBEAR_GH_APP_CACHE=/run/rhobear-neo-builder-gh
