@@ -46,6 +46,9 @@ UNITS = {
     "rhobear-neo-builder.service": "rhobear-neo-builder",
 }
 
+# Restart behavior is kept exactly as merged (the units' own settings).
+RESTART_SEC = {"rhobear-neo.service": "3", "rhobear-neo-builder.service": "15"}
+
 IGNORE_PATTERNS = [".env", ".dburl", ".dskey", ".ghtoken", ".webhooksecret", "*.pem", "app-key.pem"]
 
 # The merged W1-10-r1 hardening that must remain intact (checked statically).
@@ -297,6 +300,18 @@ def test_units_use_versioned_runtime_environment():
         path_value = path_lines[0].split("=", 2)[2]
         first = path_value.split(":")[0]
         assert first == "/opt/rhobear/gh-app", f"{unit_name}: gh-app wrapper must be first on PATH"
+
+        env_lines = [ln for ln in lines if ln.startswith("Environment=")]
+        assert set(env_lines) == {
+            f"Environment={APP_ID_LINE}",
+            "Environment=RHOBEAR_GH_APP_OWNER=deariencampbell1-sys",
+            f"Environment=RHOBEAR_GH_APP_CACHE=/run/{service}-gh",
+            f"Environment=PATH={path_value}",
+        }, f"{unit_name}: exactly the drop-in settings, no provider/model drift"
+        assert lines.count("Restart=always") == 1, unit_name
+        assert lines.count(f"RestartSec={RESTART_SEC[unit_name]}") == 1, (
+            f"{unit_name}: restart behavior must stay as merged"
+        )
 
         assert "TimeoutStopSec" not in text, f"{unit_name}: neo keeps its own stop behavior"
         exec_starts = [ln for ln in lines if ln.startswith("ExecStart=")]
