@@ -1,6 +1,6 @@
 """W1-03-r1 — vault-backed service environments without unversioned drop-ins.
 
-Eleven tests over the installer-generated ``vault-env`` helper, the two owned
+Fourteen tests over the installer-generated ``vault-env`` helper, the two owned
 units and the secret ignore rules.  Every fixture is fabricated inside the
 test: no real PEM, no real DSN, no real vault file, no network, no write to a
 production path, and no systemd is started — the helper is exercised as a
@@ -15,6 +15,8 @@ import re
 import stat
 import subprocess
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 DEPLOY = ROOT / "deploy"
@@ -293,7 +295,10 @@ def test_units_use_versioned_runtime_environment():
         assert lines.count(f"EnvironmentFile=/run/{service}/env") == 0, (
             f"{unit_name}: EnvironmentFile without the - fails on a fresh install"
         )
-        expected_pre = f"ExecStartPre=+/opt/rhobear/bin/vault-env {service}"
+        expected_pre = (
+            f"ExecStartPre=+/usr/bin/env PATH=/usr/bin:/bin "
+            f"/opt/rhobear/bin/vault-env {service}"
+        )
         assert lines.count(expected_pre) == 1, f"{unit_name}: exact {expected_pre} once"
         pre_lines = [ln for ln in lines if ln.startswith("ExecStartPre=")]
         assert len(pre_lines) == 1 and pre_lines[0].startswith("ExecStartPre=+/"), (
@@ -417,18 +422,6 @@ def _systemd_unquote(quoted: str) -> str:
     return re.sub(r"\\(.)", r"\1", quoted[1:-1], flags=re.S)
 
 
-def _fake_chown(tmp_path: Path, *, rc: int = 0):
-    """A fake `chown` first on PATH: appends its argv to $CHOWN_LOG (one line
-    per call) and exits `rc`."""
-    bin_dir = tmp_path / "fake-chown-bin"
-    bin_dir.mkdir(exist_ok=True)
-    log = tmp_path / "chown.log"
-    script = _write(bin_dir / "chown",
-                    f'#!/bin/sh\nprintf "%s\\n" "$*" >> "$CHOWN_LOG"\nexit {rc}\n')
-    script.chmod(0o755)
-    return bin_dir, log
-
-
 KEY_BYTES = (b"-----BEGIN FAKE PRIVATE KEY-----\nB64MATERIAL0000\n"
              b"-----END FAKE PRIVATE KEY-----\n")
 
@@ -448,41 +441,89 @@ def _r3_fixture(tmp_path: Path):
 
 
 def test_outputs_take_runtime_dir_owner(tmp_path):
-    """r3 — the helper chowns every temp to the service dir's owner
-    (``chown --reference=<svc_dir>``) before the rename; the final paths are
-    never chown targets."""
-    helper, run_dir, vault, names_dir, _ = _r3_fixture(tmp_path)
-    bin_dir, log = _fake_chown(tmp_path)
-    proc = _run_helper(helper, "svc", vault=vault, run_dir=run_dir, names_dir=names_dir,
-                       extra_env={"CHOWN_LOG": str(log)}, path_prefix=str(bin_dir))
-    assert proc.returncode == 0, proc.stderr
+    """r2 — restoration of the base chown-target proof, without PATH
+    interception: the extracted helper text has only the token
+    ``/usr/bin/chown`` substituted with a logging fake (which appends its
+    arguments to a log, then execs the real chown), so the log shows exactly
+    what the helper chowns and in what order. The base properties must hold:
+    the helper exits 0, the log holds exactly 2 calls, every call's first
+    argument is ``--reference=<svc_dir>``, and every target is a temp path
+    under ``RUN_DIR/.vault-env.`` — never the final ``$svc_dir/env`` or
+    ``$svc_dir/key_path.pem``. The substitution is on this fixture only; the
+    shipped helper keeps ``/usr/bin/chown``."""
+    helper, run_dir, vault, names_dir, ord_value = _r3_fixture(tmp_path)
     svc_dir = run_dir / "svc"
-    assert log.exists(), "the helper never called chown (red)"
-    calls = [ln for ln in log.read_text().splitlines() if ln.strip()]
-    assert len(calls) == 2, f"chown must run for the env temp and the pem temp: {calls}"
-    targets = []
-    for call in calls:
-        args = call.split()
-        assert args[0] == f"--reference={svc_dir}", \
-            f"chown must take its owner from the service dir: {call}"
-        targets.append(args[1])
-    assert sorted(t.rsplit("/", 1)[1] for t in targets) == ["env", "key_path.pem"], targets
-    for t in targets:
-        assert t.startswith(f"{run_dir}/.vault-env."), \
-            "chown must target the temp file before its rename: " + t
-        assert t not in (str(svc_dir / "env"), str(svc_dir / "key_path.pem")), \
-            "the final path must never be a chown target: " + t
-    assert (svc_dir / "env").is_file() and (svc_dir / "key_path.pem").is_file()
+    body = helper.read_text(encoding="utf-8")
+    assert "/usr/bin/chown" in body, (
+        "the helper must chown at its absolute path for token substitution"
+    )
+    log = tmp_path / "chown-calls.log"
+    fake_chown = tmp_path / "logging-chown"
+    fake_chown.write_text(
+        "#!/bin/sh\n"
+        'printf \'%s\\t\' "$@" >> "$CHOWN_LOG"\n'
+        'printf \'\\n\' >> "$CHOWN_LOG"\n'
+        'exec /usr/bin/chown "$@"\n',
+        encoding="utf-8",
+    )
+    fake_chown.chmod(0o755)
+    helper.write_text(body.replace("/usr/bin/chown", str(fake_chown)), encoding="utf-8")
+
+    proc = _run_helper(helper, "svc", vault=vault, run_dir=run_dir,
+                       names_dir=names_dir, extra_env={"CHOWN_LOG": str(log)})
+    assert proc.returncode == 0, proc.stderr
+
+    calls = [ln.rstrip("\t").split("\t")
+             for ln in log.read_text(encoding="utf-8").splitlines()]
+    assert len(calls) == 2, f"expected exactly two chown calls, got {calls}"
+    for args in calls:
+        assert len(args) == 2, f"unexpected chown invocation: {args}"
+        assert args[0] == f"--reference={svc_dir}", (
+            f"every chown must reference the service directory: {args}"
+        )
+        target = args[1]
+        assert target.startswith(f"{run_dir}/.vault-env."), (
+            f"chown target outside the helper's staging dir: {target}"
+        )
+        assert target not in (str(svc_dir / "env"), str(svc_dir / "key_path.pem")), (
+            f"FINAL PATH used as a chown target: {target}"
+        )
+
+    env_file = svc_dir / "env"
+    pem = svc_dir / "key_path.pem"
+    assert env_file.is_file() and pem.is_file(), "both outputs must be installed"
+    ref = (svc_dir.stat().st_uid, svc_dir.stat().st_gid)
+    assert (env_file.stat().st_uid, env_file.stat().st_gid) == ref, (
+        "env must take the service directory's owner"
+    )
+    assert (pem.stat().st_uid, pem.stat().st_gid) == ref, (
+        "pem must take the service directory's owner"
+    )
+    assert stat.S_IMODE(svc_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
+    assert stat.S_IMODE(pem.stat().st_mode) == 0o600
+    assert env_file.read_text(encoding="utf-8").splitlines() == [
+        f'ORD_OUT="{ord_value}"',
+        f'KEY_PATH="{pem}"',
+    ]
+    assert pem.read_bytes() == KEY_BYTES
 
 
 def test_chown_failure_fails_closed(tmp_path):
     """r3 — if the owner cannot be set the helper fails closed: non-zero exit,
     `cannot set owner`, no final env or pem, no temp files left, and the fake
-    sentinel value never printed."""
+    sentinel value never printed. Failure is injected by replacing the
+    helper's absolute ``/usr/bin/chown`` in the extracted test copy with a
+    nonexistent temporary path — never a PATH-planted fake."""
     helper, run_dir, vault, names_dir, sentinel = _r3_fixture(tmp_path)
-    bin_dir, log = _fake_chown(tmp_path, rc=1)
-    proc = _run_helper(helper, "svc", vault=vault, run_dir=run_dir, names_dir=names_dir,
-                       extra_env={"CHOWN_LOG": str(log)}, path_prefix=str(bin_dir))
+    body = helper.read_text(encoding="utf-8")
+    assert "/usr/bin/chown" in body, (
+        "helper must call chown at its absolute path for fail-closed injection (red)"
+    )
+    missing_chown = tmp_path / "no-such-chown"
+    helper.write_text(body.replace("/usr/bin/chown", str(missing_chown)),
+                      encoding="utf-8")
+    proc = _run_helper(helper, "svc", vault=vault, run_dir=run_dir, names_dir=names_dir)
     combined = proc.stdout + proc.stderr
     assert proc.returncode != 0, "a failed chown must fail closed"
     assert "cannot set owner" in proc.stderr
@@ -581,3 +622,346 @@ def test_preplaced_symlinks_are_not_followed(tmp_path):
     assert pem.read_bytes() == KEY_BYTES
     assert stat.S_IMODE(pem.stat().st_mode) == 0o600
     assert list(run_dir.glob("**/.vault-env.*")) == [], "no temp dir may survive the run"
+
+
+# --- F2-r1: pinned helper PATH + installer freeze guard ---------------------
+
+PATH_PIN = "PATH=/usr/bin:/bin"
+RENDER_FN = "install_vault_env_helper"
+INSTALL_FN = "install_vault_env"
+
+
+def _render_function_text() -> str:
+    """Extract only the installer's helper-rendering function, verbatim."""
+    text = _installer_text()
+    start = text.find(f"{RENDER_FN}() {{")
+    assert start != -1, f"{RENDER_FN}() absent from the installer (red)"
+    end = text.find(f"\n{INSTALL_FN}()", start)
+    assert end != -1, f"{INSTALL_FN}() must follow {RENDER_FN}() (red)"
+    return text[start:end]
+
+
+def _run_render(func_text: str, dest: Path, tag: str):
+    """Invoke the extracted render function with /bin/bash, destination $1."""
+    script = dest.parent / f"render-{tag}.sh"
+    script.write_text(f"{func_text}\n{RENDER_FN} \"$1\"\n", encoding="utf-8")
+    return subprocess.run(["/bin/bash", str(script), str(dest)],
+                          capture_output=True, text=True)
+
+
+def test_installer_refuses_helper_without_path_pin(tmp_path):
+    """F3 — the render function refuses to create its destination when the
+    captured helper body does not open with the shebang plus the exact PATH
+    pin and a newline; the unmodified function still writes the pinned
+    helper whose first two lines are the shebang and that pin."""
+    func_text = _render_function_text()
+
+    # positive control: the unmodified render function writes a pinned helper
+    dest_ok = tmp_path / "vault-env-pinned"
+    proc = _run_render(func_text, dest_ok, "pinned")
+    assert proc.returncode == 0, proc.stderr
+    assert dest_ok.is_file(), "the valid helper must be written"
+    assert dest_ok.read_text(encoding="utf-8").splitlines()[:2] == [
+        "#!/bin/sh", PATH_PIN
+    ], "the installed helper must open with the shebang and the exact PATH pin"
+
+    # negative control: remove only the helper's PATH line from the function
+    lines = func_text.splitlines(keepends=True)
+    hit = next(i for i, ln in enumerate(lines) if ln.rstrip("\n") == PATH_PIN)
+    reduced = "".join(lines[:hit] + lines[hit + 1:])
+    dest_bad = tmp_path / "vault-env-unpinned"
+    proc = _run_render(reduced, dest_bad, "unpinned")
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode != 0, "a helper body without the PATH pin must be refused (red)"
+    assert "refusing" in combined and "PATH" in combined, combined
+    assert not dest_bad.exists(), "the refused destination must not be created"
+
+    # r2: a second PATH= assignment anywhere in the body is refused, and no
+    # destination is written — the guard may not stop at the first two lines
+    doubled = func_text.replace(
+        "set -eu; set +x; umask 077\n",
+        "set -eu; set +x; umask 077\nPATH=/usr/local/bin:/usr/bin:/bin\n",
+        1,
+    )
+    assert doubled != func_text, "second-PATH mutation anchor missing (red)"
+    dest_two = tmp_path / "vault-env-second-path"
+    proc = _run_render(doubled, dest_two, "second-path")
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode != 0, "a second PATH= assignment in the body must be refused"
+    assert "refusing" in combined and "PATH" in combined, combined
+    assert not dest_two.exists(), "the refused destination must not be created"
+
+    # r2: a destination that already exists as a symlink is refused the same
+    # way, and the symlink's target is left untouched
+    link_target = tmp_path / "symlink-target"
+    link_target.write_text("SENTINEL-UNTOUCHED\n", encoding="utf-8")
+    dest_link = tmp_path / "vault-env-symlinked"
+    dest_link.symlink_to(link_target)
+    proc = _run_render(func_text, dest_link, "symlinked")
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode != 0, "a symlink destination must be refused"
+    assert "refusing" in combined and "symlink" in combined, combined
+    assert dest_link.is_symlink(), "the refused symlink must be left in place"
+    assert link_target.read_text(encoding="utf-8") == "SENTINEL-UNTOUCHED\n", (
+        "the symlink target must be left untouched"
+    )
+
+
+@pytest.mark.parametrize("util", ["chown", "mv"])
+def test_path_pin_ignores_planted_utilities(tmp_path, util):
+    """The helper's own PATH pin keeps a hostile prefix powerless: an
+    executable fake <util> planted first on PATH (unique marker, exit 0)
+    never runs while both the ordinary and the _B64 output paths complete —
+    rc 0, no marker, no fake output, exact env/PEM contents and quoting,
+    modes 0700/0600."""
+    helper, run_dir, vault, names_dir, ord_value = _r3_fixture(tmp_path)
+    bin_dir = tmp_path / "planted-bin"
+    bin_dir.mkdir()
+    marker = tmp_path / f"planted-{util}.marker"
+    fake = _write(
+        bin_dir / util,
+        '#!/bin/sh\n: > "$PLANTED_MARKER"\n'
+        f'printf "planted {util} ran\\n"\nexit 0\n',
+    )
+    fake.chmod(0o755)
+
+    proc = _run_helper(
+        helper, "svc", vault=vault, run_dir=run_dir, names_dir=names_dir,
+        extra_env={"PLANTED_MARKER": str(marker)}, path_prefix=str(bin_dir),
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert not marker.exists(), (
+        f"planted {util} executed — the helper PATH is not pinned (red)"
+    )
+    assert proc.stdout == "", f"planted {util} wrote to stdout: {proc.stdout!r}"
+    assert proc.stderr == "", f"planted {util} wrote to stderr: {proc.stderr!r}"
+    combined = proc.stdout + proc.stderr
+    assert ord_value not in combined, "a vault value leaked into the output"
+
+    svc_dir = run_dir / "svc"
+    env_file = svc_dir / "env"
+    pem = svc_dir / "key_path.pem"
+    assert env_file.is_file(), f"{util} rename path must still install env"
+    assert pem.is_file(), f"{util} rename path must still install the pem"
+    assert stat.S_IMODE(svc_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
+    assert stat.S_IMODE(pem.stat().st_mode) == 0o600
+    assert env_file.read_text(encoding="utf-8").splitlines() == [
+        f'ORD_OUT="{ord_value}"',
+        f'KEY_PATH="{pem}"',
+    ], 'both outputs must keep exact NAME="<escaped>" quoting'
+    assert pem.read_bytes() == KEY_BYTES
+    assert list(run_dir.glob("**/.vault-env.*")) == [], "no temp dir may survive"
+
+
+# --- F2-r2: every external command absolute, proved statically ---------------
+
+HELPER_ALLOWED_BUILTINS = {
+    "printf", "pwd", "set", "trap", "umask", "case", "esac", "for", "do", "done",
+    "if", "then", "fi", "local", "return", "exit", "read", "test", "[", ":",
+}
+# POSIX reserved words: grammar, never external commands, whatever they spell.
+HELPER_SHELL_KEYWORDS = {
+    "if", "then", "elif", "else", "fi", "do", "done", "case", "esac", "for",
+    "while", "until", "in", "function", "select", "time", "!", "{", "}",
+}
+_HELPER_OPS = ";|&<>()"
+_HELPER_REDIR = ("<", ">", ">>", "<<", ">&", "<&")
+_HELPER_ASSIGN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _helper_dollar_paren(text: str, i: int) -> int:
+    """Index of the ')' matching the '$(' at text[i:i+2], quote-aware."""
+    j, n, depth = i + 2, len(text), 1
+    while j < n and depth:
+        c = text[j]
+        if c == "'":
+            k = text.find("'", j + 1)
+            j = n if k == -1 else k + 1
+        elif c == '"':
+            j += 1
+            while j < n and text[j] != '"':
+                if text[j] == "\\":
+                    j += 2
+                elif text.startswith("$(", j):
+                    j = _helper_dollar_paren(text, j) + 1
+                else:
+                    j += 1
+            j += 1
+        elif text.startswith("$(", j):
+            j = _helper_dollar_paren(text, j) + 1
+        elif c == "(":
+            depth, j = depth + 1, j + 1
+        elif c == ")":
+            depth, j = depth - 1, j + 1
+        else:
+            j += 1
+    return j - 1
+
+
+def _helper_command_words(body: str) -> list[tuple[int, str]]:
+    """Every word in command position in a POSIX sh stream, as (lineno, word).
+
+    Sized to this helper's constructs: quotes, $(...) and $((...)),
+    redirections (fd numbers, >&2), function definitions, case patterns, and
+    for/while loops. Words inside $(...) are scanned as command streams of
+    their own; case patterns and redirection targets are never commands."""
+    words: list[tuple[int, str]] = []
+
+    def scan(chunk: str, base: int) -> None:
+        toks: list[tuple[str, str, int]] = []
+        line, i, n = base, 0, len(chunk)
+        while i < n:
+            c = chunk[i]
+            if c == "\n":
+                toks.append(("op", "\n", line))
+                line += 1
+                i += 1
+            elif c in " \t":
+                i += 1
+            elif c == "#":
+                nl = chunk.find("\n", i)
+                i = n if nl == -1 else nl
+            elif c in _HELPER_OPS:
+                two = chunk[i:i + 2]
+                if two in (";;", "&&", "||", ">>", "<<", ">&", "<&"):
+                    toks.append(("op", two, line))
+                    i += 2
+                else:
+                    toks.append(("op", c, line))
+                    i += 1
+            else:
+                wline, parts = line, []
+                while i < n and chunk[i] not in _HELPER_OPS and chunk[i] not in " \t\n":
+                    c = chunk[i]
+                    if c == "'":
+                        j = chunk.find("'", i + 1)
+                        j = n if j == -1 else j
+                        parts.append(chunk[i:j + 1])
+                        i = j + 1
+                    elif c == '"':
+                        parts.append('"')
+                        i += 1
+                        while i < n and chunk[i] != '"':
+                            if chunk[i] == "\\":
+                                parts.append(chunk[i:i + 2])
+                                i += 2
+                            elif chunk.startswith("$(", i):
+                                k = _helper_dollar_paren(chunk, i)
+                                scan(chunk[i + 2:k], line)
+                                parts.append("X")
+                                i = k + 1
+                            else:
+                                if chunk[i] == "\n":
+                                    line += 1
+                                parts.append(chunk[i])
+                                i += 1
+                        parts.append('"')
+                        i += 1
+                    elif chunk.startswith("$(", i):
+                        if chunk[i + 2:i + 3] == "(":
+                            j, depth = i + 3, 1
+                            while j < n and depth:
+                                if chunk[j] == "(":
+                                    depth += 1
+                                elif chunk[j] == ")":
+                                    depth -= 1
+                                j += 1
+                            k = chunk.find(")", j)
+                            k = n if k == -1 else k
+                            parts.append("X")
+                            i = k + 1
+                        else:
+                            k = _helper_dollar_paren(chunk, i)
+                            scan(chunk[i + 2:k], line)
+                            parts.append("X")
+                            i = k + 1
+                    elif c == "\\":
+                        parts.append(chunk[i:i + 2])
+                        i += 2
+                    else:
+                        parts.append(chunk[i])
+                        i += 1
+                toks.append(("w", "".join(parts), wline))
+
+        state, seen, case_depth, idx = "cmd", False, 0, 0
+        while idx < len(toks):
+            kind, val, ln = toks[idx]
+            if kind == "op":
+                if state == "casepat":
+                    if val == ")":
+                        state, seen = "cmd", False
+                elif state == "forlist":
+                    pass  # stay until the word `do`
+                elif state == "target":
+                    if val == "&":
+                        pass  # >&2: the fd target follows
+                    elif val in _HELPER_REDIR:
+                        state = "target"
+                    else:
+                        state, seen = "cmd", False
+                elif val in _HELPER_REDIR:
+                    state = "target"
+                elif val == ";;":
+                    state = "casepat" if case_depth else "cmd"
+                    seen = False
+                else:
+                    state, seen = "cmd", False
+            elif state == "target":
+                state = "arg" if seen else "cmd"
+            elif state == "forlist":
+                if val == "do":
+                    state = "cmd"
+            elif state == "casehead":
+                if val == "in":
+                    state, case_depth = "casepat", case_depth + 1
+            elif state == "casepat":
+                if val == "esac":
+                    case_depth, state = max(0, case_depth - 1), "cmd"
+            elif (state == "cmd" and val.isdigit() and idx + 1 < len(toks)
+                  and toks[idx + 1][0] == "op" and toks[idx + 1][1] in _HELPER_REDIR):
+                pass  # an fd prefix of a redirection, not a command
+            elif state == "cmd":
+                if (idx + 2 < len(toks) and toks[idx + 1][0] == "op"
+                        and toks[idx + 1][1] == "(" and toks[idx + 2][0] == "op"
+                        and toks[idx + 2][1] == ")"):
+                    idx += 3  # function definition head; the body follows in cmd state
+                    continue
+                if val in HELPER_SHELL_KEYWORDS:
+                    if val == "case":
+                        state = "casehead"
+                    elif val == "for":
+                        state = "forlist"
+                elif _HELPER_ASSIGN.match(val):
+                    pass  # an assignment keeps command position
+                else:
+                    words.append((ln, val))
+                    seen, state = True, "arg"
+            idx += 1
+
+    scan(body, 1)
+    return words
+
+
+def test_helper_commands_are_builtins_or_absolute():
+    """r2 — every command word in the shipped helper is a shell keyword, an
+    allowlisted builtin, a function defined in the body itself, or an
+    absolute path under /usr/bin/ or /bin/. A bare chown, mv, mktemp,
+    base64, sed, tr, rm, mkdir, chmod, dirname, stat — any bare word in
+    command position — fails here with the offending line. Static, so it
+    holds no matter what PATH the helper is run with."""
+    body = _helper_body()
+    defined = set(re.findall(r"(?m)^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(\)", body))
+    lines = body.splitlines()
+    offenders = [
+        (lineno, word, lines[lineno - 1].strip())
+        for lineno, word in _helper_command_words(body)
+        if (word not in HELPER_ALLOWED_BUILTINS and word not in HELPER_SHELL_KEYWORDS
+            and word not in defined
+            and not word.startswith("/usr/bin/") and not word.startswith("/bin/"))
+    ]
+    assert not offenders, (
+        "bare command words in the helper body — every command must be a "
+        "shell keyword, an allowlisted builtin, a function defined in the "
+        f"body, or an absolute /usr/bin|/bin path: {offenders}"
+    )
