@@ -18,7 +18,7 @@ install_vault_env_helper() {
   local dest="$1" body
   body=$(cat <<'VAULT_ENV_HELPER'
 #!/bin/sh
-PATH=/usr/bin:/bin; export PATH
+PATH=/usr/bin:/bin
 # vault-env <service> - materialise <RUN_DIR>/<service>/env from the vault,
 # fail closed. NAME=value records are parsed, never sourced or printed; *_B64
 # names decode to 0600 pems whose absolute path is exported. Overrides:
@@ -27,7 +27,7 @@ set -eu; set +x; umask 077
 ok=0; tmpd=""; pem_finals=""
 cleanup() { [ "$ok" -eq 1 ] || /usr/bin/rm -f ${pem_finals:-}; [ -z "$tmpd" ] || /usr/bin/rm -rf "$tmpd"; return 0; }
 trap cleanup EXIT
-fail() { echo "vault-env: $1" >&2; exit 1; }
+fail() { printf '%s\n' "vault-env: $1" >&2; exit 1; }
 esc() { printf '%s' "$1" | /usr/bin/sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
 valid_name() { case "$1" in ""|[0-9]*|*[!A-Za-z0-9_]*) return 1 ;; esac; return 0; }
 service="${1:-}"
@@ -42,22 +42,25 @@ names_file="$NAMES_DIR/$service.names"
 [ -f "$VAULT_FILE" ] || fail "missing vault file $VAULT_FILE"
 vault_value() {
   while IFS= read -r ln || [ -n "$ln" ]; do
-    case "$ln" in ""|"#"*|*=*) ;; *) continue ;; esac
-    [ "${ln%%=*}" = "$1" ] || continue
-    val="${ln#*=}"; [ -n "$val" ] || return 1
-    printf '%s' "$val"; return 0
+    case "$ln" in
+      *=*) if [ "${ln%%=*}" = "$1" ]; then val="${ln#*=}"; [ -n "$val" ] || return 1; printf '%s' "$val"; return 0; fi ;;
+    esac
   done < "$VAULT_FILE"
   return 1
 }
 pairs=""; outs=" "; n=0
 while IFS= read -r line || [ -n "$line" ]; do
-  case "$line" in ""|"#"*) continue ;; esac
-  case "$line" in *=*) out="${line%%=*}"; vn="${line#*=}" ;; *) out="$line"; vn="$line" ;; esac
-  n=$((n + 1))
-  valid_name "$out" || fail "malformed names entry in $names_file line $n"
-  valid_name "$vn" || fail "malformed names entry in $names_file line $n"
-  case "$outs" in *" $out "*) fail "duplicate output name $out" ;; esac
-  outs="$outs$out "; pairs="$pairs $out=$vn"
+  case "$line" in
+    ""|"#"*) ;;
+    *)
+      case "$line" in *=*) out="${line%%=*}"; vn="${line#*=}" ;; *) out="$line"; vn="$line" ;; esac
+      n=$((n + 1))
+      valid_name "$out" || fail "malformed names entry in $names_file line $n"
+      valid_name "$vn" || fail "malformed names entry in $names_file line $n"
+      case "$outs" in *" $out "*) fail "duplicate output name $out" ;; esac
+      outs="$outs$out "; pairs="$pairs $out=$vn"
+      ;;
+  esac
 done < "$names_file"
 for p in $pairs; do
   vault_value "${p#*=}" >/dev/null || fail "missing vault name ${p#*=}"
@@ -88,10 +91,19 @@ VAULT_ENV_HELPER
 )
   case "$body" in
     '#!/bin/sh
-PATH=/usr/bin:/bin; export PATH
+PATH=/usr/bin:/bin
 '*) ;;
     *) echo "install.sh: refusing to write $dest: helper PATH is not pinned" >&2; return 1 ;;
   esac
+  case "$body" in
+    *"PATH="*"PATH="*)
+      echo "install.sh: refusing to write $dest: second PATH= assignment in the helper body" >&2
+      return 1 ;;
+  esac
+  if [ -L "$dest" ]; then
+    echo "install.sh: refusing to write $dest: destination is a symlink" >&2
+    return 1
+  fi
   printf '%s\n' "$body" > "$dest"
 }
 

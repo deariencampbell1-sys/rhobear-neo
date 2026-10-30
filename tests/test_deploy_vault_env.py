@@ -626,7 +626,7 @@ def test_preplaced_symlinks_are_not_followed(tmp_path):
 
 # --- F2-r1: pinned helper PATH + installer freeze guard ---------------------
 
-PATH_PIN = "PATH=/usr/bin:/bin; export PATH"
+PATH_PIN = "PATH=/usr/bin:/bin"
 RENDER_FN = "install_vault_env_helper"
 INSTALL_FN = "install_vault_env"
 
