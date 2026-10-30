@@ -1,6 +1,6 @@
 """W1-03-r1 — vault-backed service environments without unversioned drop-ins.
 
-Eleven tests over the installer-generated ``vault-env`` helper, the two owned
+Fourteen tests over the installer-generated ``vault-env`` helper, the two owned
 units and the secret ignore rules.  Every fixture is fabricated inside the
 test: no real PEM, no real DSN, no real vault file, no network, no write to a
 production path, and no systemd is started — the helper is exercised as a
@@ -15,6 +15,8 @@ import re
 import stat
 import subprocess
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 DEPLOY = ROOT / "deploy"
@@ -293,7 +295,10 @@ def test_units_use_versioned_runtime_environment():
         assert lines.count(f"EnvironmentFile=/run/{service}/env") == 0, (
             f"{unit_name}: EnvironmentFile without the - fails on a fresh install"
         )
-        expected_pre = f"ExecStartPre=+/opt/rhobear/bin/vault-env {service}"
+        expected_pre = (
+            f"ExecStartPre=+/usr/bin/env PATH=/usr/bin:/bin "
+            f"/opt/rhobear/bin/vault-env {service}"
+        )
         assert lines.count(expected_pre) == 1, f"{unit_name}: exact {expected_pre} once"
         pre_lines = [ln for ln in lines if ln.startswith("ExecStartPre=")]
         assert len(pre_lines) == 1 and pre_lines[0].startswith("ExecStartPre=+/"), (
@@ -417,18 +422,6 @@ def _systemd_unquote(quoted: str) -> str:
     return re.sub(r"\\(.)", r"\1", quoted[1:-1], flags=re.S)
 
 
-def _fake_chown(tmp_path: Path, *, rc: int = 0):
-    """A fake `chown` first on PATH: appends its argv to $CHOWN_LOG (one line
-    per call) and exits `rc`."""
-    bin_dir = tmp_path / "fake-chown-bin"
-    bin_dir.mkdir(exist_ok=True)
-    log = tmp_path / "chown.log"
-    script = _write(bin_dir / "chown",
-                    f'#!/bin/sh\nprintf "%s\\n" "$*" >> "$CHOWN_LOG"\nexit {rc}\n')
-    script.chmod(0o755)
-    return bin_dir, log
-
-
 KEY_BYTES = (b"-----BEGIN FAKE PRIVATE KEY-----\nB64MATERIAL0000\n"
              b"-----END FAKE PRIVATE KEY-----\n")
 
@@ -448,41 +441,53 @@ def _r3_fixture(tmp_path: Path):
 
 
 def test_outputs_take_runtime_dir_owner(tmp_path):
-    """r3 — the helper chowns every temp to the service dir's owner
-    (``chown --reference=<svc_dir>``) before the rename; the final paths are
-    never chown targets."""
-    helper, run_dir, vault, names_dir, _ = _r3_fixture(tmp_path)
-    bin_dir, log = _fake_chown(tmp_path)
-    proc = _run_helper(helper, "svc", vault=vault, run_dir=run_dir, names_dir=names_dir,
-                       extra_env={"CHOWN_LOG": str(log)}, path_prefix=str(bin_dir))
+    """r3 — the helper derives ownership from the service dir
+    (``chown --reference=<svc_dir>``) before the rename: env and pem end up
+    with the service directory's uid/gid, the right contents and modes, and
+    the final paths are regular files. No fake `chown` is needed — ownership
+    is compared directly against the service directory."""
+    helper, run_dir, vault, names_dir, ord_value = _r3_fixture(tmp_path)
+    proc = _run_helper(helper, "svc", vault=vault, run_dir=run_dir, names_dir=names_dir)
     assert proc.returncode == 0, proc.stderr
     svc_dir = run_dir / "svc"
-    assert log.exists(), "the helper never called chown (red)"
-    calls = [ln for ln in log.read_text().splitlines() if ln.strip()]
-    assert len(calls) == 2, f"chown must run for the env temp and the pem temp: {calls}"
-    targets = []
-    for call in calls:
-        args = call.split()
-        assert args[0] == f"--reference={svc_dir}", \
-            f"chown must take its owner from the service dir: {call}"
-        targets.append(args[1])
-    assert sorted(t.rsplit("/", 1)[1] for t in targets) == ["env", "key_path.pem"], targets
-    for t in targets:
-        assert t.startswith(f"{run_dir}/.vault-env."), \
-            "chown must target the temp file before its rename: " + t
-        assert t not in (str(svc_dir / "env"), str(svc_dir / "key_path.pem")), \
-            "the final path must never be a chown target: " + t
-    assert (svc_dir / "env").is_file() and (svc_dir / "key_path.pem").is_file()
+    env_file = svc_dir / "env"
+    pem = svc_dir / "key_path.pem"
+    assert env_file.is_file() and pem.is_file(), "both outputs must be installed"
+    ref = (svc_dir.stat().st_uid, svc_dir.stat().st_gid)
+    assert (env_file.stat().st_uid, env_file.stat().st_gid) == ref, (
+        "env must take the service directory's owner"
+    )
+    assert (pem.stat().st_uid, pem.stat().st_gid) == ref, (
+        "pem must take the service directory's owner"
+    )
+    assert "chown --reference=" in _helper_body(), (
+        "ownership must still be derived from the service directory"
+    )
+    assert stat.S_IMODE(svc_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
+    assert stat.S_IMODE(pem.stat().st_mode) == 0o600
+    assert env_file.read_text(encoding="utf-8").splitlines() == [
+        f'ORD_OUT="{ord_value}"',
+        f'KEY_PATH="{pem}"',
+    ]
+    assert pem.read_bytes() == KEY_BYTES
 
 
 def test_chown_failure_fails_closed(tmp_path):
     """r3 — if the owner cannot be set the helper fails closed: non-zero exit,
     `cannot set owner`, no final env or pem, no temp files left, and the fake
-    sentinel value never printed."""
+    sentinel value never printed. Failure is injected by replacing the
+    helper's absolute ``/usr/bin/chown`` in the extracted test copy with a
+    nonexistent temporary path — never a PATH-planted fake."""
     helper, run_dir, vault, names_dir, sentinel = _r3_fixture(tmp_path)
-    bin_dir, log = _fake_chown(tmp_path, rc=1)
-    proc = _run_helper(helper, "svc", vault=vault, run_dir=run_dir, names_dir=names_dir,
-                       extra_env={"CHOWN_LOG": str(log)}, path_prefix=str(bin_dir))
+    body = helper.read_text(encoding="utf-8")
+    assert "/usr/bin/chown" in body, (
+        "helper must call chown at its absolute path for fail-closed injection (red)"
+    )
+    missing_chown = tmp_path / "no-such-chown"
+    helper.write_text(body.replace("/usr/bin/chown", str(missing_chown)),
+                      encoding="utf-8")
+    proc = _run_helper(helper, "svc", vault=vault, run_dir=run_dir, names_dir=names_dir)
     combined = proc.stdout + proc.stderr
     assert proc.returncode != 0, "a failed chown must fail closed"
     assert "cannot set owner" in proc.stderr
@@ -581,3 +586,103 @@ def test_preplaced_symlinks_are_not_followed(tmp_path):
     assert pem.read_bytes() == KEY_BYTES
     assert stat.S_IMODE(pem.stat().st_mode) == 0o600
     assert list(run_dir.glob("**/.vault-env.*")) == [], "no temp dir may survive the run"
+
+
+# --- F2-r1: pinned helper PATH + installer freeze guard ---------------------
+
+PATH_PIN = "PATH=/usr/bin:/bin; export PATH"
+RENDER_FN = "install_vault_env_helper"
+INSTALL_FN = "install_vault_env"
+
+
+def _render_function_text() -> str:
+    """Extract only the installer's helper-rendering function, verbatim."""
+    text = _installer_text()
+    start = text.find(f"{RENDER_FN}() {{")
+    assert start != -1, f"{RENDER_FN}() absent from the installer (red)"
+    end = text.find(f"\n{INSTALL_FN}()", start)
+    assert end != -1, f"{INSTALL_FN}() must follow {RENDER_FN}() (red)"
+    return text[start:end]
+
+
+def _run_render(func_text: str, dest: Path, tag: str):
+    """Invoke the extracted render function with /bin/bash, destination $1."""
+    script = dest.parent / f"render-{tag}.sh"
+    script.write_text(f"{func_text}\n{RENDER_FN} \"$1\"\n", encoding="utf-8")
+    return subprocess.run(["/bin/bash", str(script), str(dest)],
+                          capture_output=True, text=True)
+
+
+def test_installer_refuses_helper_without_path_pin(tmp_path):
+    """F3 — the render function refuses to create its destination when the
+    captured helper body does not open with the shebang plus the exact PATH
+    pin and a newline; the unmodified function still writes the pinned
+    helper whose first two lines are the shebang and that pin."""
+    func_text = _render_function_text()
+
+    # positive control: the unmodified render function writes a pinned helper
+    dest_ok = tmp_path / "vault-env-pinned"
+    proc = _run_render(func_text, dest_ok, "pinned")
+    assert proc.returncode == 0, proc.stderr
+    assert dest_ok.is_file(), "the valid helper must be written"
+    assert dest_ok.read_text(encoding="utf-8").splitlines()[:2] == [
+        "#!/bin/sh", PATH_PIN
+    ], "the installed helper must open with the shebang and the exact PATH pin"
+
+    # negative control: remove only the helper's PATH line from the function
+    lines = func_text.splitlines(keepends=True)
+    hit = next(i for i, ln in enumerate(lines) if ln.rstrip("\n") == PATH_PIN)
+    reduced = "".join(lines[:hit] + lines[hit + 1:])
+    dest_bad = tmp_path / "vault-env-unpinned"
+    proc = _run_render(reduced, dest_bad, "unpinned")
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode != 0, "a helper body without the PATH pin must be refused (red)"
+    assert "refusing" in combined and "PATH" in combined, combined
+    assert not dest_bad.exists(), "the refused destination must not be created"
+
+
+@pytest.mark.parametrize("util", ["chown", "mv"])
+def test_path_pin_ignores_planted_utilities(tmp_path, util):
+    """The helper's own PATH pin keeps a hostile prefix powerless: an
+    executable fake <util> planted first on PATH (unique marker, exit 0)
+    never runs while both the ordinary and the _B64 output paths complete —
+    rc 0, no marker, no fake output, exact env/PEM contents and quoting,
+    modes 0700/0600."""
+    helper, run_dir, vault, names_dir, ord_value = _r3_fixture(tmp_path)
+    bin_dir = tmp_path / "planted-bin"
+    bin_dir.mkdir()
+    marker = tmp_path / f"planted-{util}.marker"
+    fake = _write(
+        bin_dir / util,
+        '#!/bin/sh\n: > "$PLANTED_MARKER"\n'
+        f'printf "planted {util} ran\\n"\nexit 0\n',
+    )
+    fake.chmod(0o755)
+
+    proc = _run_helper(
+        helper, "svc", vault=vault, run_dir=run_dir, names_dir=names_dir,
+        extra_env={"PLANTED_MARKER": str(marker)}, path_prefix=str(bin_dir),
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert not marker.exists(), (
+        f"planted {util} executed — the helper PATH is not pinned (red)"
+    )
+    assert proc.stdout == "", f"planted {util} wrote to stdout: {proc.stdout!r}"
+    assert proc.stderr == "", f"planted {util} wrote to stderr: {proc.stderr!r}"
+    combined = proc.stdout + proc.stderr
+    assert ord_value not in combined, "a vault value leaked into the output"
+
+    svc_dir = run_dir / "svc"
+    env_file = svc_dir / "env"
+    pem = svc_dir / "key_path.pem"
+    assert env_file.is_file(), f"{util} rename path must still install env"
+    assert pem.is_file(), f"{util} rename path must still install the pem"
+    assert stat.S_IMODE(svc_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
+    assert stat.S_IMODE(pem.stat().st_mode) == 0o600
+    assert env_file.read_text(encoding="utf-8").splitlines() == [
+        f'ORD_OUT="{ord_value}"',
+        f'KEY_PATH="{pem}"',
+    ], 'both outputs must keep exact NAME="<escaped>" quoting'
+    assert pem.read_bytes() == KEY_BYTES
+    assert list(run_dir.glob("**/.vault-env.*")) == [], "no temp dir may survive"
