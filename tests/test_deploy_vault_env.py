@@ -626,7 +626,7 @@ def test_preplaced_symlinks_are_not_followed(tmp_path):
 
 # --- F2-r1: pinned helper PATH + installer freeze guard ---------------------
 
-PATH_PIN = "PATH=/usr/bin:/bin"
+PATH_PIN = "PATH=/usr/bin:/bin; export PATH"
 RENDER_FN = "install_vault_env_helper"
 INSTALL_FN = "install_vault_env"
 
@@ -756,10 +756,23 @@ def test_path_pin_ignores_planted_utilities(tmp_path, util):
 
 # --- F2-r2: every external command absolute, proved statically ---------------
 
+# F21: POSIX special built-ins (SUSv4 XCU 2.14) — commands sh itself
+# implements, never external programs — plus the ordinary built-ins the
+# helper may use.  This list catches external commands; it never dictates
+# which shell built-ins the helper may use.
 HELPER_ALLOWED_BUILTINS = {
-    "printf", "pwd", "set", "trap", "umask", "case", "esac", "for", "do", "done",
-    "if", "then", "fi", "local", "return", "exit", "read", "test", "[", ":",
+    # POSIX special built-ins.
+    "break", ":", "continue", "exit", "export", "readonly", "return",
+    "set", "shift", "times", "trap", "unset",
+    # Ordinary built-ins the helper is entitled to use.
+    "cd", "echo", "false", "getopts", "hash", "pwd", "read",
+    "test", "[", "type", "true", "umask", "wait", "printf", "local",
 }
+# Deliberately NOT allowed: `command`/`exec` run the word that follows them, and
+# `.`/`eval` execute arbitrary text — each would let a planted utility or a
+# vault-derived record through the scanner this file exists to be. The helper
+# uses none of them.
+
 # POSIX reserved words: grammar, never external commands, whatever they spell.
 HELPER_SHELL_KEYWORDS = {
     "if", "then", "elif", "else", "fi", "do", "done", "case", "esac", "for",
@@ -943,25 +956,195 @@ def _helper_command_words(body: str) -> list[tuple[int, str]]:
     return words
 
 
-def test_helper_commands_are_builtins_or_absolute():
-    """r2 — every command word in the shipped helper is a shell keyword, an
-    allowlisted builtin, a function defined in the body itself, or an
-    absolute path under /usr/bin/ or /bin/. A bare chown, mv, mktemp,
-    base64, sed, tr, rm, mkdir, chmod, dirname, stat — any bare word in
-    command position — fails here with the offending line. Static, so it
-    holds no matter what PATH the helper is run with."""
-    body = _helper_body()
+def _helper_offenders(body: str) -> list[tuple[int, str, str]]:
+    """The scanner's whole verdict for one sh body: every command-position
+    word that is not an allowlisted builtin, a shell keyword, a function
+    defined in the body, or an absolute /usr/bin|/bin path, as
+    (lineno, word, source line)."""
     defined = set(re.findall(r"(?m)^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(\)", body))
     lines = body.splitlines()
-    offenders = [
+    return [
         (lineno, word, lines[lineno - 1].strip())
         for lineno, word in _helper_command_words(body)
         if (word not in HELPER_ALLOWED_BUILTINS and word not in HELPER_SHELL_KEYWORDS
             and word not in defined
             and not word.startswith("/usr/bin/") and not word.startswith("/bin/"))
     ]
+
+
+def test_helper_commands_are_builtins_or_absolute():
+    """r2 — every command word in the shipped helper is a shell keyword, an
+    allowlisted builtin, a function defined in the body itself, or an
+    absolute path under /usr/bin/ or /bin/. A bare chown, mv, mktemp,
+    base64, sed, tr, rm, mkdir, chmod, dirname, stat — any bare word in
+    command position — fails here with the offending line. Static, so it
+    holds no matter what PATH the helper is run with. F21: the allowlist
+    exists to catch external commands, never to dictate which shell built-ins
+    the helper may use; if a built-in is missing, the list is wrong, not the
+    code."""
+    offenders = _helper_offenders(_helper_body())
     assert not offenders, (
         "bare command words in the helper body — every command must be a "
         "shell keyword, an allowlisted builtin, a function defined in the "
         f"body, or an absolute /usr/bin|/bin path: {offenders}"
     )
+
+
+# --- F21: the allowlist is complete; the scanner never shapes the helper -----
+
+F21_BUILTINS = (
+    "export", "continue", "break", "shift", "cd", "unset", "wait",
+    "readonly", "echo",
+)
+
+
+@pytest.mark.parametrize("utility", ["chown", "mv", "install"])
+def test_helper_scanner_rejects_planted_bare_utilities(utility):
+    """F21 — a complete allowlist is not a permissive one: a planted bare
+    utility in command position is still a finding."""
+    body = f"#!/bin/sh\n{utility} -f /run/svc/env\nprintf '%s\\n' ok\n"
+    offenders = _helper_offenders(body)
+    assert [word for _ln, word, _src in offenders] == [utility], offenders
+
+
+def test_helper_scanner_ignores_commented_bare_utilities():
+    """F21 — comments are stripped before scanning, so a commented-out bare
+    utility is not a finding."""
+    body = "#!/bin/sh\n# chown -R root:root /run/svc\nprintf '%s\\n' ok\n"
+    assert _helper_offenders(body) == []
+
+
+def test_helper_scanner_accepts_posix_builtins():
+    """F21 — every POSIX special builtin and the ordinary builtins the
+    helper may use are accepted by the scanner; rejecting them would be the
+    scanner dictating the helper's code."""
+    body = "#!/bin/sh\n" + "\n".join(F21_BUILTINS) + "\n"
+    assert _helper_offenders(body) == []
+
+
+def test_helper_scanner_builtin_and_keyword_sets_stay_disjoint():
+    """F21 — grammar keywords live only in HELPER_SHELL_KEYWORDS: a word
+    that is both a keyword and a builtin (`return`, `break`) is accepted
+    once and never shadows the keyword set."""
+    overlap = HELPER_ALLOWED_BUILTINS & HELPER_SHELL_KEYWORDS
+    assert not overlap, (
+        f"keywords duplicated into the builtin allowlist: {sorted(overlap)}"
+    )
+    for word in ("return", "break"):
+        assert _helper_offenders(f"#!/bin/sh\n{word}\n") == []
+
+
+# --- F21-r1-r2: execution builtins are out; the guard is the one under test --
+
+EXECUTION_BUILTINS = ("command", "exec", ".", "eval")
+
+
+@pytest.mark.parametrize("word, fixture", [
+    ("command", "command chown 0:0 /run/svc/env"),
+    ("exec", "exec mv /run/svc/env /run/svc/old"),
+    (".", '. "$vault_record"'),
+    ("eval", 'eval "$vault_record"'),
+])
+def test_helper_scanner_rejects_execution_builtins(word, fixture):
+    """F21-r1-r2 — `command`/`exec` run the word that follows them and
+    `.`/`eval` execute arbitrary text, so none may be allowlisted: each
+    fixture line is a command-position finding. On the F21-r1 base all four
+    are silently accepted (the red)."""
+    offenders = _helper_offenders(f"#!/bin/sh\n{fixture}\n")
+    assert [w for _ln, w, _src in offenders] == [word], offenders
+
+
+def test_helper_body_uses_no_execution_builtins():
+    """F21-r1-r2 — the shipped helper parses NAME=value records and never
+    sources, evals or delegates to a planted utility. Pin the header's
+    promise: no command/exec/./eval in command position, no leading `. `
+    source call, and no `eval` word anywhere."""
+    body = _helper_body()
+    words = [w for _ln, w in _helper_command_words(body)]
+    used = [w for w in words if w in EXECUTION_BUILTINS]
+    assert not used, f"execution builtin in command position: {used}"
+    assert not re.search(r"(?m)^\s*\.\s", body), "the helper must not source a file"
+    assert not re.search(r"\beval\b", body), "the helper must not eval text"
+
+
+def test_helper_scanner_admits_only_non_executing_introspection_builtins(tmp_path):
+    """F21-r1-r2 — hash/type/getopts/times are admitted (the helper is
+    entitled to them) but, unlike command/exec, none runs the word that
+    follows: a planted `chown` named as their argument never executes, and
+    each line still passes the scanner as a builtin in command position."""
+    planted = tmp_path / "planted-bin"
+    planted.mkdir()
+    marker = tmp_path / "planted.marker"
+    fake = planted / "chown"
+    fake.write_text('#!/bin/sh\n: > "$F21_MARKER"\n', encoding="utf-8")
+    fake.chmod(0o755)
+    fixtures = {
+        "hash": "hash chown",
+        "type": "type chown",
+        "getopts": 'getopts "c" chown',
+        "times": "times",
+    }
+    for word, line in fixtures.items():
+        proc = subprocess.run(
+            ["/bin/sh", "-c", f"{line}\nexit 0"],
+            env={"PATH": f"{planted}:/usr/bin:/bin", "F21_MARKER": str(marker)},
+            capture_output=True, text=True,
+        )
+        assert proc.returncode == 0, (word, proc.stderr)
+        assert not marker.exists(), f"{word} executed the word that follows it"
+        assert _helper_offenders(f"#!/bin/sh\n{line}\n") == [], (
+            f"{word} must stay accepted in command position"
+        )
+
+
+def test_helper_scanner_ignores_execution_words_as_data():
+    """F21-r1-r2 edge — `command` in a comment, or as an assignment name, is
+    data, not command position, and is not a finding."""
+    body = (
+        "#!/bin/sh\n"
+        "# command chown -R root:root /run/svc/env\n"
+        "command=chown\n"
+        'printf "%s\\n" "$command"\n'
+    )
+    assert _helper_offenders(body) == []
+
+
+def test_helper_scanner_reports_builtin_command_form():
+    """F21-r1-r2 edge — a bash-only `builtin command` line is never silently
+    allowed just because the word `command` appears in the file: `builtin`
+    itself is not allowlisted, so the scanner still reports a finding."""
+    offenders = _helper_offenders("#!/bin/sh\nbuiltin command chown 0:0 /x\n")
+    assert offenders, "builtin command must not pass the scanner silently"
+
+
+def test_helper_pin_line_exports_path(tmp_path):
+    """F21-r1-r2 — the pin is the second line of the helper the installer
+    actually renders, exactly as its prefix guard requires, and it is the
+    only PATH= line in that helper."""
+    func_text = _render_function_text()
+    dest = tmp_path / "vault-env-rendered"
+    proc = _run_render(func_text, dest, "rendered")
+    assert proc.returncode == 0, proc.stderr
+    rendered = dest.read_text(encoding="utf-8")
+    lines = rendered.splitlines()
+    assert lines[0] == "#!/bin/sh", lines[:2]
+    assert lines[1] == PATH_PIN, (
+        f"the pin must be the second line, got {lines[1]!r}"
+    )
+    pin_lines = [ln for ln in lines if ln.startswith("PATH=")]
+    assert len(pin_lines) == 1, f"exactly one PATH= assignment, got {pin_lines}"
+
+
+def test_installer_rejects_space_before_semicolon_in_pin(tmp_path):
+    """F21-r1-r2 — the render guard compares the pin literally, so
+    `PATH=/usr/bin:/bin ; export PATH` is refused. F21-r1 tested a regex the
+    installer never used; this drives the real guard instead."""
+    func_text = _render_function_text()
+    spaced = func_text.replace(PATH_PIN, "PATH=/usr/bin:/bin ; export PATH", 1)
+    assert spaced != func_text, "space-before-semicolon mutation anchor missing (red)"
+    dest = tmp_path / "vault-env-spaced-pin"
+    proc = _run_render(spaced, dest, "spaced-pin")
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode != 0, "the real guard accepts only the exact pin"
+    assert "refusing" in combined and "PATH" in combined, combined
+    assert not dest.exists(), "the refused destination must not be created"
