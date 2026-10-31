@@ -762,12 +762,17 @@ def test_path_pin_ignores_planted_utilities(tmp_path, util):
 # which shell built-ins the helper may use.
 HELPER_ALLOWED_BUILTINS = {
     # POSIX special built-ins.
-    "break", ":", "continue", ".", "eval", "exec", "exit", "export",
-    "readonly", "return", "set", "shift", "times", "trap", "unset",
+    "break", ":", "continue", "exit", "export", "readonly", "return",
+    "set", "shift", "times", "trap", "unset",
     # Ordinary built-ins the helper is entitled to use.
-    "cd", "command", "echo", "false", "getopts", "hash", "pwd", "read",
+    "cd", "echo", "false", "getopts", "hash", "pwd", "read",
     "test", "[", "type", "true", "umask", "wait", "printf", "local",
 }
+# Deliberately NOT allowed: `command`/`exec` run the word that follows them, and
+# `.`/`eval` execute arbitrary text — each would let a planted utility or a
+# vault-derived record through the scanner this file exists to be. The helper
+# uses none of them.
+
 # POSIX reserved words: grammar, never external commands, whatever they spell.
 HELPER_SHELL_KEYWORDS = {
     "if", "then", "elif", "else", "fi", "do", "done", "case", "esac", "for",
