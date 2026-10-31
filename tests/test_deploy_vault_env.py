@@ -1148,3 +1148,198 @@ def test_installer_rejects_space_before_semicolon_in_pin(tmp_path):
     assert proc.returncode != 0, "the real guard accepts only the exact pin"
     assert "refusing" in combined and "PATH" in combined, combined
     assert not dest.exists(), "the refused destination must not be created"
+
+
+# --- F22-r1: the installer's own commands + symlink-destination TOCTOU -------
+
+INSTALLER_PATH_PIN = "PATH=/usr/bin:/bin; export PATH"
+INSTALLER_PY = "/usr/bin/python3"
+INSTALLER_VENV = "/opt/rhobear/rhobear-neo/.venv"
+
+
+def _strip_quoted_heredoc(text: str, marker: str) -> str:
+    """Remove one `<<'MARKER'` here-doc construct (token, body, delimiter)."""
+    return re.sub(
+        rf"<<'{re.escape(marker)}'\n.*?^{re.escape(marker)}[ \t]*$",
+        "", text, flags=re.S | re.M,
+    )
+
+
+def _installer_scan_text() -> str:
+    """The installer with its here-doc bodies removed (the helper and names
+    bodies have their own tests) and the two deliberate command variables
+    resolved to the paths the script itself pins."""
+    text = _installer_text()
+    for marker in (HELPER_MARKER, NAMES_MARKER):
+        text = _strip_quoted_heredoc(text, marker)
+    return (
+        text.replace('"$PY"', INSTALLER_PY)
+            .replace('"$VENV_DIR/bin/pip"', f"{INSTALLER_VENV}/bin/pip")
+    )
+
+
+def _installer_offenders(text: str) -> list[tuple[int, str, str]]:
+    """F22-r1: the helper scanner's verdict for the installer — every
+    command-position word must be a builtin/keyword, a function defined in
+    the file, or an absolute path (the installer's own venv paths included)."""
+    defined = set(re.findall(r"(?m)^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(\)", text))
+    lines = text.splitlines()
+    return [
+        (lineno, word, lines[lineno - 1].strip())
+        for lineno, word in _helper_command_words(text)
+        if (word not in HELPER_ALLOWED_BUILTINS and word not in HELPER_SHELL_KEYWORDS
+            and word not in defined and not word.startswith("/"))
+    ]
+
+
+def test_installer_commands_are_builtins_or_absolute():
+    """F22-r1 — every command word in deploy/install.sh is a shell
+    builtin/keyword, a function defined in the file, or an absolute path
+    under /usr/bin/ or /bin/. A bare python3, install, chmod, cat or
+    systemctl fails here with the offending line."""
+    text = _installer_text()
+    offenders = _installer_offenders(_installer_scan_text())
+    assert not offenders, (
+        "bare command words in install.sh — every command must be a shell "
+        f"builtin/keyword, a function, or an absolute path: {offenders}"
+    )
+    assert '"$PY"' in text, "the interpreter must be the resolved PY variable"
+    assert '"$VENV_DIR/bin/pip"' in text, "pip must go through VENV_DIR"
+
+
+@pytest.mark.parametrize("utility", ["python3", "install", "chmod", "cat", "systemctl"])
+def test_installer_scanner_rejects_planted_bare_utilities(utility):
+    """F22-r1 — a complete allowlist is not a permissive one: a planted bare
+    utility in command position is still a finding for the installer scan."""
+    found = [
+        w for _ln, w, _src in
+        _installer_offenders(f"#!/bin/bash\nset -euo pipefail\n{utility} x\n")
+    ]
+    assert found == [utility], found
+
+
+def test_installer_resolves_interpreter_and_pins_path():
+    """F22-r1 — the interpreter is resolved once, deliberately, the venv/pip
+    calls go through PY/VENV_DIR, and the PATH pin precedes the first command
+    that used to be resolved from PATH."""
+    lines = [ln.strip() for ln in _installer_text().splitlines()]
+    assert f"PY={INSTALLER_PY}" in lines, lines[:16]
+    assert '[ -x "$PY" ] || fail "python3 not found at $PY"' in lines
+    assert f"VENV_DIR={INSTALLER_VENV}" in lines
+    assert '"$PY" -m venv "$VENV_DIR"' in lines
+    assert '"$VENV_DIR/bin/pip" install -q --upgrade pip' in lines
+    assert '"$VENV_DIR/bin/pip" install -q -r requirements.txt' in lines
+    assert INSTALLER_PATH_PIN in lines, "the installer PATH pin is missing"
+    pin_line = lines.index(INSTALLER_PATH_PIN)
+    assert pin_line < lines.index('"$PY" -m venv "$VENV_DIR"'), (
+        "the PATH pin must precede the first resolved command"
+    )
+
+
+def _installer_sandbox(tmp_path: Path, *, dry_run: bool, text: str | None = None):
+    """A runnable copy of the installer in a temp sandbox, `cd` neutered so
+    the fixed /opt path is irrelevant, fakes for the commands the installer
+    might resolve from PATH, and one shared marker."""
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    marker = tmp_path / "planted.marker"
+    for name in ("python3", "cat", "install", "chmod", "mv", "mkdir",
+                 "systemctl", "sleep", "ss"):
+        fake = _write(fake_bin / name, f'#!/bin/sh\n: > "{marker}"\nexit 0\n')
+        fake.chmod(0o755)
+    script = _write(
+        sandbox / "install-run.sh",
+        "#!/bin/bash\ncd() { :; }\n" + (text if text is not None else _installer_text()),
+    )
+    env = dict(os.environ)
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '/usr/bin:/bin')}"
+    env["PLANTED_MARKER"] = str(marker)
+    if dry_run:
+        env["INSTALL_DRY_RUN"] = "1"
+    proc = subprocess.run(
+        ["/bin/bash", str(script)], cwd=sandbox, env=env,
+        capture_output=True, text=True,
+    )
+    return proc, marker, sandbox
+
+
+def test_installer_dry_run_ignores_planted_utilities(tmp_path):
+    """F22-r1 — the resolution/pre-flight section runs to completion (rc 0)
+    with a fake python3/cat/install first on PATH and never runs any of them:
+    the PATH pin and the absolute paths make the planted commands inert."""
+    proc, marker, _ = _installer_sandbox(tmp_path, dry_run=True)
+    assert not marker.exists(), (
+        "a planted PATH command executed during the installer pre-flight (red): "
+        + proc.stdout + proc.stderr
+    )
+    assert proc.returncode == 0, (proc.returncode, proc.stderr)
+
+
+def test_installer_refuses_non_root_before_any_command(tmp_path):
+    """F22-r1 — without the dry-run seam, an unprivileged run fails closed at
+    the root check before resolving or executing any command: the planted
+    marker stays absent and no state is created."""
+    if os.geteuid() == 0:
+        pytest.skip("non-root refusal is only observable unprivileged")
+    proc, marker, sandbox = _installer_sandbox(tmp_path, dry_run=False)
+    combined = proc.stdout + proc.stderr
+    assert not marker.exists(), f"a command ran before the root check: {combined}"
+    assert proc.returncode != 0, "a non-root run must fail closed"
+    assert "root" in combined.lower(), combined
+    assert [p.name for p in sandbox.iterdir()] == ["install-run.sh"], "partial state"
+
+
+def test_installer_missing_python_fails_named_without_state(tmp_path):
+    """F22-r1 edge — python3 missing at /usr/bin/python3 fails with the path
+    named and before any write; the anchor mutation stands in for a host
+    without the interpreter."""
+    missing = tmp_path / "no-such-python3"
+    text = _installer_text().replace(f"PY={INSTALLER_PY}", f"PY={missing}", 1)
+    assert text != _installer_text(), "the PY anchor is missing (red)"
+    proc, marker, sandbox = _installer_sandbox(tmp_path, dry_run=True, text=text)
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode != 0, combined
+    assert str(missing) in combined, combined
+    assert not marker.exists(), combined
+    assert [p.name for p in sandbox.iterdir()] == ["install-run.sh"], "partial state"
+
+
+def test_installer_helper_write_is_atomic_not_check_then_write():
+    """F22-r1 (Apollo LOW neo#17) — the render function no longer writes
+    through a checked-then-used $dest: it writes a temp name in the
+    destination directory and mv -T -f's it into place."""
+    func = _render_function_text()
+    assert '> "$dest"' not in func, "check-then-write through $dest is back (red)"
+    assert "/usr/bin/mktemp" in func, "the write must go through a temp name"
+    assert "/usr/bin/mv -T -f" in func, "the temp name must be moved into place"
+
+
+def test_installer_never_writes_through_a_swapped_symlink(tmp_path):
+    """F22-r1 edge — a symlink that appears after the guard but before the
+    move must not be written through: a fake /usr/bin/mv turns the
+    destination into a symlink to a sentinel and then execs the real mv -T,
+    so the move replaces the link and the sentinel bytes stay intact."""
+    func = _render_function_text()
+    sentinel = _write(tmp_path / "sentinel", "SENTINEL-INTACT\n")
+    dest = tmp_path / "vault-env"
+    fake_mv = _write(
+        tmp_path / "mv-race",
+        "#!/bin/bash\nset -eu\n"
+        f'/usr/bin/ln -sfn "{sentinel}" "$2"\n'
+        'exec "/usr/bin/mv" -T -f "$1" "$2"\n',
+    )
+    fake_mv.chmod(0o755)
+    raced = func.replace('/usr/bin/mv -T -f "$tmp" "$dest"',
+                        f'{fake_mv} "$tmp" "$dest"')
+    assert raced != func, "the installer's atomic-move call is missing (red)"
+    proc = _run_render(raced, dest, "race")
+    assert proc.returncode == 0, proc.stderr
+    assert sentinel.read_text(encoding="utf-8") == "SENTINEL-INTACT\n", (
+        "the run wrote through the swapped symlink"
+    )
+    assert dest.is_file() and not dest.is_symlink()
+    assert dest.read_text(encoding="utf-8").splitlines()[:2] == [
+        "#!/bin/sh", PATH_PIN
+    ]
