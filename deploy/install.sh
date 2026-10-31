@@ -3,11 +3,35 @@
 # The only secret a deploy needs is the vault (/etc/rhobear/llm-keys.env): the
 # generated /opt/rhobear/bin/vault-env helper builds /run/<service>/env at start.
 set -euo pipefail
+
+# --- command resolution and pre-flight (F22-r1) ------------------------------
+# Pin PATH before anything runs: a command planted earlier on the caller's
+# PATH can never execute.  The absolute paths below are the belt, so the
+# guarantee survives a future edit that forgets this pin.  The shebang stays
+# /usr/bin/env bash: it picks the operator's interpreter for this script
+# itself, never a command resolved from a mutable PATH mid-run.
+PATH=/usr/bin:/bin; export PATH
+
+fail() { /usr/bin/printf '%s\n' "install.sh: $1" >&2; exit 1; }
+
+# Resolve the interpreter once, deliberately, never through PATH.
+PY=/usr/bin/python3
+[ -x "$PY" ] || fail "python3 not found at $PY"
+VENV_DIR=/opt/rhobear/rhobear-neo/.venv
+
+# Test seam: stop before the root check and before the first write, so the
+# resolution/pre-flight path is exercisable unprivileged in a temp sandbox.
+if [ "${INSTALL_DRY_RUN:-0}" = "1" ]; then
+  /usr/bin/printf '%s\n' "install.sh: dry run: stopping before the first write" >&2
+  exit 0
+fi
+
+[ "$(/usr/bin/id -u)" = "0" ] || fail "must run as root"
 cd /opt/rhobear/rhobear-neo
 
-python3 -m venv .venv
-./.venv/bin/pip install -q --upgrade pip
-./.venv/bin/pip install -q -r requirements.txt
+"$PY" -m venv "$VENV_DIR"
+"$VENV_DIR/bin/pip" install -q --upgrade pip
+"$VENV_DIR/bin/pip" install -q -r requirements.txt
 
 # --- vault-backed service environments --------------------------------------
 # /opt/rhobear/bin/vault-env (mode 0755) + /etc/rhobear/vault-env.d/*.names
@@ -16,7 +40,7 @@ python3 -m venv .venv
 # naming the missing vault name if anything is absent.
 install_vault_env_helper() {
   local dest="$1" body
-  body=$(cat <<'VAULT_ENV_HELPER'
+  body=$(/usr/bin/cat <<'VAULT_ENV_HELPER'
 #!/bin/sh
 PATH=/usr/bin:/bin; export PATH
 # vault-env <service> - materialise <RUN_DIR>/<service>/env from the vault,
@@ -100,22 +124,38 @@ PATH=/usr/bin:/bin; export PATH
       echo "install.sh: refusing to write $dest: second PATH= assignment in the helper body" >&2
       return 1 ;;
   esac
+  local dir tmp
+  dir=$(/usr/bin/dirname -- "$dest")
+  tmp=$(/usr/bin/mktemp "$dir/.install-vault-env.XXXXXX") || {
+    echo "install.sh: cannot create a temp file next to $dest" >&2
+    return 1
+  }
+  /usr/bin/printf '%s\n' "$body" > "$tmp" || {
+    echo "install.sh: cannot write $tmp" >&2
+    /usr/bin/rm -f "$tmp"
+    return 1
+  }
   if [ -L "$dest" ]; then
     echo "install.sh: refusing to write $dest: destination is a symlink" >&2
+    /usr/bin/rm -f "$tmp"
     return 1
   fi
-  printf '%s\n' "$body" > "$dest"
+  /usr/bin/mv -T -f "$tmp" "$dest" || {
+    echo "install.sh: cannot install $dest" >&2
+    /usr/bin/rm -f "$tmp"
+    return 1
+  }
 }
 
 install_vault_env() {
-  install -d -m 0755 /opt/rhobear/bin /etc/rhobear/vault-env.d
+  /usr/bin/install -d -m 0755 /opt/rhobear/bin /etc/rhobear/vault-env.d
 
   install_vault_env_helper /opt/rhobear/bin/vault-env || return 1
-  chmod 0755 /opt/rhobear/bin/vault-env
+  /usr/bin/chmod 0755 /opt/rhobear/bin/vault-env
 
   local svc
   for svc in rhobear-neo rhobear-neo-builder; do
-    cat > "/etc/rhobear/vault-env.d/${svc}.names" <<'VAULT_ENV_NAMES'
+    /usr/bin/cat > "/etc/rhobear/vault-env.d/${svc}.names" <<'VAULT_ENV_NAMES'
 NEO_GITHUB_APP_KEY_PATH=RHOBEAR_ZEUS_GH_APP_KEY_B64
 RHOBEAR_NEO_WEBHOOK_SECRET=RHOBEAR_ZEUS_WEBHOOK_SECRET
 DATABASE_URL=REVIEWS_DATABASE_URL
@@ -123,15 +163,15 @@ DEEPSEEK_API_KEY
 DEEPINFRA_API_KEY
 VAULT_ENV_NAMES
   done
-  chmod 0644 /etc/rhobear/vault-env.d/*.names
+  /usr/bin/chmod 0644 /etc/rhobear/vault-env.d/*.names
 }
 install_vault_env
 
-install -m 644 deploy/rhobear-neo.service /etc/systemd/system/rhobear-neo.service
-systemctl daemon-reload
-systemctl enable rhobear-neo
-systemctl restart rhobear-neo
-sleep 2
-systemctl --no-pager --lines=15 status rhobear-neo || true
+/usr/bin/install -m 644 deploy/rhobear-neo.service /etc/systemd/system/rhobear-neo.service
+/usr/bin/systemctl daemon-reload
+/usr/bin/systemctl enable rhobear-neo
+/usr/bin/systemctl restart rhobear-neo
+/usr/bin/sleep 2
+/usr/bin/systemctl --no-pager --lines=15 status rhobear-neo || true
 echo "--- listening? ---"
-ss -ltnp 2>/dev/null | grep 8767 || echo "NOT yet on :8767"
+/usr/bin/ss -ltnp 2>/dev/null | /usr/bin/grep 8767 || echo "NOT yet on :8767"
