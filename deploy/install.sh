@@ -1,18 +1,66 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # rhobear-neo installer — run ON rhobear-vps as root, from /opt/rhobear/rhobear-neo.
 # The only secret a deploy needs is the vault (/etc/rhobear/llm-keys.env): the
 # generated /opt/rhobear/bin/vault-env helper builds /run/<service>/env at start.
 set -euo pipefail
 
-# --- command resolution and pre-flight (F22-r1) ------------------------------
-# Pin PATH before anything runs: a command planted earlier on the caller's
-# PATH can never execute.  The absolute paths below are the belt, so the
-# guarantee survives a future edit that forgets this pin.  The shebang stays
-# /usr/bin/env bash: it picks the operator's interpreter for this script
-# itself, never a command resolved from a mutable PATH mid-run.
+# --- command resolution and pre-flight (F22-r1-r2) ---------------------------
+# The shebang is absolute (/bin/bash): the kernel runs exactly that
+# interpreter, never a `bash` looked up in the caller's PATH.  /usr/bin/env is
+# *defined* as a PATH lookup, so `#!/usr/bin/env bash` was itself the one
+# command a caller could hijack — before this file's first line ran.  With the
+# interpreter fixed, pin PATH before anything else so every later command
+# comes from the known system set; the absolute paths below are the belt for a
+# future edit that forgets the pin.
 PATH=/usr/bin:/bin; export PATH
 
 fail() { /usr/bin/printf '%s\n' "install.sh: $1" >&2; exit 1; }
+
+# Interrupt safety: a write mktemps next to its destination, so a root-owned
+# .install-rhobear.XXXXXX can exist between mktemp and mv; remove every
+# registered temp path on exit or signal.
+TMP_FILES=""
+cleanup_tmp() {
+  [ -z "$TMP_FILES" ] || /usr/bin/rm -f $TMP_FILES
+  return 0
+}
+trap cleanup_tmp EXIT INT TERM HUP
+
+# atomic_write <dest> <mode> <refuse-symlink> <content>
+# Write content to a mktemp file in dest's directory, set its mode, then
+# mv -T -f it into place — never a bare check-then-write through $dest.  With
+# refuse-symlink=1 a pre-existing symlink is refused and left in place;
+# otherwise the symlink itself is replaced, never followed.  The temp path is
+# registered with cleanup_tmp before it exists on disk.
+atomic_write() {
+  local dest="$1" mode="$2" refuse="$3" content="$4" dir tmp
+  dir=$(/usr/bin/dirname -- "$dest") || return 1
+  tmp=$(/usr/bin/mktemp "$dir/.install-rhobear.XXXXXX") || {
+    echo "install.sh: cannot create a temp file next to $dest" >&2
+    return 1
+  }
+  TMP_FILES="${TMP_FILES:-} $tmp"
+  /usr/bin/printf '%s\n' "$content" > "$tmp" || {
+    echo "install.sh: cannot write $tmp" >&2
+    /usr/bin/rm -f "$tmp"
+    return 1
+  }
+  /usr/bin/chmod "$mode" "$tmp" || {
+    echo "install.sh: cannot set mode $mode on $tmp" >&2
+    /usr/bin/rm -f "$tmp"
+    return 1
+  }
+  if [ "$refuse" = "1" ] && [ -L "$dest" ]; then
+    echo "install.sh: refusing to write $dest: destination is a symlink" >&2
+    /usr/bin/rm -f "$tmp"
+    return 1
+  fi
+  /usr/bin/mv -T -f "$tmp" "$dest" || {
+    echo "install.sh: cannot install $dest" >&2
+    /usr/bin/rm -f "$tmp"
+    return 1
+  }
+}
 
 # Resolve the interpreter once, deliberately, never through PATH.
 PY=/usr/bin/python3
@@ -21,8 +69,10 @@ VENV_DIR=/opt/rhobear/rhobear-neo/.venv
 
 # Test seam: stop before the root check and before the first write, so the
 # resolution/pre-flight path is exercisable unprivileged in a temp sandbox.
-if [ "${INSTALL_DRY_RUN:-0}" = "1" ]; then
-  /usr/bin/printf '%s\n' "install.sh: dry run: stopping before the first write" >&2
+# An argument, never an environment variable: an inherited variable can no
+# longer turn a real install into a green no-op.
+if [ "${1:-}" = "--dry-run" ]; then
+  /usr/bin/printf '%s\n' "install.sh: dry run: no changes made" >&2
   exit 0
 fi
 
@@ -124,46 +174,26 @@ PATH=/usr/bin:/bin; export PATH
       echo "install.sh: refusing to write $dest: second PATH= assignment in the helper body" >&2
       return 1 ;;
   esac
-  local dir tmp
-  dir=$(/usr/bin/dirname -- "$dest")
-  tmp=$(/usr/bin/mktemp "$dir/.install-vault-env.XXXXXX") || {
-    echo "install.sh: cannot create a temp file next to $dest" >&2
-    return 1
-  }
-  /usr/bin/printf '%s\n' "$body" > "$tmp" || {
-    echo "install.sh: cannot write $tmp" >&2
-    /usr/bin/rm -f "$tmp"
-    return 1
-  }
-  if [ -L "$dest" ]; then
-    echo "install.sh: refusing to write $dest: destination is a symlink" >&2
-    /usr/bin/rm -f "$tmp"
-    return 1
-  fi
-  /usr/bin/mv -T -f "$tmp" "$dest" || {
-    echo "install.sh: cannot install $dest" >&2
-    /usr/bin/rm -f "$tmp"
-    return 1
-  }
+  atomic_write "$dest" 0755 1 "$body"
 }
 
 install_vault_env() {
   /usr/bin/install -d -m 0755 /opt/rhobear/bin /etc/rhobear/vault-env.d
 
   install_vault_env_helper /opt/rhobear/bin/vault-env || return 1
-  /usr/bin/chmod 0755 /opt/rhobear/bin/vault-env
 
-  local svc
-  for svc in rhobear-neo rhobear-neo-builder; do
-    /usr/bin/cat > "/etc/rhobear/vault-env.d/${svc}.names" <<'VAULT_ENV_NAMES'
+  local svc names_body
+  names_body=$(/usr/bin/cat <<'VAULT_ENV_NAMES'
 NEO_GITHUB_APP_KEY_PATH=RHOBEAR_ZEUS_GH_APP_KEY_B64
 RHOBEAR_NEO_WEBHOOK_SECRET=RHOBEAR_ZEUS_WEBHOOK_SECRET
 DATABASE_URL=REVIEWS_DATABASE_URL
 DEEPSEEK_API_KEY
 DEEPINFRA_API_KEY
 VAULT_ENV_NAMES
+)
+  for svc in rhobear-neo rhobear-neo-builder; do
+    atomic_write "/etc/rhobear/vault-env.d/${svc}.names" 0644 0 "$names_body" || return 1
   done
-  /usr/bin/chmod 0644 /etc/rhobear/vault-env.d/*.names
 }
 install_vault_env
 

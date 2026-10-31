@@ -638,21 +638,35 @@ CLEANUP_FN = "cleanup_tmp"
 
 
 def _function_text(name: str) -> str:
-    """One top-level function definition from the installer, verbatim."""
-    match = re.search(rf"(?ms)^{re.escape(name)}\(\) \{{.*?^\}}", _installer_text())
-    assert match, f"{name}() absent from the installer (red)"
-    return match.group(0) + "\n"
+    """One top-level ``name() { ... }`` definition from the installer,
+    verbatim.  Quoted heredoc bodies are skipped: the helper body contains
+    column-0 ``}`` lines that must not end the enclosing function early."""
+    lines = _installer_text().splitlines(keepends=True)
+    start = next(
+        (i for i, ln in enumerate(lines) if ln.startswith(f"{name}() {{")), None
+    )
+    assert start is not None, f"{name}() absent from the installer (red)"
+    depth, out, heredoc = 0, [], None
+    for ln in lines[start:]:
+        out.append(ln)
+        if heredoc is not None:
+            if ln.rstrip("\n") == heredoc:
+                heredoc = None
+            continue
+        match = re.search(r"<<'([^']+)'", ln)
+        if match:
+            heredoc = match.group(1)
+            continue
+        depth += ln.count("{") - ln.count("}")
+        if depth == 0:
+            return "".join(out)
+    raise AssertionError(f"unterminated {name}() definition (red)")
 
 
 def _render_function_text() -> str:
-    """Extract the installer's atomic writer and helper-rendering function,
-    verbatim (the render function calls the writer at runtime)."""
-    text = _installer_text()
-    start = text.find(f"{WRITER_FN}() {{")
-    assert start != -1, f"{WRITER_FN}() absent from the installer (red)"
-    end = text.find(f"\n{INSTALL_FN}()", start)
-    assert end != -1, f"{INSTALL_FN}() must follow {RENDER_FN}() (red)"
-    return text[start:end]
+    """Extract only the installer's atomic writer and helper-rendering
+    function definitions, verbatim (no top-level installer code)."""
+    return _function_text(WRITER_FN) + "\n" + _function_text(RENDER_FN)
 
 
 def _run_render(func_text: str, dest: Path, tag: str):
@@ -1363,7 +1377,10 @@ def test_installer_shebang_is_absolute():
     text = _installer_text()
     lines = text.splitlines()
     assert lines[0] == "#!/bin/bash", f"absolute shebang required, got {lines[0]!r}"
-    assert "/usr/bin/env" not in text, "env resolves its argument through PATH"
+    assert not lines[0].startswith("#!/usr/bin/env"), (
+        "/usr/bin/env resolves its argument through PATH; only an absolute "
+        "interpreter removes that"
+    )
 
 
 def test_installer_shebang_ignores_planted_bash(tmp_path):
@@ -1464,12 +1481,12 @@ def _run_install_vault_env(tmp_path: Path, *, bin_dir: Path, names_dir: Path):
     """Run the installer's atomic writer + helper render + names loop with the
     two fixed directories redirected into the sandbox."""
     text = _installer_text()
-    start = text.find(f"{WRITER_FN}() {{")
-    assert start != -1, f"{WRITER_FN}() absent from the installer (red)"
-    end = text.find(f"\n{INSTALL_FN}\n", start)
-    assert end != -1, f"{INSTALL_FN} function absent from the installer (red)"
+    assert f"{WRITER_FN}() {{" in text, f"{WRITER_FN}() absent from the installer (red)"
+    functions = "\n".join(
+        _function_text(name) for name in (WRITER_FN, RENDER_FN, INSTALL_FN)
+    )
     functions = (
-        text[start:end]
+        functions
         .replace("/opt/rhobear/bin", str(bin_dir))
         .replace("/etc/rhobear/vault-env.d", str(names_dir))
     )
