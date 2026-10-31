@@ -626,7 +626,7 @@ def test_preplaced_symlinks_are_not_followed(tmp_path):
 
 # --- F2-r1: pinned helper PATH + installer freeze guard ---------------------
 
-PATH_PIN = "PATH=/usr/bin:/bin"
+PATH_PIN = "PATH=/usr/bin:/bin; export PATH"
 RENDER_FN = "install_vault_env_helper"
 INSTALL_FN = "install_vault_env"
 
@@ -756,9 +756,17 @@ def test_path_pin_ignores_planted_utilities(tmp_path, util):
 
 # --- F2-r2: every external command absolute, proved statically ---------------
 
+# F21: POSIX special built-ins (SUSv4 XCU 2.14) — commands sh itself
+# implements, never external programs — plus the ordinary built-ins the
+# helper may use.  This list catches external commands; it never dictates
+# which shell built-ins the helper may use.
 HELPER_ALLOWED_BUILTINS = {
-    "printf", "pwd", "set", "trap", "umask", "case", "esac", "for", "do", "done",
-    "if", "then", "fi", "local", "return", "exit", "read", "test", "[", ":",
+    # POSIX special built-ins.
+    "break", ":", "continue", ".", "eval", "exec", "exit", "export",
+    "readonly", "return", "set", "shift", "times", "trap", "unset",
+    # Ordinary built-ins the helper is entitled to use.
+    "cd", "command", "echo", "false", "getopts", "hash", "pwd", "read",
+    "test", "[", "type", "true", "umask", "wait", "printf", "local",
 }
 # POSIX reserved words: grammar, never external commands, whatever they spell.
 HELPER_SHELL_KEYWORDS = {

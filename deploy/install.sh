@@ -18,7 +18,7 @@ install_vault_env_helper() {
   local dest="$1" body
   body=$(cat <<'VAULT_ENV_HELPER'
 #!/bin/sh
-PATH=/usr/bin:/bin
+PATH=/usr/bin:/bin; export PATH
 # vault-env <service> - materialise <RUN_DIR>/<service>/env from the vault,
 # fail closed. NAME=value records are parsed, never sourced or printed; *_B64
 # names decode to 0600 pems whose absolute path is exported. Overrides:
@@ -91,7 +91,7 @@ VAULT_ENV_HELPER
 )
   case "$body" in
     '#!/bin/sh
-PATH=/usr/bin:/bin
+PATH=/usr/bin:/bin; export PATH
 '*) ;;
     *) echo "install.sh: refusing to write $dest: helper PATH is not pinned" >&2; return 1 ;;
   esac
