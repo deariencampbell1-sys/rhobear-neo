@@ -943,25 +943,102 @@ def _helper_command_words(body: str) -> list[tuple[int, str]]:
     return words
 
 
-def test_helper_commands_are_builtins_or_absolute():
-    """r2 — every command word in the shipped helper is a shell keyword, an
-    allowlisted builtin, a function defined in the body itself, or an
-    absolute path under /usr/bin/ or /bin/. A bare chown, mv, mktemp,
-    base64, sed, tr, rm, mkdir, chmod, dirname, stat — any bare word in
-    command position — fails here with the offending line. Static, so it
-    holds no matter what PATH the helper is run with."""
-    body = _helper_body()
+def _helper_offenders(body: str) -> list[tuple[int, str, str]]:
+    """The scanner's whole verdict for one sh body: every command-position
+    word that is not an allowlisted builtin, a shell keyword, a function
+    defined in the body, or an absolute /usr/bin|/bin path, as
+    (lineno, word, source line)."""
     defined = set(re.findall(r"(?m)^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(\)", body))
     lines = body.splitlines()
-    offenders = [
+    return [
         (lineno, word, lines[lineno - 1].strip())
         for lineno, word in _helper_command_words(body)
         if (word not in HELPER_ALLOWED_BUILTINS and word not in HELPER_SHELL_KEYWORDS
             and word not in defined
             and not word.startswith("/usr/bin/") and not word.startswith("/bin/"))
     ]
+
+
+def test_helper_commands_are_builtins_or_absolute():
+    """r2 — every command word in the shipped helper is a shell keyword, an
+    allowlisted builtin, a function defined in the body itself, or an
+    absolute path under /usr/bin/ or /bin/. A bare chown, mv, mktemp,
+    base64, sed, tr, rm, mkdir, chmod, dirname, stat — any bare word in
+    command position — fails here with the offending line. Static, so it
+    holds no matter what PATH the helper is run with. F21: the allowlist
+    exists to catch external commands, never to dictate which shell built-ins
+    the helper may use; if a built-in is missing, the list is wrong, not the
+    code."""
+    offenders = _helper_offenders(_helper_body())
     assert not offenders, (
         "bare command words in the helper body — every command must be a "
         "shell keyword, an allowlisted builtin, a function defined in the "
         f"body, or an absolute /usr/bin|/bin path: {offenders}"
     )
+
+
+# --- F21: the allowlist is complete; the scanner never shapes the helper -----
+
+F21_BUILTINS = (
+    "export", "continue", "break", "shift", "cd", "unset", "wait",
+    "readonly", "echo",
+)
+PIN_EXPORT_RE = re.compile(r"^PATH=/usr/bin:/bin\s*;\s*export\s+PATH$")
+
+
+@pytest.mark.parametrize("utility", ["chown", "mv", "install"])
+def test_helper_scanner_rejects_planted_bare_utilities(utility):
+    """F21 — a complete allowlist is not a permissive one: a planted bare
+    utility in command position is still a finding."""
+    body = f"#!/bin/sh\n{utility} -f /run/svc/env\nprintf '%s\\n' ok\n"
+    offenders = _helper_offenders(body)
+    assert [word for _ln, word, _src in offenders] == [utility], offenders
+
+
+def test_helper_scanner_ignores_commented_bare_utilities():
+    """F21 — comments are stripped before scanning, so a commented-out bare
+    utility is not a finding."""
+    body = "#!/bin/sh\n# chown -R root:root /run/svc\nprintf '%s\\n' ok\n"
+    assert _helper_offenders(body) == []
+
+
+def test_helper_scanner_accepts_posix_builtins():
+    """F21 — every POSIX special builtin and the ordinary builtins the
+    helper may use are accepted by the scanner; rejecting them would be the
+    scanner dictating the helper's code."""
+    body = "#!/bin/sh\n" + "\n".join(F21_BUILTINS) + "\n"
+    assert _helper_offenders(body) == []
+
+
+def test_helper_scanner_builtin_and_keyword_sets_stay_disjoint():
+    """F21 — grammar keywords live only in HELPER_SHELL_KEYWORDS: a word
+    that is both a keyword and a builtin (`return`, `break`) is accepted
+    once and never shadows the keyword set."""
+    overlap = HELPER_ALLOWED_BUILTINS & HELPER_SHELL_KEYWORDS
+    assert not overlap, (
+        f"keywords duplicated into the builtin allowlist: {sorted(overlap)}"
+    )
+    for word in ("return", "break"):
+        assert _helper_offenders(f"#!/bin/sh\n{word}\n") == []
+
+
+def test_helper_pin_line_exports_path():
+    """F21 — the helper's PATH pin is exported, not merely assigned, so the
+    pin reaches the helper's own children under a bare `sh`."""
+    pin_lines = [ln for ln in _helper_body().splitlines() if ln.startswith("PATH=")]
+    assert len(pin_lines) == 1, f"exactly one PATH= assignment, got {pin_lines}"
+    assert PIN_EXPORT_RE.match(pin_lines[0]), (
+        f"the helper pin must export PATH, got {pin_lines[0]!r}"
+    )
+
+
+@pytest.mark.parametrize("line, accepted", [
+    ("PATH=/usr/bin:/bin; export PATH", True),
+    ("PATH=/usr/bin:/bin ; export PATH", True),
+    ("PATH=/usr/bin:/bin", False),
+    ("PATH=/usr/bin:/bin; export", False),
+])
+def test_helper_pin_matcher_tolerates_space_before_semicolon(line, accepted):
+    """F21 — the pin matcher tolerates whitespace around `;` but never
+    accepts a bare assignment."""
+    assert bool(PIN_EXPORT_RE.match(line)) is accepted
