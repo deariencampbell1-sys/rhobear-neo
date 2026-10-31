@@ -991,7 +991,6 @@ F21_BUILTINS = (
     "export", "continue", "break", "shift", "cd", "unset", "wait",
     "readonly", "echo",
 )
-PIN_EXPORT_RE = re.compile(r"^PATH=/usr/bin:/bin\s*;\s*export\s+PATH$")
 
 
 @pytest.mark.parametrize("utility", ["chown", "mv", "install"])
@@ -1030,23 +1029,117 @@ def test_helper_scanner_builtin_and_keyword_sets_stay_disjoint():
         assert _helper_offenders(f"#!/bin/sh\n{word}\n") == []
 
 
-def test_helper_pin_line_exports_path():
-    """F21 — the helper's PATH pin is exported, not merely assigned, so the
-    pin reaches the helper's own children under a bare `sh`."""
-    pin_lines = [ln for ln in _helper_body().splitlines() if ln.startswith("PATH=")]
-    assert len(pin_lines) == 1, f"exactly one PATH= assignment, got {pin_lines}"
-    assert PIN_EXPORT_RE.match(pin_lines[0]), (
-        f"the helper pin must export PATH, got {pin_lines[0]!r}"
-    )
+# --- F21-r1-r2: execution builtins are out; the guard is the one under test --
+
+EXECUTION_BUILTINS = ("command", "exec", ".", "eval")
 
 
-@pytest.mark.parametrize("line, accepted", [
-    ("PATH=/usr/bin:/bin; export PATH", True),
-    ("PATH=/usr/bin:/bin ; export PATH", True),
-    ("PATH=/usr/bin:/bin", False),
-    ("PATH=/usr/bin:/bin; export", False),
+@pytest.mark.parametrize("word, fixture", [
+    ("command", "command chown 0:0 /run/svc/env"),
+    ("exec", "exec mv /run/svc/env /run/svc/old"),
+    (".", '. "$vault_record"'),
+    ("eval", 'eval "$vault_record"'),
 ])
-def test_helper_pin_matcher_tolerates_space_before_semicolon(line, accepted):
-    """F21 — the pin matcher tolerates whitespace around `;` but never
-    accepts a bare assignment."""
-    assert bool(PIN_EXPORT_RE.match(line)) is accepted
+def test_helper_scanner_rejects_execution_builtins(word, fixture):
+    """F21-r1-r2 — `command`/`exec` run the word that follows them and
+    `.`/`eval` execute arbitrary text, so none may be allowlisted: each
+    fixture line is a command-position finding. On the F21-r1 base all four
+    are silently accepted (the red)."""
+    offenders = _helper_offenders(f"#!/bin/sh\n{fixture}\n")
+    assert [w for _ln, w, _src in offenders] == [word], offenders
+
+
+def test_helper_body_uses_no_execution_builtins():
+    """F21-r1-r2 — the shipped helper parses NAME=value records and never
+    sources, evals or delegates to a planted utility. Pin the header's
+    promise: no command/exec/./eval in command position, no leading `. `
+    source call, and no `eval` word anywhere."""
+    body = _helper_body()
+    words = [w for _ln, w in _helper_command_words(body)]
+    used = [w for w in words if w in EXECUTION_BUILTINS]
+    assert not used, f"execution builtin in command position: {used}"
+    assert not re.search(r"(?m)^\s*\.\s", body), "the helper must not source a file"
+    assert not re.search(r"\beval\b", body), "the helper must not eval text"
+
+
+def test_helper_scanner_admits_only_non_executing_introspection_builtins(tmp_path):
+    """F21-r1-r2 — hash/type/getopts/times are admitted (the helper is
+    entitled to them) but, unlike command/exec, none runs the word that
+    follows: a planted `chown` named as their argument never executes, and
+    each line still passes the scanner as a builtin in command position."""
+    planted = tmp_path / "planted-bin"
+    planted.mkdir()
+    marker = tmp_path / "planted.marker"
+    fake = planted / "chown"
+    fake.write_text('#!/bin/sh\n: > "$F21_MARKER"\n', encoding="utf-8")
+    fake.chmod(0o755)
+    fixtures = {
+        "hash": "hash chown",
+        "type": "type chown",
+        "getopts": 'getopts "c" chown',
+        "times": "times",
+    }
+    for word, line in fixtures.items():
+        proc = subprocess.run(
+            ["/bin/sh", "-c", f"{line}\nexit 0"],
+            env={"PATH": f"{planted}:/usr/bin:/bin", "F21_MARKER": str(marker)},
+            capture_output=True, text=True,
+        )
+        assert proc.returncode == 0, (word, proc.stderr)
+        assert not marker.exists(), f"{word} executed the word that follows it"
+        assert _helper_offenders(f"#!/bin/sh\n{line}\n") == [], (
+            f"{word} must stay accepted in command position"
+        )
+
+
+def test_helper_scanner_ignores_execution_words_as_data():
+    """F21-r1-r2 edge — `command` in a comment, or as an assignment name, is
+    data, not command position, and is not a finding."""
+    body = (
+        "#!/bin/sh\n"
+        "# command chown -R root:root /run/svc/env\n"
+        "command=chown\n"
+        'printf "%s\\n" "$command"\n'
+    )
+    assert _helper_offenders(body) == []
+
+
+def test_helper_scanner_reports_builtin_command_form():
+    """F21-r1-r2 edge — a bash-only `builtin command` line is never silently
+    allowed just because the word `command` appears in the file: `builtin`
+    itself is not allowlisted, so the scanner still reports a finding."""
+    offenders = _helper_offenders("#!/bin/sh\nbuiltin command chown 0:0 /x\n")
+    assert offenders, "builtin command must not pass the scanner silently"
+
+
+def test_helper_pin_line_exports_path(tmp_path):
+    """F21-r1-r2 — the pin is the second line of the helper the installer
+    actually renders, exactly as its prefix guard requires, and it is the
+    only PATH= line in that helper."""
+    func_text = _render_function_text()
+    dest = tmp_path / "vault-env-rendered"
+    proc = _run_render(func_text, dest, "rendered")
+    assert proc.returncode == 0, proc.stderr
+    rendered = dest.read_text(encoding="utf-8")
+    lines = rendered.splitlines()
+    assert lines[0] == "#!/bin/sh", lines[:2]
+    assert lines[1] == PATH_PIN, (
+        f"the pin must be the second line, got {lines[1]!r}"
+    )
+    pin_lines = [ln for ln in lines if ln.startswith("PATH=")]
+    assert len(pin_lines) == 1, f"exactly one PATH= assignment, got {pin_lines}"
+
+
+def test_installer_rejects_space_before_semicolon_in_pin(tmp_path):
+    """F21-r1-r2 — the render guard compares the pin literally, so
+    `PATH=/usr/bin:/bin ; export PATH` is refused. F21-r1 tested a regex the
+    installer never used; this drives the real guard instead."""
+    func_text = _render_function_text()
+    spaced = func_text.replace(PATH_PIN, "PATH=/usr/bin:/bin ; export PATH", 1)
+    assert spaced != func_text, "space-before-semicolon mutation anchor missing (red)"
+    dest = tmp_path / "vault-env-spaced-pin"
+    proc = _run_render(spaced, dest, "spaced-pin")
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode != 0, "the real guard accepts only the exact pin"
+    assert "refusing" in combined and "PATH" in combined, combined
+    assert not dest.exists(), "the refused destination must not be created"
