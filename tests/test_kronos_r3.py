@@ -655,7 +655,7 @@ def test_unproven_install_defers_loudly():
 # MEDIUM 1 — the 240 s budget bounds the alert and delivery I/O too
 # ---------------------------------------------------------------------------
 
-def test_alert_http_timeout_clamps_to_the_remaining_budget():
+def test_alert_http_timeout_clamps_to_the_remaining_budget(monkeypatch):
     """_alert_once builds its alerter WITH the budget: with <1s left the
     issue calls time out at 1s, not the default 30s."""
     from src.kronos.__main__ import _alert_once
@@ -670,6 +670,18 @@ def test_alert_http_timeout_clamps_to_the_remaining_budget():
             seen.append(timeout)
             return 200, "[]"
 
+    class _FakeApp:
+        def __init__(self, *a, **k):
+            pass
+
+        def token_for_repo(self, *a, **k):
+            return "tok"
+
+        def jwt(self):
+            return "jwt"
+
+    # the alerter imports GitHubApp lazily; patch it at the source module
+    monkeypatch.setattr("src.github_app.GitHubApp", _FakeApp)
     _alert_once(cfg, state, lambda l: None, fingerprint="check:x",
                 subject="s", body="b", now_fn=lambda: 0.0,
                 services=_Svc(), left_fn=lambda: 0.4)

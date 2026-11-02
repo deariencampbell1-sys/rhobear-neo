@@ -593,6 +593,11 @@ def judge_pr(cfg, db, *, comments, alerter, state, repo: str, pr: int,
             "deferred",
             f"PR head moved ({state_now.head_sha[:12]} != recorded "
             f"{head_sha[:12]}) — Zeus is mid-flight on a newer head")
+    if state_now.head_sha and two_greens_on_head(
+            github, repo, pr, state_now.head_sha, token=read_token,
+            timeout=github_timeout, apollo_login=apollo_login):
+        return JudgeOutcome(
+            "skip", "two greens on the current head — the loop is over")
 
     loops = same_commit_loop(rounds)
     report = build_report(rounds, loops=loops)

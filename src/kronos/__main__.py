@@ -632,7 +632,8 @@ def _resolve_fixed(cfg, state, results, db, out, *, now_fn,
                     continue
                 note = f"{unit} is active again"
             elif fingerprint.startswith("check:flap-detect:"):
-                unit = fingerprint.split(":", 1)[1]
+                # the fingerprint carries TWO colons before the unit name
+                unit = fingerprint.split(":", 2)[2]
                 if f"unit:{unit}" not in ok_names or unit in flap_blind:
                     continue
                 note = (f"{unit}'s restart probe succeeded — flap "
