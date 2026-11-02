@@ -228,17 +228,17 @@ def test_concurrent_escalations_produce_exactly_one_row(fresh):
 def _backdate(dsn, repo: str, pr: int, *, hours: float = 3.0) -> None:
     """Make the PR look quiet: at judge time a real loop's rows are hours
     old. (The r3 store defers on recent activity — Zeus may be mid-flight.)"""
+    h = int(hours)
     with psycopg.connect(dsn, autocommit=True) as c:
         c.execute(
             "UPDATE neo_actions SET created_at = now() - make_interval("
-            "hours => %s::int) WHERE repo=%s AND pr_number=%s",
-            (hours, repo, pr))
+            "hours => %s) WHERE repo=%s AND pr_number=%s",
+            (h, repo, pr))
         c.execute(
             "UPDATE neo_jobs SET created_at = now() - make_interval("
-            "hours => %s::int), updated_at = now() - make_interval("
-            "hours => %s::int) WHERE kind='builder' AND repo=%s "
-            "AND pr_number=%s",
-            (hours, hours, repo, pr))
+            "hours => %s), updated_at = now() - make_interval(hours => %s) "
+            "WHERE kind='builder' AND repo=%s AND pr_number=%s",
+            (h, h, repo, pr))
 
 
 def test_pre_existing_parked_round_six_job_is_never_rearmed(fresh):
