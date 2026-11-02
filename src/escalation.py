@@ -472,7 +472,7 @@ def _consume_and_act(state, repo: str, pr: int, head_sha: str,
     if not state.take_escalation(repo, pr, advice_id):
         return None
     try:
-        return act()
+        out = act()
     except Exception as exc:  # noqa: BLE001 — fail closed, never strand
         log.warning("escalation act failed for %s#%s advice %s: %s — marker "
                     "re-recorded, retry next poll", repo, pr, advice_id, exc)
@@ -486,6 +486,15 @@ def _consume_and_act(state, repo: str, pr: int, head_sha: str,
             repo, pr, head_sha, advice_id=advice_id,
             installation_id=installation_id, extra=extra or None)
         return {"action": "retry", "reason": f"transient failure: {exc}"}
+    # r4 (HIGH C): the outcome is recorded — the in-flight marker the take
+    # left behind is removed now, and ONLY now. A failure here is retried by
+    # the stale reclaim (a crashed caller cannot strand the marker).
+    try:
+        state.clear_inflight_markers(repo, pr)
+    except Exception as exc:  # noqa: BLE001 — the stale reclaim covers it
+        log.warning("could not clear the in-flight marker for %s#%s "
+                    "(the stale reclaim will): %s", repo, pr, exc)
+    return out
 
 
 def recover_escalations(
@@ -508,7 +517,10 @@ def recover_escalations(
 
     Every terminal action consumes the escalating marker atomically under the
     per-PR advisory lock (`state.take_escalation`): it verifies the advice is
-    still the NEWEST escalation for the PR and deletes only that advice's rows.
+    still the NEWEST escalation for the PR and consumes only that advice's
+    rows. r4 (HIGH C): the consumed rows become a durable 'escalation-inflight'
+    marker (never a deletion), removed when the outcome records and reclaimed
+    after ESCALATION_INFLIGHT_STALE_SECS — the consume-then-act gap is closed.
     A newer escalation (a new head bounced while this advice was queued)
     supersedes it, so no round is created for a stale head and the newer
     advice's marker is never deleted.  If the action itself raises after the
@@ -517,6 +529,16 @@ def recover_escalations(
     Returns the list of handled rows for the caller/tests.
     """
     handled: list[dict] = []
+    # r4 (HIGH C) — reclaim stale in-flight markers FIRST: a crashed Zeus's
+    # consumed-but-never-acted advice re-enters this pipeline (or is dropped
+    # when a newer escalation took over), so it cannot block a PR forever.
+    # Fresh markers are left alone — Zeus may still be mid-act.
+    try:
+        for rec in state.reclaim_stale_inflight():
+            log.info("escalation in-flight marker reclaimed for %s#%s: %s",
+                     rec.get("repo"), rec.get("pr"), rec.get("action"))
+    except Exception as exc:  # noqa: BLE001 — the poll loop still runs
+        log.warning("stale in-flight reclaim failed: %s", exc)
     for row in state.escalating_prs():
         repo = row["repo"]
         pr = row["pr"]

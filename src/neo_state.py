@@ -9,6 +9,7 @@ button and the credit meter.
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 
 import psycopg  # psycopg3
@@ -49,6 +50,18 @@ def _started_at(detail: dict, created_at) -> float:
     except (TypeError, ValueError):
         pass
     return created_at.timestamp()
+
+
+# r4 (HIGH C, authorized Zeus interop change — Morpheus ruling 2026-11-02):
+# take_escalation() no longer DELETES the consumed advice's rows. They are
+# re-phased to this marker phase with a consumed_at timestamp, so there is
+# never a window with no marker between the consume and the recorded outcome
+# (the gap Kronos's judge could previously fall into). The marker is removed
+# only when the outcome records (escalate_pr's escalated row / the park row),
+# and is reclaimable after ESCALATION_INFLIGHT_STALE_SECS so a crashed Zeus
+# cannot block a PR forever. Kronos defers whenever the marker exists.
+ESCALATION_INFLIGHT_PHASE = "escalation-inflight"
+ESCALATION_INFLIGHT_STALE_SECS = 3600
 
 
 _TRUE_STRINGS = frozenset({"true", "1", "yes", "y", "on", "success", "green"})
@@ -193,15 +206,24 @@ class NeoState:
         One transaction under the per-PR advisory lock
         (pg_advisory_xact_lock(hashtext(repo||':'||pr))): re-checks that no
         newer escalating row appeared since the recovery loop's snapshot, then
-        deletes exactly this advice's rows (never a newer escalation's marker).
-        The lock serializes this check-then-delete-all against a concurrent
-        submit_escalation / phase-row INSERT, so a freshly-inserted newer
-        escalation is never clobbered (defect 1).
+        consumes exactly this advice's rows (never a newer escalation's
+        marker). The lock serializes this check-then-consume-all against a
+        concurrent submit_escalation / phase-row INSERT, so a freshly-inserted
+        newer escalation is never clobbered (defect 1).
+
+        r4 (HIGH C, authorized interop change): a successful consume does NOT
+        delete the rows — it re-phases them to ESCALATION_INFLIGHT_PHASE with
+        a consumed_at timestamp, so no gap without a marker exists between
+        the consume and escalate_pr recording its outcome. The marker is
+        removed only when the outcome records (clear_inflight_markers, called
+        by the escalation flow after act()) and is reclaimable after
+        ESCALATION_INFLIGHT_STALE_SECS (reclaim_stale_inflight) so a crashed
+        Zeus cannot block a PR forever.
 
         Returns True when the advice was current and is consumed (caller acts
         on it), False when it was superseded (caller drops it, logged, without
-        creating a round).  In both cases this advice's own rows are removed so
-        stale markers never accumulate.
+        creating a round). In the superseded case this advice's own rows are
+        removed — a newer escalation's marker exists, so there is no gap.
         """
         with psycopg.connect(self.dsn, autocommit=False) as c:
             try:
@@ -219,11 +241,16 @@ class NeoState:
                 if newest is not None and newest_id == (advice_id or ""):
                     # Still the newest escalation — consume it AND any
                     # superseded older rows (they are stale; nothing newer
-                    # exists to protect).
+                    # exists to protect). r4 (HIGH C): RE-PHASE to the
+                    # durable in-flight marker instead of deleting.
                     c.execute(
-                        "DELETE FROM neo_actions WHERE repo=%s AND pr_number=%s "
+                        "UPDATE neo_actions SET phase=%s, "
+                        "detail = detail || %s::jsonb "
+                        "WHERE repo=%s AND pr_number=%s "
                         "AND phase='escalating'",
-                        (repo, pr),
+                        (ESCALATION_INFLIGHT_PHASE,
+                         json.dumps({"consumed_at": time.time()}),
+                         repo, pr),
                     )
                     c.commit()
                     return True
@@ -239,6 +266,97 @@ class NeoState:
             except Exception:
                 c.rollback()
                 raise
+
+    def clear_inflight_markers(self, repo: str, pr: int) -> int:
+        """r4 (HIGH C): remove the PR's in-flight escalation markers once the
+        outcome is recorded (escalate_pr's escalated row, or the park row the
+        give-up / failed-advice paths write). This — and the stale reclaim —
+        is the ONLY thing that removes them. Under the per-PR advisory lock;
+        returns the number of rows removed."""
+        with psycopg.connect(self.dsn, autocommit=False) as c:
+            try:
+                c.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                    (f"{repo}:{pr}",),
+                )
+                cur = c.execute(
+                    "DELETE FROM neo_actions WHERE repo=%s AND pr_number=%s "
+                    "AND phase=%s",
+                    (repo, pr, ESCALATION_INFLIGHT_PHASE),
+                )
+                removed = cur.rowcount
+                c.commit()
+                return removed
+            except Exception:
+                c.rollback()
+                raise
+
+    def reclaim_stale_inflight(
+            self, *,
+            stale_secs: int = ESCALATION_INFLIGHT_STALE_SECS) -> list[dict]:
+        """r4 (HIGH C): the in-flight marker is reclaimable — a crashed Zeus
+        cannot block a PR forever. Every in-flight marker whose consumed_at
+        is older than `stale_secs` is re-phased back to 'escalating' (detail
+        restored, consumed_at stripped) so the advice re-enters the normal
+        recovery pipeline (escalate_pr is idempotent per advice_id) — UNLESS
+        a newer escalating marker already owns the PR, in which case the
+        stale marker is simply dropped. Returns one row per reclaimed
+        marker."""
+        now = time.time()
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT id, repo, pr_number, detail FROM neo_actions "
+                "WHERE phase=%s ORDER BY id",
+                (ESCALATION_INFLIGHT_PHASE,),
+            ).fetchall()
+        out: list[dict] = []
+        for row_id, repo, pr, detail in rows:
+            if isinstance(detail, str):
+                try:
+                    detail = json.loads(detail)
+                except (TypeError, ValueError):
+                    detail = {}
+            detail = detail or {}
+            try:
+                consumed = float(detail.get("consumed_at") or 0)
+            except (TypeError, ValueError):
+                consumed = 0.0
+            if consumed <= 0 or now - consumed < stale_secs:
+                continue  # fresh marker: Zeus may still be mid-act
+            with psycopg.connect(self.dsn, autocommit=False) as c:
+                try:
+                    c.execute(
+                        "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                        (f"{repo}:{pr}",),
+                    )
+                    still = c.execute(
+                        "SELECT 1 FROM neo_actions WHERE id=%s AND phase=%s",
+                        (row_id, ESCALATION_INFLIGHT_PHASE),
+                    ).fetchone()
+                    if not still:
+                        c.rollback()
+                        continue
+                    newer = c.execute(
+                        "SELECT 1 FROM neo_actions WHERE repo=%s "
+                        "AND pr_number=%s AND phase='escalating' LIMIT 1",
+                        (repo, pr),
+                    ).fetchone()
+                    if newer:
+                        c.execute(
+                            "DELETE FROM neo_actions WHERE id=%s", (row_id,))
+                        action = "dropped (a newer escalation owns the PR)"
+                    else:
+                        c.execute(
+                            "UPDATE neo_actions SET phase='escalating', "
+                            "detail = detail - 'consumed_at' WHERE id=%s",
+                            (row_id,))
+                        action = "re-recorded"
+                    c.commit()
+                    out.append({"repo": repo, "pr": pr, "action": action})
+                except Exception:
+                    c.rollback()
+                    raise
+        return out
 
     def record_escalating(self, repo: str, pr: int, head_sha: str, *,
                           verdict: str = "ESCALATE", builder_round: int = 0,

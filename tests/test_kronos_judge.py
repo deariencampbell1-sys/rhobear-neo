@@ -57,6 +57,10 @@ class FakeDb:
     # read side -------------------------------------------------------------
     def rows(self, sql: str, params=()) -> list[dict]:
         s = " ".join(str(sql).split())
+        if "phase='escalation-inflight'" in s:
+            # r4 HIGH C — no Zeus in-flight marker in these fixtures; this
+            # branch must come before the generic FROM neo_actions catch-all.
+            return []
         if "phase='escalated'" in s or "phase = 'escalated'" in s:
             return [{"n": 1}] if self.escalated else []
         if "phase='escalating'" in s or "phase = 'escalating'" in s:
