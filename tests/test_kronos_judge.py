@@ -44,36 +44,81 @@ class FakeDb:
     def __init__(self, rounds: list[dict] | None = None,
                  escalated: bool = False,
                  escalating: bool = False,
-                 assessments: list[dict] | None = None):
+                 assessments: list[dict] | None = None,
+                 merged: bool = False,
+                 ready: bool = False):
         self.rounds = rounds or []
         self.escalated = escalated
         self.escalating = escalating
         self.assessments = assessments or []
+        self.merged = merged
+        self.ready = ready
 
     # read side -------------------------------------------------------------
     def rows(self, sql: str, params=()) -> list[dict]:
-        if "FROM neo_actions" in sql and "phase='escalated'" in sql:
+        s = " ".join(str(sql).split())
+        if "phase='escalated'" in s or "phase = 'escalated'" in s:
             return [{"n": 1}] if self.escalated else []
-        if "phase='escalating'" in sql:
+        if "phase='escalating'" in s or "phase = 'escalating'" in s:
             return [{"repo": "o/r", "pr": 1}] if self.escalating else []
-        if "FROM neo_actions" in sql:
+        if "phase = 'merged'" in s or "phase='merged'" in s:
+            return [{"n": 1}] if self.merged else []
+        if "phase = 'ready'" in s or "phase='ready'" in s:
+            return [{"n": 1}] if self.ready else []
+        if "FROM neo_actions" in s:
             return self.rounds
-        if "FROM assessments" in sql:
+        if "FROM assessments" in s:
             return self.assessments
         return []
 
 
+class FakeGithub:
+    """api.github.com as the judge sees it (r3 HIGH 2): the PR's CURRENT
+    state and its reviews, read-only. Defaults to an open PR on the same
+    head the judge was given, with no reviews — the judging path."""
+
+    def __init__(self, *, merged=False, state="open", head="f" * 40,
+                 reviews=None):
+        self.merged = merged
+        self.state = state
+        self.head = head
+        self.reviews = reviews or []
+        self.calls: list[dict] = []
+
+    def __call__(self, method, url, *, headers=None, body=None, timeout=30):
+        self.calls.append({"method": method, "url": url})
+        if "/reviews" in url:
+            return 200, json.dumps(self.reviews)
+        if "/pulls/" in url:
+            return 200, json.dumps({"state": self.state,
+                                    "merged": self.merged, "draft": False,
+                                    "head": {"sha": self.head}})
+        return 200, "{}"
+
+
 class FakeWrites:
     """The judge's ONLY writer: escalate/stop, each an atomic CAS that can
-    defer (Zeus won the race). Records every call for assertions."""
+    defer (Zeus won the race). Records every call for assertions. Honours an
+    injected authority callable exactly like src.kronos.store.SqlWrites."""
 
     def __init__(self, defer_reason: str | None = None):
         self.escalates: list[dict] = []
         self.stops: list[dict] = []
         self.defer_reason = defer_reason
+        self.authority_results: list[str] = []
+
+    def _gate(self, authority):
+        if authority is None:
+            return True, ""
+        ok, why = authority()
+        self.authority_results.append(why or "ok")
+        return ok, why
 
     def escalate(self, repo, pr, head_sha, *, advisor_round, detail,
-                 builder_payload):
+                 builder_payload, authority=None, **kw):
+        ok, why = self._gate(authority)
+        if not ok:
+            return False, f"deferred: {why}"
         self.escalates.append({"repo": repo, "pr": pr, "head_sha": head_sha,
                                "advisor_round": advisor_round,
                                "detail": detail,
@@ -82,7 +127,11 @@ class FakeWrites:
             return False, self.defer_reason
         return True, f"escalated round {advisor_round} recorded"
 
-    def stop(self, repo, pr, head_sha, *, advisor_round, detail):
+    def stop(self, repo, pr, head_sha, *, advisor_round, detail,
+             authority=None, **kw):
+        ok, why = self._gate(authority)
+        if not ok:
+            return False, f"deferred: {why}"
         self.stops.append({"repo": repo, "pr": pr, "head_sha": head_sha,
                            "advisor_round": advisor_round, "detail": detail})
         if self.defer_reason:
@@ -209,7 +258,7 @@ def test_timeout_raises_judge_timeout():
 # ---------------------------------------------------------------------------
 
 def _run_judge(db: FakeDb, http, *, install_id="9999",
-               state=None, writes=None, timeout=None):
+               state=None, writes=None, timeout=None, github=None):
     comments = FakeComments()
     alerter = FakeAlerter()
     state = state or FakeState()
@@ -217,7 +266,8 @@ def _run_judge(db: FakeDb, http, *, install_id="9999",
     out = judge.judge_pr(
         _cfg(), db, comments=comments, alerter=alerter, state=state,
         repo="o/r", pr=52, head_sha="f" * 40, install_id=install_id,
-        http=http, now_fn=lambda: 1.0, writes=writes, timeout=timeout)
+        http=http, now_fn=lambda: 1.0, writes=writes, timeout=timeout,
+        github=github if github is not None else FakeGithub())
     return out, comments, alerter, state, writes
 
 

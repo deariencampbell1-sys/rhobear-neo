@@ -6,6 +6,23 @@ build_report) to Summit through RouteGate, consumer
 `reviews:kronos/<install_id>`, carrying a READ-ONLY installation token
 ({contents: read, pull_requests: read} — never the write token).
 
+r3 (HIGH 2): BEFORE the model is called — and again under the decision CAS —
+the PR's CURRENT state is proven, never assumed from the round history:
+
+  - Zeus's own terminal rows: phase='merged' or phase='ready' -> skip
+    (accepted work becomes ready/merged in src/neo_worker.py, never a
+    verdict ACCEPT on a builder row);
+  - GitHub's authoritative state (GET /repos/{repo}/pulls/{pr}): merged or
+    closed -> skip; the head moved since the last recorded round -> defer
+    (Zeus is mid-flight on a newer head);
+  - the SAME-head two-green proof (Apollo ACCEPT + a second approval, both
+    bound to the current head — the merge rule's greens (b)+(c)) -> skip.
+
+r3 (HIGH 6): the installation identity must be PROVEN from the authoritative
+rows Zeus writes (neo_jobs.payload / a recorded identity) — Zeus's builder
+action rows do not carry it. Unproven -> the judge defers loudly instead of
+degrading to the bare consumer and a repo-lookup token.
+
 r2 (HIGH 7): the installation token travels in a TRUSTED HEADER
 (`X-RHOBEAR-Install-Token`), NEVER in model-visible message content — r1
 pasted it into the user message, so a model echo would leak it into logs,
@@ -32,8 +49,18 @@ lost race DEFERS: no marker, no comment, no alert — Zeus's path owns the PR.
 Deconfliction with Zeus's own advisor escalation (src/escalation.py, W1-10's
 file — read, never touched): while a phase='escalating' marker exists, or an
 escalated round is already recorded, Kronos defers — Zeus's path owns the
-PR. Kronos judges only when the loop is at 5+ rounds and Zeus has not taken
-it, and never twice for the same PR (the judged marker in Kronos's state).
+PR. r3 (HIGH 4): Zeus's take_escalation COMMITS the marker's deletion before
+escalate_pr runs, so the store additionally defers on RECENT activity (the
+consume-then-act gap; see src/kronos/store.py). Kronos judges only when the
+loop is at 5+ rounds, quiet, and Zeus has not taken it, and never twice for
+the same PR (the judged marker in Kronos's state).
+
+r3 (HIGH 7): a committed decision NEVER loses its notifications. The stop's
+owner alert and both explanatory comments go through a durable
+pending-notification OUTBOX in Kronos's state: entries are recorded when the
+decision commits and retried on later passes (drain_notify_outbox) until the
+comment AND the alert are delivered. A GitHub comment 403/timeout can no
+longer swallow the owner alert.
 
 The stop marker: a phase='escalated' row with detail.advisor_round set and
 detail.kronos_stop explaining the judgment. Zeus's neo_worker checks
@@ -71,6 +98,8 @@ REDACT_FAILED_REASON = (
     "judge answer withheld: redaction failed (fail closed) — "
     "no model text used")
 
+API_GITHUB = "https://api.github.com"
+
 
 class JudgeTimeout(Exception):
     """Summit did not answer inside the budget — a stop, not a retry."""
@@ -85,6 +114,86 @@ class JudgeOutcome:
     action: str          # escalated | stopped | deferred | skip
     reason: str
     plan: str = ""
+
+
+@dataclass
+class PRAuthState:
+    """GitHub's authoritative answer about the PR's CURRENT state."""
+
+    ok: bool
+    reason: str
+    merged: bool = False
+    closed: bool = False
+    head_sha: str = ""
+
+
+# ---------------------------------------------------------------------------
+# the authoritative PR state (r3 HIGH 2) — GitHub, read-only
+# ---------------------------------------------------------------------------
+
+def pr_authoritative(github, repo: str, pr: int, *, token: str = "",
+                     timeout: int = 15) -> PRAuthState:
+    """GET /repos/{repo}/pulls/{pr} — GitHub's current view. Any failure is
+    a `not ok` state: the judge defers loudly, it never judges blind."""
+    headers = {"Accept": "application/vnd.github+json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        status, raw = github("GET", f"{API_GITHUB}/repos/{repo}/pulls/{pr}",
+                             headers=headers, timeout=timeout)
+    except Exception as exc:  # noqa: BLE001 — the reason is one line
+        return PRAuthState(False, f"GitHub PR state unreadable: "
+                                  f"{type(exc).__name__}")
+    if status != 200:
+        return PRAuthState(False, f"GitHub PR state -> HTTP {status}")
+    try:
+        data = json.loads(raw)
+        return PRAuthState(
+            True, "",
+            merged=bool(data.get("merged")),
+            closed=str(data.get("state") or "") == "closed",
+            head_sha=str((data.get("head") or {}).get("sha") or ""))
+    except (TypeError, ValueError) as exc:
+        return PRAuthState(False, f"GitHub PR state malformed: "
+                                  f"{type(exc).__name__}")
+
+
+def two_greens_on_head(github, repo: str, pr: int, head_sha: str, *,
+                       token: str = "", timeout: int = 15,
+                       apollo_login: str = "rhobear-reviews[bot]") -> bool:
+    """The SAME-head two-green proof (merge rule greens (b)+(c), read-only):
+    Apollo's ACCEPT review on this exact head plus a second approval
+    (architect or trusted reviewer) on the same head. A fetch failure is
+    `no proof` — the gate only ever SKIPS on positive evidence."""
+    headers = {"Accept": "application/vnd.github+json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        status, raw = github(
+            "GET", f"{API_GITHUB}/repos/{repo}/pulls/{pr}/reviews?per_page=100",
+            headers=headers, timeout=timeout)
+    except Exception:  # noqa: BLE001 — no proof is not a crash
+        return False
+    if status != 200:
+        return False
+    try:
+        reviews = json.loads(raw)
+    except (TypeError, ValueError):
+        return False
+    green1 = green2 = False
+    for review in reviews or []:
+        if not isinstance(review, dict):
+            continue
+        if str(review.get("state") or "") != "APPROVED":
+            continue
+        if str(review.get("commit_id") or "") != head_sha:
+            continue
+        login = str((review.get("user") or {}).get("login") or "")
+        if login and login == apollo_login:
+            green1 = True
+        else:
+            green2 = True
+    return green1 and green2
 
 
 # ---------------------------------------------------------------------------
@@ -348,19 +457,80 @@ def _redact(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# the notification outbox (r3 HIGH 7) — a committed decision never loses
+# its comment or its owner alert
+# ---------------------------------------------------------------------------
+
+def _outbox_entry(repo: str, pr: int, *, comment: str | None,
+                  alert_fp: str | None, alert_subject: str,
+                  alert_body: str) -> dict:
+    return {"repo": repo, "pr": int(pr), "comment": comment,
+            "alert_fp": alert_fp, "alert_subject": alert_subject,
+            "alert_body": alert_body,
+            "needs_comment": comment is not None,
+            "needs_alert": alert_fp is not None}
+
+
+def _deliver_entry(state, entry: dict, comments, alerter) -> bool:
+    """One delivery attempt for an outbox entry. The comment and the alert
+    fail INDEPENDENTLY (a 403 comment never swallows the owner alert).
+    Returns True when nothing is pending any more."""
+    if entry.get("needs_comment") and entry.get("comment"):
+        try:
+            comments(entry["repo"], int(entry["pr"]), entry["comment"])
+            entry["needs_comment"] = False
+        except Exception as exc:  # noqa: BLE001 — retried next pass
+            log.warning("kronos notify: comment for %s#%s failed (%s) — "
+                        "stays in the outbox", entry["repo"], entry["pr"],
+                        type(exc).__name__)
+    if entry.get("needs_alert") and entry.get("alert_fp"):
+        try:
+            alerter.alert(entry["alert_fp"], entry["alert_subject"],
+                          entry["alert_body"])
+            entry["needs_alert"] = False
+            # MEDIUM 2 — the loop alert is tracked so it can CLOSE when the
+            # PR leaves the loop.
+            import time
+            state.slot("open_alerts")[entry["alert_fp"]] = time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        except Exception as exc:  # noqa: BLE001 — retried next pass
+            log.warning("kronos notify: owner alert %s failed (%s) — stays "
+                        "in the outbox", entry["alert_fp"],
+                        type(exc).__name__)
+    return not (entry.get("needs_comment") or entry.get("needs_alert"))
+
+
+def drain_notify_outbox(state, comments, alerter) -> None:
+    """Retry every pending notification from earlier passes. An entry leaves
+    the outbox only when its comment AND its alert are both delivered."""
+    box = state.slot("notify_outbox")
+    for key in list(box):
+        entry = box.get(key)
+        if not isinstance(entry, dict):
+            box.pop(key, None)
+            continue
+        if _deliver_entry(state, entry, comments, alerter):
+            box.pop(key, None)
+
+
+# ---------------------------------------------------------------------------
 # the flow
 # ---------------------------------------------------------------------------
 
 def judge_pr(cfg, db, *, comments, alerter, state, repo: str, pr: int,
              head_sha: str, install_id: str, read_token: str = "", http,
              now_fn, writes, dry_run: bool = False,
-             timeout: int | None = None) -> JudgeOutcome:
+             timeout: int | None = None, github=None,
+             github_timeout: int = 15,
+             apollo_login: str = "rhobear-reviews[bot]") -> JudgeOutcome:
     """Judge one PR (or defer). Writes ONLY through the atomic CAS `writes`
     adapter (src/kronos/store.py) — never through the read-only rows
     adapter (that was HIGH 2). Posts ONE PR comment; alerts on a stop.
 
     `timeout` (optional) is the ALREADY-CLAMPED Summit timeout the sweep
-    computed from the remaining pass budget (MEDIUM 3)."""
+    computed from the remaining pass budget (MEDIUM 3). `github` is the
+    authoritative state source (r3 HIGH 2): without it a real pass defers —
+    it never judges a PR whose current state it cannot prove."""
     marker_slot = state.slot("judged")
     marker = f"{repo}#{pr}"
     rounds = round_history(db, repo, pr)
@@ -385,11 +555,65 @@ def judge_pr(cfg, db, *, comments, alerter, state, repo: str, pr: int,
                "AND detail->'advisor_round' IS NOT NULL "
                "AND repo = %s AND pr_number = %s LIMIT 1", (repo, pr)):
         return JudgeOutcome("skip", "escalated round already recorded")
+    # r3 HIGH 2 — Zeus's own terminal decisions about this PR:
+    if db.rows("SELECT 1 FROM neo_actions WHERE repo = %s "
+               "AND pr_number = %s AND phase = 'merged' LIMIT 1",
+               (repo, pr)):
+        return JudgeOutcome("skip", "merged — Zeus recorded the merge")
+    if db.rows("SELECT 1 FROM neo_actions WHERE repo = %s "
+               "AND pr_number = %s AND phase = 'ready' LIMIT 1",
+               (repo, pr)):
+        return JudgeOutcome("skip", "ready — Zeus accepted this PR")
+    # r3 HIGH 6 — no proven installation identity, no model call: no bare
+    # consumer, no repo-lookup token. Defer loudly.
+    install_id = str(install_id or "").strip()
+    if not install_id:
+        return JudgeOutcome(
+            "deferred",
+            "installation identity unproven (no neo_jobs payload / recorded "
+            "identity) — refusing the bare-lane fallback, deferring loudly")
+    if dry_run:
+        return JudgeOutcome("skip", "dry-run")
+    # r3 HIGH 2 — GitHub's CURRENT state, before the model is ever asked.
+    if github is None:
+        return JudgeOutcome(
+            "deferred",
+            "no GitHub access to prove the PR's current state — deferring "
+            "loudly")
+    state_now = pr_authoritative(github, repo, pr, token=read_token,
+                                 timeout=github_timeout)
+    if not state_now.ok:
+        return JudgeOutcome("deferred",
+                            f"{state_now.reason} — deferring loudly")
+    if state_now.merged or state_now.closed:
+        return JudgeOutcome("skip",
+                            "merged/closed on GitHub — nothing to judge")
+    if state_now.head_sha and state_now.head_sha != head_sha:
+        return JudgeOutcome(
+            "deferred",
+            f"PR head moved ({state_now.head_sha[:12]} != recorded "
+            f"{head_sha[:12]}) — Zeus is mid-flight on a newer head")
 
     loops = same_commit_loop(rounds)
     report = build_report(rounds, loops=loops)
-    if dry_run:
-        return JudgeOutcome("skip", "dry-run")
+
+    def _authority() -> tuple[bool, str]:
+        """r3 HIGH 2 — the SAME proof again, under the decision CAS (the
+        writer holds the per-PR advisory lock while this runs)."""
+        st = pr_authoritative(github, repo, pr, token=read_token,
+                              timeout=github_timeout)
+        if not st.ok:
+            return False, f"GitHub state unreadable at the write: {st.reason}"
+        if st.merged or st.closed:
+            return False, "PR merged/closed before the write"
+        if st.head_sha and st.head_sha != head_sha:
+            return False, (f"PR head moved before the write "
+                           f"({st.head_sha[:12]} != {head_sha[:12]})")
+        if st.head_sha and two_greens_on_head(
+                github, repo, pr, st.head_sha, token=read_token,
+                timeout=github_timeout, apollo_login=apollo_login):
+            return False, "two greens on the current head before the write"
+        return True, ""
 
     summit_timeout = timeout if timeout is not None else cfg.judge_timeout_secs
     try:
@@ -400,11 +624,11 @@ def judge_pr(cfg, db, *, comments, alerter, state, repo: str, pr: int,
     except JudgeTimeout as exc:
         return _stop(writes, comments, alerter, state, marker, repo, pr,
                      rounds, reason=f"judge timeout: {exc}",
-                     dry_run=dry_run)
+                     dry_run=dry_run, authority=_authority)
     except ValueError as exc:
         return _stop(writes, comments, alerter, state, marker, repo, pr,
                      rounds, reason=f"bad judge answer: {exc}",
-                     dry_run=dry_run)
+                     dry_run=dry_run, authority=_authority)
 
     # HIGH 7 — redact EVERY model output string BEFORE anything sees it.
     # Fail closed on ANY redaction failure: no model text is used at all.
@@ -413,7 +637,8 @@ def judge_pr(cfg, db, *, comments, alerter, state, repo: str, pr: int,
         reason_r = _redact(answer["reason"])
     except Exception:  # noqa: BLE001 — a redaction failure is fail-closed
         return _stop(writes, comments, alerter, state, marker, repo, pr,
-                     rounds, reason=REDACT_FAILED_REASON, dry_run=dry_run)
+                     rounds, reason=REDACT_FAILED_REASON, dry_run=dry_run,
+                     authority=_authority)
 
     if answer["progress"] == "yes":
         if not plan_r.strip():
@@ -421,15 +646,18 @@ def judge_pr(cfg, db, *, comments, alerter, state, repo: str, pr: int,
             # with; a `yes` without a usable plan is a bad answer.
             return _stop(writes, comments, alerter, state, marker, repo, pr,
                          rounds, reason="judge plan was unusable after "
-                                        "redaction", dry_run=dry_run)
-        return _escalate(cfg, writes, comments, state, marker, repo, pr,
-                         rounds, plan_r, reason_r, install_id=install_id)
+                                        "redaction", dry_run=dry_run,
+                         authority=_authority)
+        return _escalate(cfg, writes, comments, alerter, state, marker,
+                         repo, pr, rounds, plan_r, reason_r,
+                         install_id=install_id, authority=_authority)
     return _stop(writes, comments, alerter, state, marker, repo, pr, rounds,
-                 reason=reason_r, dry_run=dry_run)
+                 reason=reason_r, dry_run=dry_run, authority=_authority)
 
 
-def _escalate(cfg, writes, comments, state, marker, repo, pr, rounds,
-              plan_r, reason_r, *, install_id: str) -> JudgeOutcome:
+def _escalate(cfg, writes, comments, alerter, state, marker, repo, pr, rounds,
+              plan_r, reason_r, *, install_id: str,
+              authority=None) -> JudgeOutcome:
     """`yes` -> the ONE escalated Zeus round whose brief is the plan."""
     head_sha = str(rounds[-1]["head_sha"])
     stored_max = max(r["round"] for r in rounds)
@@ -465,11 +693,24 @@ def _escalate(cfg, writes, comments, state, marker, repo, pr, rounds,
             "escalated": True,
             "work_order": work_order,
             "installation_id": install_id,
-        })
+        }, authority=authority)
     if not ok:
         # HIGH 6 — the CAS deferred (Zeus won, or the ceiling was hit in the
         # meantime): no marker, no comment, no alert — Zeus's path owns it.
         log.info("kronos judge deferred %s#%s: %s", repo, pr, note)
+        if note.startswith(JOB_EXISTS_PREFIX) and alerter is not None:
+            # r3 HIGH 1 — the fresh-only insert hit an EXISTING job row: the
+            # owner is told (Kronos never re-arms it; that is the ruling).
+            fp = f"job-conflict:{repo}#{pr}"
+            try:
+                alerter.alert(
+                    fp, f"Kronos: a round-{new_round} Zeus job already "
+                        f"exists — escalation deferred",
+                    f"{repo}#{pr}: {note}")
+                state.slot("open_alerts")[fp] = now_iso()
+            except Exception as exc:  # noqa: BLE001 — never stops the sweep
+                log.warning("kronos job-conflict alert failed (%s)",
+                            type(exc).__name__)
         return JudgeOutcome("deferred", note)
     state.slot("judged")[marker] = now_iso()
     comment = (
@@ -479,16 +720,30 @@ def _escalate(cfg, writes, comments, state, marker, repo, pr, rounds,
         f"Reason: {reason_r}\n\n"
         f"Proposal (one escalated round, never a 7th):\n\n{plan_r}"
     )
-    comments(repo, pr, comment)
+    # r3 HIGH 7 — the comment and any follow-up are OUTBOXED: the write is
+    # already committed; a failed comment is retried on later passes.
+    entry = _outbox_entry(repo, pr, comment=comment, alert_fp=None,
+                          alert_subject="", alert_body="")
+    state.slot("notify_outbox")[f"{repo}#{pr}"] = entry
+    _deliver_entry(state, entry, comments, None)
     log.info("kronos judged %s#%s: escalated round %d", repo, pr, new_round)
     return JudgeOutcome("escalated", reason_r, plan=plan_r)
 
 
+#: the store's fresh-only conflict reason, matched by prefix
+JOB_EXISTS_PREFIX = "deferred: builder job"
+
+
 def _stop(writes, comments, alerter, state, marker, repo, pr, rounds, *,
-          reason: str, dry_run: bool = False) -> JudgeOutcome:
+          reason: str, dry_run: bool = False,
+          authority=None) -> JudgeOutcome:
     """`no` / bad answer / timeout -> Zeus stops on that PR, one comment,
     the owner alerted. `reason` must already be redacted (or a fixed
-    literal) — it lands in the DB, a comment, an alert and the log."""
+    literal) — it lands in the DB, a comment, an alert and the log.
+
+    r3 HIGH 7 — the marker is committed FIRST; the comment and the owner
+    alert go through the durable outbox and are retried on later passes, so
+    a comment 403/timeout can never lose the owner notification."""
     head_sha = str(rounds[-1]["head_sha"]) if rounds else ""
     stored_max = max(r["round"] for r in rounds) if rounds else 0
     new_round = stored_max + 1
@@ -501,23 +756,26 @@ def _stop(writes, comments, alerter, state, marker, repo, pr, rounds, *,
                 "advice_id": f"kronos-stop:{repo}#{pr}",
                 "kronos_stop": True,
                 "kronos": True,
-            })
+            }, authority=authority)
         if not ok:
             log.info("kronos judge deferred stop %s#%s: %s", repo, pr, note)
             return JudgeOutcome("deferred", note)
         state.slot("judged")[marker] = now_iso()
-        comments(repo, pr, (
+        comment = (
             "**Kronos · stopped: 5 rounds but still red**\n\n"
             f"{len(rounds)} fix rounds without two greens; nothing will "
             "improve by iterating in the same direction.\n\n"
             f"Reason: {reason}\n\n"
             "This needs a decision from a person. Zeus is off this PR — "
             "never a 7th round."
-        ))
-        alerter.alert(
-            f"loop:{repo}#{pr}",
-            f"Kronos stopped Zeus on #{pr} — needs you",
-            f"{repo}#{pr}: {reason}")
+        )
+        entry = _outbox_entry(
+            repo, pr, comment=comment,
+            alert_fp=f"loop:{repo}#{pr}",
+            alert_subject=f"Kronos stopped Zeus on #{pr} — needs you",
+            alert_body=f"{repo}#{pr}: {reason}")
+        state.slot("notify_outbox")[f"{repo}#{pr}"] = entry
+        _deliver_entry(state, entry, comments, alerter)
     log.warning("kronos stopped %s#%s: %s", repo, pr, reason)
     return JudgeOutcome("stopped", reason)
 

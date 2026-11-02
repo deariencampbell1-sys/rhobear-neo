@@ -46,7 +46,7 @@ class KronosConfig:
     routegate_url: str = field(default_factory=lambda: _get(
         "KRONOS_ROUTEGATE_URL", "http://127.0.0.1:8645"))
 
-    # --- the four watched units (the restart allow-list) ---
+    # --- the four watched units (observed read-only; r2 ruling) ---
     systemd_units: tuple[str, ...] = field(default_factory=lambda: tuple(
         u.strip() for u in _get(
             "KRONOS_UNITS",
@@ -94,8 +94,6 @@ class KronosConfig:
         "KRONOS_INTERVAL_SECS", 300))            # timer: every 5 minutes
     pass_budget_secs: int = field(default_factory=lambda: _get_int(
         "KRONOS_PASS_BUDGET_SECS", 240))         # one pass: 4-minute budget
-    remedy_window_secs: int = field(default_factory=lambda: _get_int(
-        "KRONOS_REMEDY_WINDOW_SECS", 3600))      # remedy: once per hour
     alert_window_secs: int = field(default_factory=lambda: _get_int(
         "KRONOS_ALERT_WINDOW_SECS", 6 * 3600))   # alert: never twice in 6h
     stall_mins: int = field(default_factory=lambda: _get_int(
@@ -114,6 +112,20 @@ class KronosConfig:
         "KRONOS_JUDGE_MODEL", "summit"))
     judge_timeout_secs: int = field(default_factory=lambda: _get_int(
         "KRONOS_JUDGE_TIMEOUT_SECS", 300))
+    # r3 HIGH 3 — how many five-round PRs one pass judges (the page is
+    # walked fairly across passes through the persisted keyset cursor).
+    judge_page_size: int = field(default_factory=lambda: _get_int(
+        "KRONOS_JUDGE_PAGE_SIZE", 20))
+    # r3 HIGH 4 — the quiet window: a PR Zeus touched more recently than
+    # this may be inside its consume-then-act gap (take_escalation commits
+    # the marker's deletion before escalate_pr records the outcome), so the
+    # judge defers. 3600s covers Zeus's own 1800s advisor give-up window.
+    zeus_quiet_secs: int = field(default_factory=lambda: _get_int(
+        "KRONOS_ZEUS_QUIET_SECS", 3600))
+    # r3 HIGH 2 — the login whose SAME-head approval counts as green 1
+    # (Apollo's review; green 2 is any other approval on the same head).
+    apollo_login: str = field(default_factory=lambda: _get(
+        "KRONOS_APOLLO_LOGIN", "rhobear-reviews[bot]"))
 
     def consumer_for(self, install_id: str) -> str:
         """`reviews:kronos/<install_id>` — the consumer header for every

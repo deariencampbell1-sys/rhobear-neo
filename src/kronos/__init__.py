@@ -44,8 +44,9 @@ from pathlib import Path
 
 
 class KronosState:
-    """Small JSON-file state store (alert dedupe windows, remedy ledger,
-    flap windows, judged markers).
+    """Small JSON-file state store (alert dedupe windows, open-alert
+    tracking, flap windows, judged markers, the notify outbox, the judge's
+    paging cursor).
 
     `:memory:` keeps everything in a dict (tests). Otherwise the file is
     loaded lazily, written atomically on flush(), and every slot is an

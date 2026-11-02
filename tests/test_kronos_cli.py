@@ -35,13 +35,17 @@ class FakeServices:
 
     def runner(self, argv, *, timeout=30):
         self.runner_calls.append(tuple(argv))
+        # a real `systemctl show -p NRestarts --value` answers with a number
+        if argv[:2] == ["systemctl", "show"] and "NRestarts" in argv:
+            return subprocess.CompletedProcess(argv, 0, stdout="0\n",
+                                               stderr="")
         return subprocess.CompletedProcess(argv, 0, stdout="active\n",
                                            stderr="")
 
-    def db(self, dsn: str):
+    def db(self, dsn: str, **kw):
         raise AssertionError("no DSN is configured in these tests")
 
-    def writes(self, dsn: str):
+    def writes(self, dsn: str, **kw):
         raise AssertionError("no DSN is configured in these tests")
 
 
@@ -369,14 +373,14 @@ class _JudgeServices(FakeServices):
         del self.http  # noqa: W420 — restore the class method
         self.http_log: list[tuple] = []
 
-    def db(self, dsn):
+    def db(self, dsn, **kw):
         class _Db:
             def rows(_self, sql, params=()):
-                if "GROUP BY repo, pr_number" in sql:
+                s = " ".join(str(sql).split())
+                if "GROUP BY repo, pr_number" in s:
                     return [{"repo": "o/r", "pr_number": 52,
-                             "rounds": 5, "head_sha": "f" * 40,
-                             "detail": "{}"}]
-                if "ORDER BY id ASC" in sql:
+                             "rounds": 5, "head_sha": "f" * 40}]
+                if "ORDER BY id ASC" in s:
                     return [{"round": i, "head_sha": f"{i:04d}" * 10,
                              "verdict": "BOUNCE", "tree_sha": f"t{i}",
                              "diff_stat": "", "created_at": 0}
@@ -385,13 +389,14 @@ class _JudgeServices(FakeServices):
 
         return _Db()
 
-    def writes(self, dsn):
+    def writes(self, dsn, **kw):
         class _Writes:
             def escalate(_self, repo, pr, head_sha, *, advisor_round, detail,
-                         builder_payload):
+                         builder_payload, authority=None, **kw2):
                 return True, "ok"
 
-            def stop(_self, repo, pr, head_sha, *, advisor_round, detail):
+            def stop(_self, repo, pr, head_sha, *, advisor_round, detail,
+                     authority=None, **kw2):
                 return True, "ok"
 
         return _Writes()
@@ -403,6 +408,13 @@ class _JudgeServices(FakeServices):
             msg = {"choices": [{"message": {"content": _json.dumps(
                 {"progress": "no", "plan": "", "reason": "stop"})}}]}
             return 200, _json.dumps(msg)
+        if "api.github.com" in url and "/reviews" in url:
+            return 200, "[]"
+        if "api.github.com" in url and "/pulls/" in url:
+            import json as _json
+            return 200, _json.dumps({"state": "open", "merged": False,
+                                     "draft": False,
+                                     "head": {"sha": "f" * 40}})
         if "/issues/" in url and method == "POST":
             self.comment_timeouts.append(timeout)
             return 201, "{}"
@@ -431,7 +443,7 @@ def test_judge_and_comment_timeouts_are_clamped_to_the_budget(tmp_path,
             clock.t = 200.0
             return real_db("dsn").rows(sql, params)
 
-    services.db = lambda dsn: _BumpingDb()
+    services.db = lambda dsn, **kw: _BumpingDb()
 
     alerter = _FakeAlerter()
     monkeypatch.setattr("src.kronos.__main__._alerter",

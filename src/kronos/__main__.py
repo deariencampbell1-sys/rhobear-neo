@@ -21,6 +21,29 @@ HIGH 1: the state (alert dedupe, flap windows, judged markers) lives in a
 DURABLE state dir — the unit mounts a StateDirectory, because a
 RuntimeDirectory is wiped when this oneshot stops and the dedupe would
 start empty every five minutes.
+
+r3 changes (ASTRA re-review, issuecomment-6578963903):
+
+- HIGH 3: the judge sweep's SQL itself excludes terminal (merged/ready) and
+  already-judged (escalated) rows and PRs Zeus is still moving, and pages
+  FAIRLY through a persisted keyset cursor — the fixed `ORDER BY ... LIMIT
+  20` starved every PR behind the first 20 historical rows forever.
+- HIGH 5: the App JWT construction and the delivery probe run INSIDE
+  run_check — a JWT failure is a BROKEN deliveries:<app> check that alerts
+  with a non-secret reason, never a crashed pass.
+- HIGH 6: the judge's installation identity is read from the AUTHORITATIVE
+  rows Zeus writes (neo_jobs.payload, or a recorded identity on an action
+  row) — never from the builder action detail Zeus does not write. An
+  unproven identity defers loudly (no bare consumer, no repo-lookup token).
+- HIGH 7: every committed decision's notifications go through the durable
+  outbox (src/kronos/judge.py), drained at the start of every judge sweep —
+  a failed PR comment can no longer swallow the owner alert.
+- MEDIUM 1: Postgres connects with bounded connect/statement timeouts, and
+  the delivery probe, every alerter (dispatch AND resolution) and the PR
+  commenter all clamp their HTTP timeouts to the remaining budget.
+- MEDIUM 2: flap and flap-detect alerts now register and CLOSE (quiet
+  window / probe recovered), and loop alerts close on Zeus's real terminal
+  shapes.
 """
 from __future__ import annotations
 
@@ -49,7 +72,7 @@ from .checks import (
     postgres_reachable,
 )
 from .config import KronosConfig
-from .judge import judge_pr
+from .judge import drain_notify_outbox, judge_pr
 from .store import SqlWrites
 
 log = logging.getLogger("rhobear_neo.kronos")
@@ -57,6 +80,33 @@ log = logging.getLogger("rhobear_neo.kronos")
 #: per-action subprocess budget ceiling (clamped to the remaining budget)
 _RUNNER_TIMEOUT_SECS = 30
 _HTTP_TIMEOUT_SECS = 30
+_DB_TIMEOUT_SECS = 15
+
+#: The judge sweep's page (HIGH 3, r3): filtered, quiet, undecided PRs only,
+#: keyset-paged past the persisted cursor. The NOT EXISTS clause drops
+#: terminal rows (merged/ready) and decided rows (any escalated marker with
+#: an advisor_round — Kronos's stop, Kronos's escalation, Zeus's own).
+_JUDGE_SWEEP_SQL = (
+    "SELECT repo, pr_number, "
+    "MAX(builder_round) AS rounds, "
+    "(array_agg(head_sha ORDER BY id DESC))[1] AS head_sha "
+    "FROM neo_actions "
+    "WHERE phase = 'builder' "
+    "GROUP BY repo, pr_number "
+    "HAVING MAX(builder_round) >= %s "
+    "AND MAX(builder_round) <= %s "
+    "AND MAX(created_at) < now() - make_interval(secs => %s) "
+    "AND NOT EXISTS ("
+    "  SELECT 1 FROM neo_actions AS other "
+    "  WHERE other.repo = repo "
+    "    AND other.pr_number = neo_actions.pr_number "
+    "    AND (other.phase IN ('merged', 'ready') "
+    "         OR (other.phase = 'escalated' "
+    "             AND other.detail->'advisor_round' IS NOT NULL))) "
+    "AND (repo, pr_number) > (%s, %s) "
+    "ORDER BY repo, pr_number "
+    "LIMIT %s"
+)
 
 
 class Services:
@@ -76,17 +126,30 @@ class Services:
 
     # -- read-only SQL ----------------------------------------------------
     @staticmethod
-    def db(dsn: str):
+    def db(dsn: str, *, connect_timeout: int | None = None,
+           statement_timeout_ms: int | None = None):
         import psycopg
         from psycopg.rows import dict_row
 
+        kwargs = {}
+        if connect_timeout:
+            kwargs["connect_timeout"] = max(1, int(connect_timeout))
+
         class _Db:
             """READ-ONLY. The judge's writes go through Services.writes()
-            (src/kronos/store.py) — never through this object (HIGH 2)."""
+            (src/kronos/store.py) — never through this object (HIGH 2).
+
+            MEDIUM 1 (r3): the connection is bounded — a connect timeout
+            and a per-statement timeout, both inside the pass budget."""
+
+            _st_ms = statement_timeout_ms
 
             def rows(self, sql: str, params=()):
                 with psycopg.connect(dsn, autocommit=True,
-                                     row_factory=dict_row) as conn:
+                                     row_factory=dict_row, **kwargs) as conn:
+                    if self._st_ms:
+                        conn.execute("SET statement_timeout = %s",
+                                     (max(1, int(self._st_ms)),))
                     cur = conn.execute(sql, params)
                     try:
                         return list(cur.fetchall())
@@ -96,8 +159,17 @@ class Services:
 
     # -- the judge's atomic CAS writer (HIGH 2 + HIGH 6) -------------------
     @staticmethod
-    def writes(dsn: str):
-        return SqlWrites(dsn)
+    def writes(dsn: str, *, quiet_secs: int | None = None,
+               connect_timeout: int | None = None,
+               statement_timeout_ms: int | None = None):
+        kw = {}
+        if quiet_secs is not None:
+            kw["quiet_secs"] = quiet_secs
+        if connect_timeout is not None:
+            kw["connect_timeout"] = connect_timeout
+        if statement_timeout_ms is not None:
+            kw["statement_timeout_ms"] = statement_timeout_ms
+        return SqlWrites(dsn, **kw)
 
     # -- HTTP (RouteGate judge + GitHub) ----------------------------------
     @staticmethod
@@ -144,8 +216,10 @@ def run_pass(cfg: KronosConfig, *, dry_run: bool, state: KronosState,
         return services.http(method, url, headers=headers, body=body,
                              timeout=clamp(timeout))
 
-    db = services.db(cfg.reviews_database_url) if cfg.reviews_database_url \
-        else None
+    db = services.db(cfg.reviews_database_url,
+                     connect_timeout=clamp(_DB_TIMEOUT_SECS),
+                     statement_timeout_ms=clamp(_DB_TIMEOUT_SECS) * 1000) \
+        if cfg.reviews_database_url else None
     results: list[CheckResult] = []
 
     # -- 1. checks ---------------------------------------------------------
@@ -191,12 +265,14 @@ def run_pass(cfg: KronosConfig, *, dry_run: bool, state: KronosState,
                     f"app identity missing — vault name loud at boot; "
                     f"deliveries unchecked this pass"))
                 continue
-            jwt = _app_jwt(cfg, app)
-            res, _failed = failed_deliveries(
-                f"deliveries:{app}", app_name=app,
-                list_deliveries=_delivery_lister(jwt),
-                hours=1.0, now=now_fn())
-            results.append(res)
+            # r3 HIGH 5 — the JWT construction AND the delivery probe are
+            # INSIDE the check: a JWT failure is a BROKEN result that
+            # alerts with a non-secret reason, never a crashed pass.
+            results.append(run_check(
+                f"deliveries:{app}",
+                lambda a=app: _deliveries_result(cfg, a, now_fn=now_fn,
+                                                 lister_timeout=clamp(
+                                                     _HTTP_TIMEOUT_SECS))))
         results.append(run_check("stalled-reviews", lambda: stalled_reviews(
             "stalled-reviews", db=db, mins=cfg.stall_mins)))
         results.append(run_check("stuck-jobs", lambda: stuck_jobs(
@@ -212,9 +288,11 @@ def run_pass(cfg: KronosConfig, *, dry_run: bool, state: KronosState,
         return 0
 
     # -- 2. alerts (the r1 remedies are RETIRED: a problem ALERTS) ---------
+    flap_blind: set[str] = set()   # MEDIUM 2 — units whose probe failed
     if not budget_gone("alerts"):
         # flap detection per unit (edge 2); a blind detector alerts loudly
         def _restarts(unit: str) -> int:
+            # MEDIUM 3 (r3) — a failed probe RAISES (never a silent zero).
             return nrestarts(unit, runner=bounded_runner)
 
         flap_slot = state.slot("flaps")
@@ -222,13 +300,14 @@ def run_pass(cfg: KronosConfig, *, dry_run: bool, state: KronosState,
             try:
                 restarts = _restarts(unit)
             except Exception as exc:  # noqa: BLE001 — HIGH 8: loud, not blind
+                flap_blind.add(unit)
                 _alert_once(cfg, state, out,
                             fingerprint=f"check:flap-detect:{unit}",
                             subject=(f"Kronos: cannot read restart counts "
                                      f"for {unit}"),
                             body=f"flap detection is blind this pass: "
                                  f"{type(exc).__name__}",
-                            now_fn=now_fn)
+                            now_fn=now_fn, services=services, left_fn=left)
                 continue
             should, flap_slot = flap_status(
                 flap_slot, unit, nrestarts=restarts, now=now_fn(),
@@ -241,7 +320,7 @@ def run_pass(cfg: KronosConfig, *, dry_run: bool, state: KronosState,
                             body=flap_report_body(
                                 unit, count=cfg.flap_threshold,
                                 window_secs=cfg.flap_window_secs),
-                            now_fn=now_fn)
+                            now_fn=now_fn, services=services, left_fn=left)
         # every BROKEN check alerts (HIGH 8): never a silent miss — and the
         # unit alerts carry the bounded journal tail (MEDIUM 2).
         for res in results:
@@ -253,12 +332,13 @@ def run_pass(cfg: KronosConfig, *, dry_run: bool, state: KronosState,
                             fingerprint=f"unit-down:{unit}",
                             subject=f"Kronos: {unit} is down",
                             body=f"{res.reason}\n\n{_unit_tail(unit)}",
-                            now_fn=now_fn)
+                            now_fn=now_fn, services=services, left_fn=left)
             else:
                 _alert_once(cfg, state, out,
                             fingerprint=f"check:{res.name}",
                             subject=f"Kronos: {res.name} is broken",
-                            body=res.reason, now_fn=now_fn)
+                            body=res.reason, now_fn=now_fn,
+                            services=services, left_fn=left)
         state.flush()   # HIGH 1 — the dedupe ledger persists at dispatch
 
     # -- 3. the judge ------------------------------------------------------
@@ -269,7 +349,9 @@ def run_pass(cfg: KronosConfig, *, dry_run: bool, state: KronosState,
 
     # -- 4. resolve alerts whose problem is gone ---------------------------
     if not budget_gone("alert resolution"):
-        _resolve_fixed(cfg, state, results, db, out, now_fn=now_fn)
+        _resolve_fixed(cfg, state, results, db, out, now_fn=now_fn,
+                       services=services, left_fn=left,
+                       flap_blind=flap_blind)
 
     state.flush()
     out(f"kronos pass: done in {mono_fn() - (deadline - cfg.pass_budget_secs):.1f}s "
@@ -307,9 +389,29 @@ def _app_jwt(cfg: KronosConfig, app: str) -> str:
     return GitHubApp(app_id, key).jwt()
 
 
-def _delivery_lister(jwt: str):
+def _deliveries_result(cfg: KronosConfig, app: str, *, now_fn,
+                       lister_timeout: int) -> CheckResult:
+    """The deliveries check for ONE app — r3 HIGH 5: the App JWT is
+    constructed HERE (inside run_check's try). A JWT failure is a BROKEN
+    result with a stable, NON-SECRET reason (the exception class only)."""
+    name = f"deliveries:{app}"
+    try:
+        jwt = _app_jwt(cfg, app)
+    except Exception as exc:  # noqa: BLE001 — one line, nothing secret
+        return CheckResult(
+            name, BROKEN,
+            f"{app} App JWT could not be minted: {type(exc).__name__} — "
+            f"deliveries unchecked, alerting")
+    res, _failed = failed_deliveries(
+        name, app_name=app,
+        list_deliveries=_delivery_lister(jwt, timeout=lister_timeout),
+        hours=1.0, now=now_fn())
+    return res
+
+
+def _delivery_lister(jwt: str, *, timeout: int = 30):
     lister = list_deliveries_via_app()
-    return lambda: lister(jwt)
+    return lambda: lister(jwt, timeout=timeout)
 
 
 def _alerter(cfg: KronosConfig, state: KronosState, now_fn,
@@ -329,9 +431,14 @@ def _alerter(cfg: KronosConfig, state: KronosState, now_fn,
                    window_secs=cfg.alert_window_secs, label=cfg.alert_label)
 
 
-def _alert_once(cfg, state, out, *, fingerprint, subject, body, now_fn):
+def _alert_once(cfg, state, out, *, fingerprint, subject, body, now_fn,
+                services=None, left_fn=None):
+    """One alert dispatch — r3 MEDIUM 1: the alerter's HTTP is built WITH
+    the pass budget (its issue-list/create/comment calls clamp to what is
+    left, never a free-standing 30 s)."""
     try:
-        action = _alerter(cfg, state, now_fn).alert(fingerprint, subject, body)
+        action = _alerter(cfg, state, now_fn, services=services,
+                          left_fn=left_fn).alert(fingerprint, subject, body)
         out(f"kronos alert: {fingerprint} {action}")
         if action != "suppressed":
             state.slot("open_alerts")[fingerprint] = now_iso()
@@ -371,77 +478,148 @@ def _pr_commenter(services, cfg, left_fn=None):
     return _comment
 
 
-def _judge_sweep(cfg, state, db, services, out, *, now_fn, left_fn, clamp):
-    """Every PR at 5+ builder rounds without two greens gets judged once.
-    Per-PR budget checks and clamped timeouts (MEDIUM 3)."""
-    if db is None:
-        return
+def install_id_for(db, repo: str, pr: int) -> str:
+    """r3 HIGH 6 — the PR's installation identity from the AUTHORITATIVE
+    rows Zeus writes: neo_jobs.payload (the job's payload carries the
+    webhook installation id), else a recorded identity on an action row.
+    Zeus's builder ACTION rows do NOT carry it (their detail is green /
+    wake_job / route metadata), so the r2 code read the wrong place and
+    always degraded to the bare consumer. Returns '' = unproven."""
     try:
         rows = db.rows(
-            "SELECT repo, pr_number, "
-            "MAX(builder_round) AS rounds, "
-            "(array_agg(head_sha ORDER BY id DESC))[1] AS head_sha, "
-            "(array_agg(detail ORDER BY id DESC))[1] AS detail "
-            "FROM neo_actions WHERE phase = 'builder' "
-            "GROUP BY repo, pr_number HAVING MAX(builder_round) >= %s "
-            "ORDER BY repo, pr_number LIMIT 20",
-            (5,),
+            "SELECT payload FROM neo_jobs WHERE kind='builder' "
+            "AND repo=%s AND pr_number=%s ORDER BY id DESC LIMIT 1",
+            (repo, pr))
+    except Exception as exc:  # noqa: BLE001 — read failures defer below
+        log.info("kronos judge: neo_jobs unreadable for %s#%s: %s",
+                 repo, pr, type(exc).__name__)
+        rows = []
+    for r in rows:
+        val = _json_field(r.get("payload"), "installation_id")
+        if val not in (None, ""):
+            return str(val)
+    try:
+        rows = db.rows(
+            "SELECT detail FROM neo_actions WHERE repo=%s AND pr_number=%s "
+            "AND detail->>'installation_id' IS NOT NULL "
+            "ORDER BY id DESC LIMIT 1", (repo, pr))
+    except Exception as exc:  # noqa: BLE001
+        log.info("kronos judge: neo_actions unreadable for %s#%s: %s",
+                 repo, pr, type(exc).__name__)
+        rows = []
+    for r in rows:
+        val = _json_field(r.get("detail"), "installation_id")
+        if val not in (None, ""):
+            return str(val)
+    return ""
+
+
+def _json_field(value, key: str):
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return None
+    if isinstance(value, dict):
+        return value.get(key)
+    return None
+
+
+def _judge_sweep(cfg, state, db, services, out, *, now_fn, left_fn, clamp):
+    """Every PR at 5+ builder rounds without two greens gets judged once.
+
+    r3 HIGH 3 — the page is FILTERED (terminal/judged/quiet rows are
+    dropped in SQL, see _JUDGE_SWEEP_SQL) and FAIR: a persisted keyset
+    cursor walks the qualifying set across passes, so no PR starves behind
+    a fixed LIMIT. Per-PR budget checks and clamped timeouts (MEDIUM 3)."""
+    if db is None:
+        return
+    writes = services.writes(cfg.reviews_database_url,
+                             quiet_secs=cfg.zeus_quiet_secs,
+                             connect_timeout=clamp(_DB_TIMEOUT_SECS),
+                             statement_timeout_ms=clamp(_DB_TIMEOUT_SECS)
+                             * 1000)
+    alerter = _alerter(cfg, state, now_fn, services=services,
+                       left_fn=left_fn)
+    comments = _pr_commenter(services, cfg, left_fn)
+    # r3 HIGH 7 — deliver what a previous pass still owes (comment/alert).
+    drain_notify_outbox(state, comments, alerter)
+    cursor_slot = state.slot("judge_cursor")
+    cur_repo = str(cursor_slot.get("repo") or "")
+    cur_pr = int(cursor_slot.get("pr") or 0)
+    try:
+        rows = db.rows(
+            _JUDGE_SWEEP_SQL,
+            (5, 6, cfg.zeus_quiet_secs, cur_repo, cur_pr,
+             cfg.judge_page_size),
         )
     except Exception as exc:  # noqa: BLE001
         out(f"kronos judge: rounds unreadable: {type(exc).__name__}")
         return
-    writes = services.writes(cfg.reviews_database_url)
-    alerter = _alerter(cfg, state, now_fn, services=services,
-                       left_fn=left_fn)
+    last_processed: tuple[str, int] | None = None
     for row in rows:
         if left_fn() <= 0:
             out("kronos judge: pass budget gone — remaining PRs are "
-                "deferred to the next pass")
+                "deferred to the next pass (the cursor keeps the rest)")
             break
-        install_id = str(_install_of(row) or "")
+        repo, pr = str(row["repo"]), int(row["pr_number"])
+        install_id = install_id_for(db, repo, pr)
         try:
-            read_token = _readonly_token(cfg, row["repo"], install_id)
+            read_token = _readonly_token(cfg, repo, install_id)
         except Exception as exc:  # noqa: BLE001 — loud, then judge anyway
-            out(f"kronos judge: {row['repo']}#{row['pr_number']}: read-only "
+            out(f"kronos judge: {repo}#{pr}: read-only "
                 f"token unavailable ({type(exc).__name__}) — judging "
                 f"without the credential header")
             read_token = ""
         try:
             outcome = judge_pr(
-                cfg, db, comments=_pr_commenter(services, cfg, left_fn),
+                cfg, db, comments=comments,
                 alerter=alerter, state=state,
-                repo=row["repo"], pr=int(row["pr_number"]),
+                repo=repo, pr=pr,
                 head_sha=str(row.get("head_sha") or ""),
                 install_id=install_id,
                 read_token=read_token,
                 http=services.http, now_fn=now_fn, writes=writes,
+                github=services.http, github_timeout=clamp(15),
+                apollo_login=cfg.apollo_login,
                 timeout=clamp(cfg.judge_timeout_secs))
         except Exception as exc:  # noqa: BLE001 — one PR never stops the sweep
-            out(f"kronos judge: {row['repo']}#{row['pr_number']} failed: "
+            out(f"kronos judge: {repo}#{pr} failed: "
                 f"{type(exc).__name__}")
+            last_processed = (repo, pr)
             continue
-        out(f"kronos judge: {row['repo']}#{row['pr_number']} -> "
+        out(f"kronos judge: {repo}#{pr} -> "
             f"{outcome.action} ({outcome.reason})")
+        last_processed = (repo, pr)
+    # r3 HIGH 3 — persist the cursor: past the last PROCESSED row (a budget
+    # break never skips unprocessed rows), and wrap to the top when the
+    # qualifying set is exhausted.
+    if not rows or len(rows) < cfg.judge_page_size:
+        cursor_slot.clear()
+    elif last_processed is not None:
+        cursor_slot["repo"], cursor_slot["pr"] = last_processed
+    state.flush()
 
 
-def _install_of(row: dict):
-    detail = row.get("detail") or {}
-    if isinstance(detail, str):
-        try:
-            detail = json.loads(detail)
-        except (TypeError, ValueError):
-            detail = {}
-    return detail.get("installation_id") if isinstance(detail, dict) else None
-
-
-def _resolve_fixed(cfg, state, results, db, out, *, now_fn):
+def _resolve_fixed(cfg, state, results, db, out, *, now_fn,
+                   services=None, left_fn=None, flap_blind=None):
     """Commented and closed when fixed — for EVERY alert kind (HIGH 8).
 
     A resolve that raises keeps the open_alerts entry so the next pass
-    retries the close; an entry is dropped only after a successful close."""
+    retries the close; an entry is dropped only after a successful close.
+
+    r3 MEDIUM 2 — the kinds that could never close now do:
+      * `loop:` closes on Zeus's real terminal shapes (checks.loop_resolved);
+      * `flap:` closes after a quiet window measured from the REPORT (the
+        detection window's reset no longer hides it);
+      * `check:flap-detect:` closes when the unit is ok AND the restart
+        probe succeeded again;
+      * `job-conflict:` closes when the blocking job is gone or the PR left
+        the loop."""
     open_slot = state.slot("open_alerts")
     ok_names = {r.name for r in results if r.status == OK}
     flap_slot = state.slot("flaps")
+    flap_blind = flap_blind or set()
 
     for fingerprint in list(open_slot):
         note = None
@@ -451,6 +629,12 @@ def _resolve_fixed(cfg, state, results, db, out, *, now_fn):
                 if f"unit:{unit}" not in ok_names:
                     continue
                 note = f"{unit} is active again"
+            elif fingerprint.startswith("check:flap-detect:"):
+                unit = fingerprint.split(":", 1)[1]
+                if f"unit:{unit}" not in ok_names or unit in flap_blind:
+                    continue
+                note = (f"{unit}'s restart probe succeeded — flap "
+                        f"detection can see again")
             elif fingerprint.startswith("check:"):
                 name = fingerprint.split(":", 1)[1]
                 if name not in ok_names:
@@ -461,10 +645,11 @@ def _resolve_fixed(cfg, state, results, db, out, *, now_fn):
                 if f"unit:{unit}" not in ok_names:
                     continue
                 window = flap_slot.get(unit) or {}
-                if now_fn() - float(window.get("window_start") or 0) \
-                        <= cfg.flap_window_secs:
-                    continue  # still inside the flap window
-                note = f"{unit} settled — no new restarts in the window"
+                reported_at = float(window.get("reported_at") or 0)
+                if not reported_at or \
+                        now_fn() - reported_at <= cfg.flap_window_secs:
+                    continue  # still inside the quiet window since the report
+                note = f"{unit} settled — no new restarts since the report"
             elif fingerprint.startswith("loop:"):
                 rest = fingerprint.split(":", 1)[1]
                 repo, _, pr = rest.rpartition("#")
@@ -472,15 +657,39 @@ def _resolve_fixed(cfg, state, results, db, out, *, now_fn):
                     continue  # unparseable: keep, never silently drop
                 if not loop_resolved(db, repo, int(pr)):
                     continue
-                note = f"{repo}#{pr} is out of the loop (merged or green)"
+                note = f"{repo}#{pr} is out of the loop (merged or accepted)"
+            elif fingerprint.startswith("job-conflict:"):
+                rest = fingerprint.split(":", 1)[1]
+                repo, _, pr = rest.rpartition("#")
+                if not repo or not pr.lstrip("-").isdigit():
+                    continue
+                if loop_resolved(db, repo, int(pr)):
+                    note = f"{repo}#{pr} left the loop"
+                elif not _round_job_active(db, repo, int(pr)):
+                    note = "the blocking job is gone"
+                else:
+                    continue
             else:
                 continue  # unknown kind: never dropped by a guess
-            _alerter(cfg, state, now_fn).resolved(fingerprint, note)
+            _alerter(cfg, state, now_fn, services=services,
+                     left_fn=left_fn).resolved(fingerprint, note)
             open_slot.pop(fingerprint, None)
             out(f"kronos alert: {fingerprint} resolved (closed)")
         except Exception as exc:  # noqa: BLE001 — retried next pass
             out(f"kronos alert: {fingerprint} resolve failed (kept open): "
                 f"{type(exc).__name__}: {exc}")
+
+
+def _round_job_active(db, repo: str, pr: int) -> bool:
+    """True while a non-final builder job still exists for the PR (the
+    job-conflict alert stays open until it is gone)."""
+    if db is None:
+        return True  # cannot prove it is gone: stay open
+    rows = db.rows(
+        "SELECT 1 FROM neo_jobs WHERE kind='builder' AND repo=%s "
+        "AND pr_number=%s AND state IN ('queued','running') LIMIT 1",
+        (repo, pr))
+    return bool(rows)
 
 
 def now_iso() -> str:

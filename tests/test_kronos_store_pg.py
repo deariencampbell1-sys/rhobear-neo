@@ -78,6 +78,7 @@ def _escalated_rows(dsn, repo: str, pr: int) -> list[dict]:
 def test_yes_records_escalated_row_and_builder_job_in_one_write(fresh):
     repo, pr = "o/r", 52
     _builder_rounds(fresh, repo, pr, 5)
+    _backdate(fresh, repo, pr)
     writes = SqlWrites(fresh)
     ok, note = writes.escalate(
         repo, pr, "h" * 40, advisor_round=6,
@@ -113,6 +114,7 @@ def test_yes_records_escalated_row_and_builder_job_in_one_write(fresh):
 def test_second_escalate_defers_never_a_second_row(fresh):
     repo, pr = "o/r", 7
     _builder_rounds(fresh, repo, pr, 5)
+    _backdate(fresh, repo, pr)
     writes = SqlWrites(fresh)
     ok1, _ = writes.escalate(repo, pr, "h" * 40, advisor_round=6,
                              detail={"advisor_round": 6},
@@ -152,6 +154,7 @@ def test_escalating_marker_defers_inside_the_lock(fresh):
 def test_stop_records_the_marker_zeus_consumes(fresh):
     repo, pr = "o/r", 10
     _builder_rounds(fresh, repo, pr, 5)
+    _backdate(fresh, repo, pr)
     writes = SqlWrites(fresh)
     ok, _note = writes.stop(repo, pr, "h" * 40, advisor_round=6,
                             detail={"reason": "kronos judge stopped the loop",
@@ -175,6 +178,7 @@ def test_stop_records_the_marker_zeus_consumes(fresh):
 def test_second_stop_defers(fresh):
     repo, pr = "o/r", 11
     _builder_rounds(fresh, repo, pr, 5)
+    _backdate(fresh, repo, pr)
     writes = SqlWrites(fresh)
     ok1, _ = writes.stop(repo, pr, "h" * 40, advisor_round=6, detail={})
     ok2, note2 = writes.stop(repo, pr, "h" * 40, advisor_round=6, detail={})
@@ -188,6 +192,7 @@ def test_concurrent_escalations_produce_exactly_one_row(fresh):
     ONE builder job may survive."""
     repo, pr = "o/r", 12
     _builder_rounds(fresh, repo, pr, 5)
+    _backdate(fresh, repo, pr)
     writes_a = SqlWrites(fresh)
     writes_b = SqlWrites(fresh)
     results: list[tuple[bool, str]] = []
@@ -226,12 +231,13 @@ def _backdate(dsn, repo: str, pr: int, *, hours: float = 3.0) -> None:
     with psycopg.connect(dsn, autocommit=True) as c:
         c.execute(
             "UPDATE neo_actions SET created_at = now() - make_interval("
-            "hours => %s) WHERE repo=%s AND pr_number=%s",
+            "hours => %s::int) WHERE repo=%s AND pr_number=%s",
             (hours, repo, pr))
         c.execute(
             "UPDATE neo_jobs SET created_at = now() - make_interval("
-            "hours => %s), updated_at = now() - make_interval(hours => %s) "
-            "WHERE kind='builder' AND repo=%s AND pr_number=%s",
+            "hours => %s::int), updated_at = now() - make_interval("
+            "hours => %s::int) WHERE kind='builder' AND repo=%s "
+            "AND pr_number=%s",
             (hours, hours, repo, pr))
 
 

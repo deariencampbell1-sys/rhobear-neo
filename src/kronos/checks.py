@@ -125,12 +125,25 @@ def journal_tail(unit: str, *, runner, lines: int = 20) -> str:
 
 
 def nrestarts(unit: str, *, runner) -> int:
-    """`systemctl show <unit> -p NRestarts` — restarts since unit load."""
+    """`systemctl show <unit> -p NRestarts` — restarts since unit load.
+
+    r3 (MEDIUM 3): a failed or malformed probe RAISES into the caller's
+    'check:flap-detect' alert branch — the r2 code silently read a denied
+    probe (returncode != 0) or garbage output as zero restarts, leaving a
+    BLIND flap detector that looked healthy."""
     res = runner(["systemctl", "show", unit, "-p", "NRestarts", "--value"])
+    rc = getattr(res, "returncode", 1)
+    out = (getattr(res, "stdout", "") or "").strip()
+    if rc != 0:
+        raise RuntimeError(
+            f"systemctl show {unit} NRestarts failed (rc={rc}) — flap "
+            f"detection is blind")
     try:
-        return int((getattr(res, "stdout", "") or "0").strip() or 0)
+        return int(out)
     except ValueError:
-        return 0
+        raise RuntimeError(
+            f"systemctl show {unit} NRestarts returned malformed output — "
+            f"flap detection is blind") from None
 
 
 def flap_status(state: dict, unit: str, *, nrestarts: int, now: float,
@@ -141,14 +154,22 @@ def flap_status(state: dict, unit: str, *, nrestarts: int, now: float,
     Pure: `state` is the flap slot (per unit: base count, window start);
     returns (should_report, new_state). After a report the window re-arms
     from the current count; a window older than `window_secs` resets first.
-    """
+
+    r3 (MEDIUM 2): the slot keeps `reported_at` — the time the LAST report
+    was raised — and PRESERVES it across window resets, so the resolution
+    pass can close the alert after a quiet window even though the detection
+    window re-armed (r2 reset window_start on aging, which kept a healthy
+    unit's flap alert open forever)."""
     slot = state.setdefault(unit, {"base": nrestarts, "window_start": now})
     if now - slot["window_start"] > window_secs:
+        prev_reported = slot.get("reported_at")
         slot = state[unit] = {"base": nrestarts, "window_start": now}
+        if prev_reported:
+            slot["reported_at"] = prev_reported
     climbed = nrestarts - slot["base"]
     if climbed >= threshold:
         state[unit] = {"base": nrestarts, "window_start": now,
-                       "reported": True}
+                       "reported_at": now}
         return True, state
     return False, state
 
@@ -297,8 +318,11 @@ def credit_gated_installs(name: str, *, db, owner_install_id: str) -> CheckResul
 # ---------------------------------------------------------------------------
 
 def loop_resolved(db, repo: str, pr: int) -> bool:
-    """The judged-loop alert (`loop:o/r#52`) closes when the PR is out of
-    the loop: merged, or two distinct heads judged green."""
+    """The judged-loop alert (`loop:o/r#52`) closes on Zeus's REAL terminal
+    shapes (r3 MEDIUM 2): a merged row, or a ready row (the worker ACCEPTed)
+    bound to the NEWEST builder head — the same-head evidence the merge rule
+    produces. The r2 signal (two DISTINCT ACCEPT verdicts on builder rows)
+    never occurs: accepted work is recorded as phase='ready'/'merged'."""
     if db is None:
         return False
     merged = db.rows(
@@ -306,20 +330,26 @@ def loop_resolved(db, repo: str, pr: int) -> bool:
         "AND phase = 'merged' LIMIT 1", (repo, pr))
     if merged:
         return True
-    greens = db.rows(
-        "SELECT COUNT(DISTINCT head_sha) AS greens FROM neo_actions "
-        "WHERE repo = %s AND pr_number = %s AND phase = 'builder' "
-        "AND verdict = 'ACCEPT'", (repo, pr))
-    return bool(greens) and int(greens[0].get("greens") or 0) >= 2
+    accepted = db.rows(
+        "SELECT 1 FROM neo_actions WHERE repo = %s AND pr_number = %s "
+        "AND phase = 'ready' "
+        "AND head_sha = (SELECT head_sha FROM neo_actions "
+        "                WHERE repo = %s AND pr_number = %s "
+        "                AND phase = 'builder' ORDER BY id DESC LIMIT 1) "
+        "LIMIT 1", (repo, pr, repo, pr))
+    return bool(accepted)
 
 
 def list_deliveries_via_app(http_opener=None):
     """Factory: GET /app/hook/deliveries with the given App JWT (page 1).
     (Moved here r2 — it is a CHECK input, not a remedy; the remedies module
-    is retired by the read-only ruling.)"""
+    is retired by the read-only ruling.)
+
+    r3 (MEDIUM 1): the GET's timeout is a parameter — the caller clamps it
+    to the remaining pass budget instead of a free-standing 30 s."""
     from urllib.request import Request, build_opener
 
-    def _list(jwt: str, *, per_page: int = 100):
+    def _list(jwt: str, *, per_page: int = 100, timeout: float = 30):
         opener = http_opener or build_opener()
         req = Request(
             f"{API_GITHUB}/app/hook/deliveries?per_page={per_page}",
@@ -328,7 +358,7 @@ def list_deliveries_via_app(http_opener=None):
                 "Authorization": f"Bearer {jwt}",
                 "X-GitHub-Api-Version": "2022-11-28",
             })
-        with opener.open(req, timeout=30) as resp:
+        with opener.open(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
     return _list
 

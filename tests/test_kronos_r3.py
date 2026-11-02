@@ -501,8 +501,8 @@ def test_app_jwt_failure_marks_deliveries_broken_and_alerts(tmp_path,
         def http(self, method, url, *, headers=None, body=None, timeout=30):
             raise AssertionError("no network in this test")
 
-        def writes(self, dsn):
-            raise AssertionError("no writes in this test")
+        def writes(self, dsn, **kw):
+            return FakeWritesR3()
 
     cfg = KronosConfig(state_dir=str(tmp_path),
                        reviews_database_url="postgresql://fake/fake",

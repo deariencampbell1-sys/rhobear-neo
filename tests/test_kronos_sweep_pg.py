@@ -69,12 +69,12 @@ def _quiet(dsn, repo: str, pr: int, *, hours: float = 3.0) -> None:
     with psycopg.connect(dsn, autocommit=True) as c:
         c.execute(
             "UPDATE neo_actions SET created_at = now() - make_interval("
-            "hours => %s) WHERE repo=%s AND pr_number=%s",
+            "hours => %s::int) WHERE repo=%s AND pr_number=%s",
             (hours, repo, pr))
         c.execute(
             "UPDATE neo_jobs SET created_at = now() - make_interval("
-            "hours => %s), updated_at = now() - make_interval(hours => %s) "
-            "WHERE kind='builder' AND repo=%s AND pr_number=%s",
+            "hours => %s::int), updated_at = now() - make_interval(hours => "
+            "%s::int) WHERE kind='builder' AND repo=%s AND pr_number=%s",
             (hours, hours, repo, pr))
 
 
@@ -172,6 +172,17 @@ class _SweepServices:
         raise AssertionError("alerter built through _alerter")
 
 
+def _zeus_pr(dsn, repo: str, pr: int, *, install=4242, head: str = HEAD) -> None:
+    """One Zeus-shaped PR: 5 builder rounds (actions) + the round-5 job whose
+    payload carries the installation id (the authoritative place)."""
+    _builder_rounds(dsn, repo, pr, 5, head=head)
+    Jobs(dsn).create_builder(repo, pr, f"{head[:39]}5", 5, payload={
+        "verdict": "BOUNCE", "wake_job": 1000 + pr, "head_sha": f"{head[:39]}5",
+        "phase": "builder", "round": 5, "context": "green",
+        "installation_id": install,
+    })
+
+
 def _run_judge_sweep(cfg, dsn, services, state, out, *, monkeypatch):
     monkeypatch.setattr("src.kronos.__main__._readonly_token",
                         lambda cfg2, repo, install_id: "ro-token")
@@ -197,11 +208,11 @@ def test_twenty_one_rows_first_twenty_terminal_the_21st_gets_judged(
     terminal (merged) — the sweep must still reach the 21st on this pass."""
     dsn = fresh
     for pr in range(1, 21):
-        _builder_rounds(dsn, "o/r", pr, 5)
+        _zeus_pr(dsn, "o/r", pr, install=4242)
         NeoState(dsn).record("o/r", pr, HEAD, "merged", verdict="MERGED",
                              detail={})
         _quiet(dsn, "o/r", pr)
-    _builder_rounds(dsn, "o/r", 21, 5)
+    _zeus_pr(dsn, "o/r", 21, install=4242)
     _quiet(dsn, "o/r", 21)
 
     services = _SweepServices(dsn)
@@ -224,7 +235,7 @@ def test_twenty_five_live_rows_are_judged_across_passes_none_twice(
     judged twice."""
     dsn = fresh
     for pr in range(1, 26):
-        _builder_rounds(dsn, "o/r", pr, 5)
+        _zeus_pr(dsn, "o/r", pr, install=4242)
         _quiet(dsn, "o/r", pr)
 
     services = _SweepServices(dsn)
