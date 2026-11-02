@@ -85,20 +85,22 @@ def test_dead_unit_report_carries_last_20_journal_lines():
 
 def test_journal_tail_reads_the_real_returncode_field():
     """MEDIUM 2 — the tail decision reads subprocess' REAL field
-    (returncode). A failed journalctl (returncode=1) falls back to
-    `systemctl status` even when stdout is empty."""
+    (returncode). journalctl exiting NONZERO with partial stdout (its
+    rights hint) must NOT be returned as the tail: the fallback to
+    `systemctl status` carries the real lines."""
+    hint = "Hint: You are currently not seeing messages from other users\n"
     runner = FakeRunner({
         ("journalctl", "-u", "rhobear-neo", "-n", "20", "--no-pager",
-         "-o", "short-iso"): proc(["journalctl"], 1, stdout="",
-                                  stderr="Hint: You are currently not "
-                                         "seeing messages from other users"),
+         "-o", "short-iso"): proc(["journalctl"], 1, stdout=hint,
+                                  stderr=""),
         ("systemctl", "status", "rhobear-neo", "-n", "20", "--no-pager",
          "-l"): proc(["systemctl"], 0,
                      "● rhobear-neo.service - ...\n"
                      "Nov 01 10:00:00 box boom[1]: died\n"),
     })
     tail = journal_tail("rhobear-neo", runner=runner, lines=20)
-    assert "died" in tail
+    assert "died" in tail, tail
+    assert "Hint:" not in tail, "a failed journalctl's stdout was the tail"
 
 
 def test_journal_permission_falls_back_to_status():

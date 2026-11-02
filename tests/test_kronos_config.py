@@ -146,7 +146,10 @@ def test_app_identity_gets_the_loaded_pem_never_the_path(monkeypatch,
     cfg = KronosConfig.required()
     km._app_jwt(cfg, "zeus")
     km._readonly_token(cfg, "o/r", "42")
-    km._alerter(cfg, _StateShim(), lambda: 0.0)
+    alerter = km._alerter(cfg, _StateShim(), lambda: 0.0)
+    # the alerter's token callable is lazy — invoke it so its GitHubApp is
+    # constructed (a wiring defect there must not hide)
+    alerter._client._token()
     km._pr_commenter(_SrvShim(), cfg)("o/r", 1, "body")
     assert seen, "no GitHubApp was constructed"
     for app_id, key in seen:

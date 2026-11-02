@@ -425,30 +425,33 @@ def test_escalated_plan_is_redacted_too():
 
 def test_redaction_failure_fails_closed():
     """If the redactor itself fails, NO model text may reach any surface:
-    the judge stops with a fixed literal reason instead."""
+    the judge stops with a fixed literal reason instead. This exercises the
+    REAL chain: src.redact.redact_data fails -> _redact converts ->
+    judge_pr fails closed."""
     db = FakeDb(rounds=_rounds(5))
     http = FakeHttp(content=GOOD_NO)
     state = FakeState()
     writes = FakeWrites()
 
-    import src.kronos.judge as j
+    import src.redact as redact_mod
 
-    def boom(_text):
+    def boom(_value):
         raise RuntimeError("redactor exploded")
 
-    original = j._redact
-    j._redact = boom
+    original = redact_mod.redact_data
+    redact_mod.redact_data = boom
     try:
         out, comments, alerter, state, writes2 = _run_judge(
             db, http, state=state, writes=writes)
     finally:
-        j._redact = original
+        redact_mod.redact_data = original
     assert out.action == "stopped"
     assert writes2.stops, "the fail-closed stop still parks the PR"
     surfaces = json.dumps(writes2.stops) + json.dumps(alerter.alerts) + \
         json.dumps(comments.posted) + out.reason
     assert "converging structure" not in surfaces, \
         "unredactable model text reached a surface"
+    assert "judge answer withheld" in out.reason, out.reason
 
 
 # ---------------------------------------------------------------------------

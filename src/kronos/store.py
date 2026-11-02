@@ -89,6 +89,10 @@ class SqlWrites:
                  builder_payload: dict,
                  max_attempts: int = 3) -> tuple[bool, str]:
         """`yes` -> the ONE escalated Zeus round whose brief is the plan."""
+        # The CAS re-check keys on detail->'advisor_round' — inject it so the
+        # idempotency never depends on the caller remembering it.
+        detail = dict(detail or {})
+        detail.setdefault("advisor_round", advisor_round)
         with psycopg.connect(self.dsn, autocommit=False) as conn:
             try:
                 cur = conn.execute(
@@ -119,6 +123,10 @@ class SqlWrites:
              advisor_round: int, detail: dict) -> tuple[bool, str]:
         """`no` / bad / timeout -> the stop marker Zeus checks before any
         further round (already_escalated) — no builder job, ever."""
+        # Same defense as escalate(): the CAS re-check keys on
+        # detail->'advisor_round' — never depend on the caller for it.
+        detail = dict(detail or {})
+        detail.setdefault("advisor_round", advisor_round)
         with psycopg.connect(self.dsn, autocommit=False) as conn:
             try:
                 cur = conn.execute(
