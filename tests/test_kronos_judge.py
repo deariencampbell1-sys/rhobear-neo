@@ -1,13 +1,22 @@
-"""W1-08-r1 — the judge (escalator) with fakes (acceptance).
+"""W1-08-r2 — the judge (escalator) with fakes.
 
-- 5 Zeus fix rounds without two greens triggers the judge: one Summit call
-  through RouteGate with consumer `reviews:kronos/<install_id>`, a READ-ONLY
-  installation token in the payload, and the bounded round history;
-- `progress: yes` -> exactly ONE escalated Zeus round whose brief is the plan
-  (never a 7th round — 5 normal + 1 escalated = 6 max);
-- `progress: no`, a bad answer, or a timeout -> Zeus stops on that PR (the
-  marker Zeus already consumes), one PR comment with the reason, owner alert;
-- the judge never fires twice for the same PR.
+r2 changes (fix round on the r1 review):
+
+- HIGH 6: the round-six ceiling and the Zeus/Kronos deconfliction are
+  ATOMIC — the judge writes through a compare-and-set `writes` adapter
+  (one advisory-locked transaction); six stored rounds are refused before
+  Summit is ever asked, by the STORED round number, not the list length;
+  a lost race (writes defer) never sets the judged marker and never
+  comments, so Zeus's path owns the PR;
+- HIGH 7: the installation token NEVER rides in a model message, and every
+  model output string is redacted (fail closed) before it reaches the DB,
+  a PR comment, an alert or a log;
+- HIGH 2: the judge no longer writes through the read-only rows adapter —
+  writes go through the `writes` adapter (SqlWrites against the real
+  schema in tests/test_kronos_store_pg.py);
+- MEDIUM 3: the Summit timeout is clamped by the caller to the remaining
+  pass budget (the plumbing is pinned here, the clamp math in the CLI
+  tests).
 
 The DB, RouteGate HTTP, GitHub comments and the alerter are fakes.
 """
@@ -29,7 +38,8 @@ from src.kronos.judge import (
 # ---------------------------------------------------------------------------
 
 class FakeDb:
-    """rows(sql, params) from a dict of canned tables."""
+    """rows(sql, params) from a dict of canned tables. READ-ONLY: the judge
+    may never write through this object again (that was HIGH 2)."""
 
     def __init__(self, rounds: list[dict] | None = None,
                  escalated: bool = False,
@@ -39,8 +49,6 @@ class FakeDb:
         self.escalated = escalated
         self.escalating = escalating
         self.assessments = assessments or []
-        self.recorded: list[dict] = []
-        self.builder_jobs: list[dict] = []
 
     # read side -------------------------------------------------------------
     def rows(self, sql: str, params=()) -> list[dict]:
@@ -54,16 +62,32 @@ class FakeDb:
             return self.assessments
         return []
 
-    # write side (the two things the judge may write) ------------------------
-    def record(self, repo, pr, head_sha, phase, **kw):
-        self.recorded.append({"repo": repo, "pr": pr, "head_sha": head_sha,
-                              "phase": phase, **kw})
 
-    def create_builder(self, repo, pr, head_sha, builder_round, *, payload=None,
-                       **kw):
-        self.builder_jobs.append({"repo": repo, "pr": pr, "round": builder_round,
-                                  "payload": payload})
-        return 55
+class FakeWrites:
+    """The judge's ONLY writer: escalate/stop, each an atomic CAS that can
+    defer (Zeus won the race). Records every call for assertions."""
+
+    def __init__(self, defer_reason: str | None = None):
+        self.escalates: list[dict] = []
+        self.stops: list[dict] = []
+        self.defer_reason = defer_reason
+
+    def escalate(self, repo, pr, head_sha, *, advisor_round, detail,
+                 builder_payload):
+        self.escalates.append({"repo": repo, "pr": pr, "head_sha": head_sha,
+                               "advisor_round": advisor_round,
+                               "detail": detail,
+                               "builder_payload": builder_payload})
+        if self.defer_reason:
+            return False, self.defer_reason
+        return True, f"escalated round {advisor_round} recorded"
+
+    def stop(self, repo, pr, head_sha, *, advisor_round, detail):
+        self.stops.append({"repo": repo, "pr": pr, "head_sha": head_sha,
+                           "advisor_round": advisor_round, "detail": detail})
+        if self.defer_reason:
+            return False, self.defer_reason
+        return True, "stop marker recorded"
 
 
 class FakeState:
@@ -142,22 +166,22 @@ GOOD_NO = json.dumps({"progress": "no", "plan": "",
 # the Summit call itself
 # ---------------------------------------------------------------------------
 
-def test_ask_summit_uses_routegate_consumer_and_readonly_token():
+def test_ask_summit_never_puts_a_token_in_the_messages():
+    """HIGH 7 — the read-only installation token never travels in a model
+    message (r1 put it in the user content; a model echo would leak it)."""
     http = FakeHttp(content=GOOD_YES)
-    answer = ask_summit(
+    ask_summit(
         "http://127.0.0.1:8645", "summit", "REPORT", install_id="123456",
-        read_token="ght_ro_token", http=http, timeout=5)
+        read_token="ghs_AAAA0123456789abcdefgh", http=http, timeout=5)
     call = http.calls[0]
     assert call["url"] == "http://127.0.0.1:8645/v1/chat/completions"
     assert call["headers"]["X-RHOBEAR-Consumer"] == "reviews:kronos/123456"
     body = json.loads(call["body"])
     assert body["model"] == "summit"
     assert "REPORT" in body["messages"][-1]["content"]
-    assert "ght_ro_token" in body["messages"][-1]["content"], \
-        "the read-only token rides the payload so Summit can read the PR"
-    assert answer == {"progress": "yes",
-                      "plan": "split the module and fix imports",
-                      "reason": "converging structure, one more round is worth it"}
+    for msg in body["messages"]:
+        assert "ghs_" not in str(msg.get("content")), (
+            "an installation token reached a model message")
 
 
 def test_parse_rejects_missing_fields_and_wrong_shape():
@@ -184,22 +208,23 @@ def test_timeout_raises_judge_timeout():
 # the judge flow
 # ---------------------------------------------------------------------------
 
-def _run_judge(db: FakeDb, http, *, install_id="9999", read_token="ro-token",
-               state=None):
+def _run_judge(db: FakeDb, http, *, install_id="9999",
+               state=None, writes=None, timeout=None):
     comments = FakeComments()
     alerter = FakeAlerter()
     state = state or FakeState()
+    writes = writes if writes is not None else FakeWrites()
     out = judge.judge_pr(
         _cfg(), db, comments=comments, alerter=alerter, state=state,
         repo="o/r", pr=52, head_sha="f" * 40, install_id=install_id,
-        read_token=read_token, http=http, now_fn=lambda: 1.0)
-    return out, comments, alerter, state
+        http=http, now_fn=lambda: 1.0, writes=writes, timeout=timeout)
+    return out, comments, alerter, state, writes
 
 
 def test_five_rounds_trigger_the_judge():
     db = FakeDb(rounds=_rounds(5))
     http = FakeHttp(content=GOOD_YES)
-    out, comments, alerter, state = _run_judge(db, http)
+    out, *_rest = _run_judge(db, http)
     assert http.calls, "the judge never asked Summit"
     assert out.action == "escalated"
 
@@ -207,7 +232,7 @@ def test_five_rounds_trigger_the_judge():
 def test_fewer_than_five_rounds_never_judges():
     db = FakeDb(rounds=_rounds(4))
     http = FakeHttp(content=GOOD_YES)
-    out, comments, alerter, _ = _run_judge(db, http)
+    out, *_rest = _run_judge(db, http)
     assert http.calls == []
     assert out.action == "skip"
 
@@ -215,28 +240,28 @@ def test_fewer_than_five_rounds_never_judges():
 def test_yes_creates_exactly_one_escalated_round():
     db = FakeDb(rounds=_rounds(5))
     http = FakeHttp(content=GOOD_YES)
-    out, comments, alerter, _ = _run_judge(db, http)
+    out, comments, alerter, state, writes = _run_judge(db, http)
     assert out.action == "escalated"
-    assert len(db.builder_jobs) == 1, "ONE escalated Zeus round"
-    job = db.builder_jobs[0]
-    assert job["round"] == 6, "5 normal rounds + 1 escalated = 6, never a 7th"
-    assert job["payload"]["escalated"] is True
-    assert "split the module and fix imports" in json.dumps(job["payload"])
-    esc = [r for r in db.recorded if r["phase"] == "escalated"]
-    assert len(esc) == 1
-    assert esc[0]["detail"]["advisor_round"] == 6
+    assert len(writes.escalates) == 1, "ONE escalated Zeus round"
+    call = writes.escalates[0]
+    assert call["advisor_round"] == 6, "5 normal rounds + 1 escalated = 6"
+    payload = call["builder_payload"]
+    assert payload["escalated"] is True
+    assert "split the module and fix imports" in json.dumps(payload)
+    assert call["detail"]["advisor_round"] == 6
     assert any("judged this loop" in b for _, _, b in comments.posted)
+    assert state.slot("judged"), "the judged marker is set only after the CAS won"
 
 
 def test_no_stops_zeus_with_comment_and_alert():
     db = FakeDb(rounds=_rounds(5))
     http = FakeHttp(content=GOOD_NO)
-    out, comments, alerter, _ = _run_judge(db, http)
+    out, comments, alerter, _state, writes = _run_judge(db, http)
     assert out.action == "stopped"
-    assert db.builder_jobs == [], "a 'no' never creates a round"
-    stops = [r for r in db.recorded if r["phase"] == "escalated"
-             and r["detail"].get("kronos_stop")]
-    assert stops, "Zeus is stopped via the marker it already consumes"
+    assert writes.escalates == [], "a 'no' never creates a round"
+    assert len(writes.stops) == 1
+    assert writes.stops[0]["detail"].get("kronos_stop") is True, \
+        "Zeus is stopped via the marker it already consumes"
     assert any("stopped" in b.lower() for _, _, b in comments.posted)
     assert alerter.alerts, "the owner is alerted"
 
@@ -244,18 +269,17 @@ def test_no_stops_zeus_with_comment_and_alert():
 def test_timeout_stops():
     db = FakeDb(rounds=_rounds(5))
     http = FakeHttp(err=TimeoutError("slow"))
-    out, comments, alerter, _ = _run_judge(db, http)
+    out, _comments, alerter, _state, writes = _run_judge(db, http)
     assert out.action == "stopped"
-    assert db.builder_jobs == []
+    assert writes.escalates == []
     assert alerter.alerts, "a timeout stops and tells the owner"
 
 
 def test_bad_answer_stops():
     db = FakeDb(rounds=_rounds(5))
     http = FakeHttp(content="I think it looks fine?!")
-    out, comments, alerter, _ = _run_judge(db, http)
+    out, *_rest = _run_judge(db, http)
     assert out.action == "stopped"
-    assert db.builder_jobs == []
 
 
 def test_judge_never_fires_twice_for_the_same_pr():
@@ -264,10 +288,10 @@ def test_judge_never_fires_twice_for_the_same_pr():
     shared_state = FakeState()
     out1, *_ = _run_judge(db, http, state=shared_state)
     # a second pass on the same PR (state remembers the judgment)
-    out2, comments2, alerter2, _ = _run_judge(db, http, state=shared_state)
+    out2, _c2, _a2, _s2, writes2 = _run_judge(db, http, state=shared_state)
     assert out1.action == "escalated"
     assert out2.action == "skip"
-    assert len(db.builder_jobs) == 1, "never a second escalated round"
+    assert writes2.escalates == [], "never a second escalated round"
 
 
 def test_judge_defers_while_zeus_advisor_path_is_escalating():
@@ -285,6 +309,159 @@ def test_judge_defers_when_already_escalated():
     http = FakeHttp(content=GOOD_YES)
     out, *_ = _run_judge(db, http)
     assert out.action == "skip"
+
+
+# ---------------------------------------------------------------------------
+# HIGH 6 — the round-six ceiling and the CAS deconfliction
+# ---------------------------------------------------------------------------
+
+def test_six_stored_rounds_are_never_judged():
+    """HIGH 6 — at six stored rounds every decision is refused BEFORE Summit
+    is asked: 5 normal + 1 escalated = 6 is the ceiling, never a 7th."""
+    db = FakeDb(rounds=_rounds(6))
+    http = FakeHttp(content=GOOD_YES)
+    out, _c, _a, _s, writes = _run_judge(db, http)
+    assert http.calls == [], "Summit was asked at the ceiling"
+    assert out.action == "skip"
+    assert "6" in out.reason or "ceiling" in out.reason, out.reason
+    assert writes.escalates == [] and writes.stops == []
+
+
+def test_sparse_round_numbers_hit_the_ceiling_too():
+    """HIGH 6 — the ceiling reads the STORED round number, not the list
+    length: five rows whose rounds are 1,2,3,4,6 (a lost marker row) are at
+    the ceiling and must be refused."""
+    rounds = _rounds(5)
+    rounds[-1]["round"] = 6
+    db = FakeDb(rounds=rounds)
+    http = FakeHttp(content=GOOD_YES)
+    out, _c, _a, _s, writes = _run_judge(db, http)
+    assert http.calls == [], "list length hid a stored round 6"
+    assert out.action == "skip"
+    assert writes.escalates == [] and writes.stops == []
+
+
+def test_a_yes_at_five_rounds_targets_round_six_not_seven():
+    """The escalated round is the stored MAX + 1 — with 5 rows that is 6,
+    never len()+1 against a sparse history."""
+    rounds = _rounds(5)
+    rounds[-1]["round"] = 5
+    rounds[0]["round"] = 1
+    db = FakeDb(rounds=rounds)
+    http = FakeHttp(content=GOOD_YES)
+    _out, _c, _a, _s, writes = _run_judge(db, http)
+    assert writes.escalates[0]["advisor_round"] == 6
+
+
+def test_cas_deferral_writes_nothing_and_comments_nothing():
+    """HIGH 6 — when the CAS defers (Zeus won the race between the read and
+    the write), the judge must not set the judged marker, must not comment,
+    must not alert as if IT had decided — and must not raise."""
+    db = FakeDb(rounds=_rounds(5))
+    http = FakeHttp(content=GOOD_YES)
+    state = FakeState()
+    writes = FakeWrites(defer_reason="deferred: Zeus advisor escalation is in flight")
+    out, comments, alerter, state, _w = _run_judge(
+        db, http, state=state, writes=writes)
+    assert out.action == "deferred", out
+    assert len(writes.escalates) == 1, "exactly ONE write attempt"
+    assert state.slot("judged") == {}, "a lost race must not park the PR"
+    assert comments.posted == [], "a lost race must not comment"
+    assert alerter.alerts == [], "a lost race must not alert"
+
+
+def test_stop_cas_deferral_writes_nothing():
+    db = FakeDb(rounds=_rounds(5))
+    http = FakeHttp(content=GOOD_NO)
+    state = FakeState()
+    writes = FakeWrites(defer_reason="deferred: already escalated or stopped")
+    out, comments, alerter, state, _w = _run_judge(
+        db, http, state=state, writes=writes)
+    assert out.action == "deferred"
+    assert state.slot("judged") == {}
+    assert comments.posted == []
+    assert alerter.alerts == []
+
+
+# ---------------------------------------------------------------------------
+# HIGH 7 — every model output string is redacted before it lands anywhere
+# ---------------------------------------------------------------------------
+
+def test_model_output_is_redacted_before_db_comment_alert_and_log(caplog):
+    """HIGH 7 — Summit echoes a token in the reason: no model text carrying a
+    token shape may reach the DB detail, the PR comment, the owner alert,
+    the returned outcome or the log."""
+    import logging
+    echoed = json.dumps({
+        "progress": "no",
+        "plan": "",
+        "reason": "leaked ghs_AAAA0123456789abcdefgh while reading the diff",
+    })
+    db = FakeDb(rounds=_rounds(5))
+    http = FakeHttp(content=echoed)
+    with caplog.at_level(logging.WARNING, logger="rhobear_neo.kronos.judge"):
+        out, comments, alerter, _state, writes = _run_judge(db, http)
+    assert out.action == "stopped"
+    surfaces = json.dumps(writes.stops) + json.dumps(alerter.alerts) + \
+        json.dumps(comments.posted) + out.reason + caplog.text
+    assert "ghs_AAAA0123456789abcdefgh" not in surfaces, surfaces
+
+
+def test_escalated_plan_is_redacted_too():
+    echoed = json.dumps({
+        "progress": "yes",
+        "plan": "first paste ghs_BBBB0123456789abcdefgh then split the module",
+        "reason": "converging",
+    })
+    db = FakeDb(rounds=_rounds(5))
+    http = FakeHttp(content=echoed)
+    out, comments, _a, _s, writes = _run_judge(db, http)
+    assert out.action == "escalated"
+    surfaces = json.dumps(writes.escalates) + json.dumps(comments.posted)
+    assert "ghs_BBBB0123456789abcdefgh" not in surfaces, surfaces
+    assert "split the module" in json.dumps(writes.escalates), \
+        "the harmless plan text survives the redaction"
+
+
+def test_redaction_failure_fails_closed():
+    """If the redactor itself fails, NO model text may reach any surface:
+    the judge stops with a fixed literal reason instead."""
+    db = FakeDb(rounds=_rounds(5))
+    http = FakeHttp(content=GOOD_NO)
+    state = FakeState()
+    writes = FakeWrites()
+
+    import src.kronos.judge as j
+
+    def boom(_text):
+        raise RuntimeError("redactor exploded")
+
+    original = j._redact
+    j._redact = boom
+    try:
+        out, comments, alerter, state, writes2 = _run_judge(
+            db, http, state=state, writes=writes)
+    finally:
+        j._redact = original
+    assert out.action == "stopped"
+    assert writes2.stops, "the fail-closed stop still parks the PR"
+    surfaces = json.dumps(writes2.stops) + json.dumps(alerter.alerts) + \
+        json.dumps(comments.posted) + out.reason
+    assert "converging structure" not in surfaces, \
+        "unredactable model text reached a surface"
+
+
+# ---------------------------------------------------------------------------
+# MEDIUM 3 — the Summit timeout the caller clamps
+# ---------------------------------------------------------------------------
+
+def test_judge_passes_the_clamped_timeout_to_summit():
+    """The sweep clamps the judge's timeout to the remaining pass budget;
+    judge_pr must forward it to the RouteGate call verbatim."""
+    db = FakeDb(rounds=_rounds(5))
+    http = FakeHttp(content=GOOD_YES)
+    _run_judge(db, http, timeout=37)
+    assert http.calls[0]["timeout"] == 37, http.calls[0]["timeout"]
 
 
 def test_trigger_threshold_is_five():

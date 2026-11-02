@@ -1,15 +1,15 @@
-"""W1-08-r1 — the Kronos systemd unit files and timer: spec, not deployment.
+"""W1-08-r2 — the Kronos systemd unit files and timer: spec, not deployment.
 
 Nothing here starts, enables or installs a unit (the lane manager owns the
 deploy steps). These tests pin the SPEC the manager installs:
 
-- the service runs as its own user `rhobear-kronos`, keys delivered by
-  /opt/rhobear/bin/vault-env (ExecStartPre, root), missing helper -> loud;
-- the restart remedy needs `sudo`, so NoNewPrivileges=true is deliberately
-  ABSENT from this unit (kernel: setuid exec is impossible under it — sudo
-  can never elevate, the brief's restart remedy would be dead code). The
-  sudoers line the manager installs (M-11) is the privilege boundary instead,
-  and it is quoted in the unit so the manager can copy it;
+- r2 RULING (Morpheus, 2026-11-02): Kronos is READ-ONLY on other services —
+  it observes; it never restarts, never kills, never edits a unit. The r1
+  sudoers line and restart privilege are GONE, so NoNewPrivileges=true holds
+  again (the r1 deviation existed only for the sudo remedy);
+- HIGH 1: the alert dedupe, flap windows and judged markers must survive the
+  oneshot's exit and a reboot — they live in a durable StateDirectory, not
+  in the RuntimeDirectory systemd wipes when the service stops;
 - the timer wakes every 5 minutes and the unit runs exactly one pass.
 """
 from __future__ import annotations
@@ -25,9 +25,10 @@ DEPLOY = Path(__file__).resolve().parent.parent / "deploy"
 SERVICE = DEPLOY / "rhobear-kronos.service"
 TIMER = DEPLOY / "rhobear-kronos.timer"
 
-# The hardening set that CAN hold alongside sudo-based restarts
-# (NoNewPrivileges is the one directive that cannot — see module docstring).
+# The full hardening set — NoNewPrivileges is BACK: with no restart remedy
+# there is nothing that needs setuid elevation.
 HARDENING = {
+    "NoNewPrivileges": "true",
     "ProtectSystem": "full",
     "ProtectHome": "true",
     "PrivateTmp": "true",
@@ -50,7 +51,6 @@ def test_service_runs_as_its_own_user():
     d = _directives(SERVICE.read_text(encoding="utf-8"))
     assert d.get("User") == ["rhobear-kronos"], d.get("User")
     assert d.get("Type") == ["oneshot"], "one timer firing = one pass"
-    assert d.get("RuntimeDirectory") == ["rhobear-kronos"]
 
 
 def test_service_takes_keys_from_vault_env_not_its_own_loader():
@@ -62,24 +62,40 @@ def test_service_takes_keys_from_vault_env_not_its_own_loader():
     assert "/run/rhobear-kronos/env" in envfile
 
 
-def test_service_hardening_without_nonewprivileges():
+def test_service_is_read_only_no_restart_privilege_anywhere():
+    """RULING — Kronos never restarts, kills or edits a unit. The unit file
+    must carry NO sudoers line and NO systemctl restart privilege."""
+    text = SERVICE.read_text(encoding="utf-8")
+    assert "sudo" not in text.lower(), "a sudoers line survived the r2 ruling"
+    assert "systemctl restart" not in text.lower(), (
+        "a restart privilege or remedy note survived the r2 ruling"
+    )
+    d = _directives(text)
+    assert d.get("NoNewPrivileges") == ["true"], (
+        "with no privilege to elevate, NoNewPrivileges=true must hold"
+    )
+
+
+def test_service_hardening_set():
     d = _directives(SERVICE.read_text(encoding="utf-8"))
     for key, want in HARDENING.items():
         assert d.get(key) == [want], f"{key}={want} required, got {d.get(key)}"
-    assert d.get("NoNewPrivileges") is None, (
-        "NoNewPrivileges=true would kill the brief's sudo restart remedy "
-        "(setuid exec is impossible under it) — the sudoers line is the "
-        "boundary instead; see the unit's comment for M-11"
-    )
+
+
+def test_state_is_durable_across_oneshot_restarts():
+    """HIGH 1 — the ledger (alert dedupe, flaps, judged markers) lives in a
+    StateDirectory that systemd keeps across oneshot exits and reboots; the
+    state dir env points there; the unit may write it."""
+    d = _directives(SERVICE.read_text(encoding="utf-8"))
+    assert d.get("StateDirectory") == ["rhobear-kronos"], d.get(
+        "StateDirectory")
+    assert d.get("StateDirectoryMode") == ["0700"], d.get(
+        "StateDirectoryMode")
+    env = " ".join(d.get("Environment", []))
+    assert "RHOBEAR_KRONOS_STATE_DIR=/var/lib/rhobear-kronos" in env, env
     rw = " ".join(d.get("ReadWritePaths", []))
-    assert "/run/rhobear-kronos" in rw, "the state dir must be writable"
-
-
-def test_unit_quotes_the_sudoers_line_for_the_manager():
-    text = SERVICE.read_text(encoding="utf-8")
-    assert "systemctl restart rhobear-neo.service" in text, (
-        "the exact sudoers line for M-11 must be in the unit comment"
-    )
+    assert "/var/lib/rhobear-kronos" in rw, \
+        "the durable state dir must be writable"
 
 
 def test_timer_wakes_every_five_minutes():
