@@ -148,8 +148,10 @@ class Services:
                 with psycopg.connect(dsn, autocommit=True,
                                      row_factory=dict_row, **kwargs) as conn:
                     if self._st_ms:
-                        conn.execute("SET statement_timeout = %s",
-                                     (max(1, int(self._st_ms)),))
+                        # SET cannot take a bound parameter: inline the
+                        # validated int.
+                        conn.execute(f"SET statement_timeout = "
+                                     f"{max(1, int(self._st_ms))}")
                     cur = conn.execute(sql, params)
                     try:
                         return list(cur.fetchall())

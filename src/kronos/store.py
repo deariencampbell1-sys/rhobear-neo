@@ -143,8 +143,9 @@ class SqlWrites:
     def _connect(self):
         conn = psycopg.connect(self.dsn, autocommit=False,
                                connect_timeout=self.connect_timeout)
-        conn.execute("SET LOCAL statement_timeout = %s",
-                     (self.statement_timeout_ms,))
+        # SET cannot take a bound parameter: inline the validated int.
+        conn.execute(f"SET LOCAL statement_timeout = "
+                     f"{int(self.statement_timeout_ms)}")
         return conn
 
     def escalate(self, repo: str, pr: int, head_sha: str, *,
