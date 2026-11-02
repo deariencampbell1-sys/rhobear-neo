@@ -80,6 +80,11 @@ def test_completing_advice_a_preserves_concurrent_advice_b(fresh):
 
     assert _owners(fresh, 901) == [("B", ESCALATION_INFLIGHT_PHASE)], \
         "A's completion erased B's durable ownership"
+    # The CAS must identify B's live marker, not merely defer on recency.
+    from src.kronos.store import SqlWrites
+    ok, why = SqlWrites(fresh).stop("o/r", 901, HEAD_B,
+                                   advisor_round=6, detail={})
+    assert not ok and "mid-flight" in why.lower(), (ok, why)
     _age(fresh, 901, "B")
     b.reclaim_stale_inflight()
     assert _owners(fresh, 901) == [("B", "escalating")], \
