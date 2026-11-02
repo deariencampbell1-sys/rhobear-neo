@@ -718,8 +718,8 @@ def test_delivery_list_timeout_clamps_to_the_remaining_budget(tmp_path,
         def http(self, method, url, *, headers=None, body=None, timeout=30):
             raise AssertionError("no network in this test")
 
-        def writes(self, dsn):
-            raise AssertionError("no writes in this test")
+        def writes(self, dsn, **kw):
+            return FakeWritesR3()
 
     recorded: list[float] = []
 
@@ -805,20 +805,25 @@ def test_flap_alert_resolves_after_a_quiet_window(tmp_path, monkeypatch):
                         lambda cfg2, state2, now_fn, **kw: alerter)
     now = 1000.0
     flap_slot = state.slot("flaps")
+    for i in range(5):  # the count climbs to the threshold...
+        should, flap_slot = flap_status(flap_slot, "rhobear-neo",
+                                        nrestarts=i, now=now + i * 60)
+        assert should is False
     should, flap_slot = flap_status(flap_slot, "rhobear-neo", nrestarts=5,
-                                    now=now)
+                                    now=now + 5 * 60)
     assert should is True
+    reported_at = now + 5 * 60
     state.slot("open_alerts")["flap:rhobear-neo"] = "x"
     results = [checks.CheckResult("unit:rhobear-neo", checks.OK, "active")]
     # healthy passes go by (the detection window ages, no new restarts)...
-    for t in (now + 300, now + 900):
+    for t in (reported_at + 300, reported_at + 900):
         flap_slot = state.slot("flaps")
         should, flap_slot = flap_status(flap_slot, "rhobear-neo",
                                         nrestarts=5, now=t)
         assert should is False
         _resolve_fixed(cfg, state, results, None, lambda l: None,
                        now_fn=lambda: t)
-        if t - now <= 600:
+        if t - reported_at <= 600:
             assert "flap:rhobear-neo" in state.slot("open_alerts"), \
                 "closed inside the quiet window"
     assert "flap:rhobear-neo" not in state.slot("open_alerts"), \
