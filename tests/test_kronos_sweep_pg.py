@@ -216,7 +216,7 @@ def test_twenty_one_rows_first_twenty_terminal_the_21st_gets_judged(
     _zeus_pr(dsn, "o/r", 21, install=4242)
     _quiet(dsn, "o/r", 21)
 
-    services = _SweepServices(dsn)
+    services = _SweepServices(dsn, pulls_head=f"{HEAD[:39]}5")
     from src.kronos import KronosState
     state = KronosState(str(tmp_path / "state.json"))
     lines: list[str] = []
@@ -239,7 +239,7 @@ def test_twenty_five_live_rows_are_judged_across_passes_none_twice(
         _zeus_pr(dsn, "o/r", pr, install=4242)
         _quiet(dsn, "o/r", pr)
 
-    services = _SweepServices(dsn)
+    services = _SweepServices(dsn, pulls_head=f"{HEAD[:39]}5")
     from src.kronos import KronosState
     state = KronosState(str(tmp_path / "state.json"))
     _run_judge_sweep(_cfg(tmp_path, dsn), dsn, services, state,
@@ -337,7 +337,7 @@ def test_consumer_scope_comes_from_the_job_payload(fresh, tmp_path,
     })
     _quiet(dsn, repo, pr)
 
-    services = _SweepServices(dsn)
+    services = _SweepServices(dsn, pulls_head=f"{HEAD[:39]}5")
     from src.kronos import KronosState
     state = KronosState(str(tmp_path / "state.json"))
     _run_judge_sweep(_cfg(tmp_path, dsn), dsn, services, state,
