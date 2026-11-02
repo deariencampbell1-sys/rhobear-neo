@@ -380,6 +380,9 @@ class _JudgeServices(FakeServices):
                 if "GROUP BY repo, pr_number" in s:
                     return [{"repo": "o/r", "pr_number": 52,
                              "rounds": 5, "head_sha": "f" * 40}]
+                if "FROM neo_jobs" in s:
+                    # the authoritative installation identity (HIGH 6)
+                    return [{"payload": {"installation_id": 4242}}]
                 if "ORDER BY id ASC" in s:
                     return [{"round": i, "head_sha": f"{i:04d}" * 10,
                              "verdict": "BOUNCE", "tree_sha": f"t{i}",
