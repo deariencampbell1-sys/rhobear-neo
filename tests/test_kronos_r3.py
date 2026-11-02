@@ -269,7 +269,7 @@ class _SweepServices:
     def db(self, dsn, **kw):
         return self._db
 
-    def writes(self, dsn):
+    def writes(self, dsn, **kw):
         return FakeWritesR3()
 
     def http(self, method, url, *, headers=None, body=None, timeout=30):

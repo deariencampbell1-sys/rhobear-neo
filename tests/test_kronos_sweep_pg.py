@@ -134,8 +134,8 @@ class _SweepServices:
                 with psycopg.connect(dsn, autocommit=True,
                                      row_factory=dict_row) as c:
                     if kw.get("statement_timeout_ms"):
-                        c.execute("SET statement_timeout = %s",
-                                  (int(kw["statement_timeout_ms"]),))
+                        c.execute("SET statement_timeout = "
+                                  f"{max(1, int(kw['statement_timeout_ms']))}")
                     cur = c.execute(sql, params)
                     try:
                         return list(cur.fetchall())
@@ -144,7 +144,7 @@ class _SweepServices:
 
         return _Db()
 
-    def writes(self, dsn):
+    def writes(self, dsn, **kw):
         return _RecordingWrites()
 
     def http(self, method, url, *, headers=None, body=None, timeout=30):
