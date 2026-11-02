@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 
 import psycopg
 import pytest
@@ -151,6 +152,11 @@ class _SweepServices:
         if "chat/completions" in url:
             self.summit_consumers.append(
                 str((headers or {}).get("X-RHOBEAR-Consumer", "")))
+            # r4: an optional override lets a test drive the `yes` path
+            override = getattr(self, "summit_answer", None)
+            if override:
+                return 200, json.dumps({"choices": [{"message": {
+                    "content": override}}]})
             answer = {"progress": "no", "plan": "", "reason": "r3 sweep stop"}
             return 200, json.dumps({"choices": [{"message": {
                 "content": json.dumps(answer)}}]})
@@ -400,3 +406,305 @@ def test_two_repos_same_pr_number_both_served(fresh, tmp_path, monkeypatch):
     assert "o/live#800" in state.slot("judged"), state.slot("judged")
     assert "o/ready#800" not in state.slot("judged"), \
         "repo A's terminal PR was judged after all"
+# ---------------------------------------------------------------------------
+# r4 HIGH C — Zeus's consume-then-act gap is sealed by a durable in-flight
+# marker (AUTHORIZED Zeus interop change, Morpheus ruling 2026-11-02):
+# take_escalation() re-phases the consumed marker to 'escalation-inflight'
+# instead of deleting it; the marker is cleared only when the outcome
+# records, and is reclaimable after a stated stale timeout (3600 s).
+# Kronos defers whenever the marker exists.
+# ---------------------------------------------------------------------------
+
+def test_kronos_defers_on_the_just_consumed_marker_with_stale_history(fresh):
+    """THE review's counterexample: five builder rounds and their jobs more
+    than 3600 s old; Zeus creates a fresh escalating marker, consumes it and
+    pauses before escalate_pr(). The r3 quiet-window defer sees only stale
+    rows — on the r3 head Kronos's CAS WROTE round six here. With the r4
+    Zeus change a durable in-flight marker remains: both Kronos decisions
+    must defer until Zeus's outcome records."""
+
+    from src.neo_state import ESCALATION_INFLIGHT_PHASE, NeoState as _NS
+    repo, pr = "o/r", 603
+    _builder_rounds(fresh, repo, pr, 5)
+    _quiet(fresh, repo, pr, hours=3.0)   # stale (>3600 s) history
+    state = _NS(fresh)
+    state.record_escalating(repo, pr, HEAD, advice_id="zeus-adv-3")
+    assert state.take_escalation(repo, pr, "zeus-adv-3") is True
+    # ---- paused: marker consumed; escalate_pr() has not run yet ----
+    writes = SqlWrites(fresh)
+    ok, note = writes.escalate(repo, pr, HEAD, advisor_round=6,
+                               detail={}, builder_payload={"escalated": True})
+    assert not ok, "Kronos escalated onto a just-consumed Zeus escalation"
+    assert ("in-flight" in note.lower() or "mid-flight" in note.lower()), note
+    ok, note = writes.stop(repo, pr, HEAD, advisor_round=6, detail={})
+    assert not ok, "Kronos stopped a PR Zeus was escalating"
+    assert ("in-flight" in note.lower() or "mid-flight" in note.lower()), note
+    # ---- Zeus's act() completes: outcome recorded, marker cleared ----
+    state.record(repo, pr, HEAD, "escalated", verdict="ESCALATE",
+                 builder_round=6, detail={"advisor_round": 6})
+    state.clear_inflight_markers(repo, pr)
+    with psycopg.connect(fresh, row_factory=dict_row) as c:
+        n = c.execute(
+            "SELECT COUNT(*) AS n FROM neo_actions WHERE repo=%s AND "
+            "pr_number=%s AND phase=%s",
+            (repo, pr, ESCALATION_INFLIGHT_PHASE)).fetchone()["n"]
+        jobs = c.execute(
+            "SELECT COUNT(*) AS n FROM neo_jobs WHERE kind='builder' "
+            "AND repo=%s AND pr_number=%s", (repo, pr)).fetchone()["n"]
+    assert n == 0, "the in-flight marker outlived the outcome"
+    ok2, note2 = writes.escalate(repo, pr, HEAD, advisor_round=6,
+                                 detail={}, builder_payload={})
+    assert not ok2 and "already" in note2.lower(), (ok2, note2)
+    assert jobs == 0
+
+
+def test_kronos_defers_whenever_the_marker_exists_even_when_stale(fresh):
+    """The marker is reclaimable by ZEUS after the stale timeout — but until
+    Zeus reclaims it, it exists and Kronos defers. After the reclaim the
+    advice re-enters Zeus's pipeline; when the outcome records (here: the
+    advisor lost the advice and Zeus parked it) every marker is gone and
+    Kronos can stop the loop — a crashed Zeus cannot block forever."""
+    from src.escalation import _consume_and_act
+    from src.neo_state import ESCALATION_INFLIGHT_PHASE, NeoState as _NS
+    repo, pr = "o/r", 605
+    _builder_rounds(fresh, repo, pr, 5)
+    _quiet(fresh, repo, pr, hours=3.0)
+    state = _NS(fresh)
+    state.record_escalating(repo, pr, HEAD, advice_id="zeus-adv-4")
+    assert state.take_escalation(repo, pr, "zeus-adv-4") is True
+    _age_marker(fresh, repo, pr, seconds=72000)
+    writes = SqlWrites(fresh)
+    ok, note = writes.escalate(repo, pr, HEAD, advisor_round=6,
+                               detail={}, builder_payload={"escalated": True})
+    assert not ok, "Kronos wrote round six over Zeus's in-flight marker"
+    assert ("in-flight" in note.lower() or "mid-flight" in note.lower()), note
+    # Zeus recovers: the stale marker is reclaimed into its pipeline...
+    reclaimed = state.reclaim_stale_inflight(stale_secs=3600)
+    assert reclaimed == [{"repo": repo, "pr": pr, "action": "re-recorded"}]
+    # ...the advice is consumed again and the outcome records (a park)...
+    out = _consume_and_act(
+        state, repo, pr, HEAD, "zeus-adv-4", None,
+        lambda: state.record(repo, pr, HEAD, "parked", verdict="PARKED",
+                             detail={"reason": "advisor lost the advice"})
+        or {"action": "parked"},
+        detail={"advice_id": "zeus-adv-4"})
+    assert out["action"] == "parked", out
+    # ...the parked rows age (the recovery happened hours ago in real life)...
+    _quiet(fresh, repo, pr)
+    # ...and the PR is judgeable again: no marker of any kind is left
+    ok, note = writes.stop(repo, pr, HEAD, advisor_round=6,
+                           detail={"kronos_stop": True})
+    assert ok, f"Kronos could not stop a settled PR: {note}"
+
+
+def _age_marker(dsn, repo: str, pr: int, *, seconds: float) -> None:
+    from src.neo_state import ESCALATION_INFLIGHT_PHASE
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute(
+            "UPDATE neo_actions SET detail = jsonb_set(detail, "
+            "'{consumed_at}', to_jsonb(%s::double precision)) "
+            "WHERE repo=%s AND pr_number=%s AND phase=%s",
+            (time.time() - seconds, repo, pr, ESCALATION_INFLIGHT_PHASE))
+class _RealWritesSweepServices(_SweepServices):
+    """The sweep with the REAL CAS writer, so the fresh-only insert really
+    hits the pre-existing job row and mark_notified really lands in the
+    committed marker's detail."""
+
+    def writes(self, dsn, **kw):
+        return SqlWrites(dsn)
+
+
+# ---------------------------------------------------------------------------
+# r4 HIGH D — a committed decision survives a process death before the flush
+# ---------------------------------------------------------------------------
+
+class _FakeTokenApp:
+    """The PR commenter's Zeus-App stand-in (no credentials on the box)."""
+
+    def __init__(self, *a, **k):
+        pass
+
+    def token_for_repo(self, *a, **k):
+        return "tok"
+
+
+class _CapturingAlerter:
+    """What _alerter() returns in these tests: every alert and close is
+    recorded for the assertions."""
+
+    def __init__(self):
+        self.alerts: list[tuple[str, str, str]] = []
+        self.closes: list[str] = []
+
+    def alert(self, fp, subject, body):
+        self.alerts.append((fp, subject, body))
+        return "created"
+
+    def resolved(self, fp, note):
+        self.closes.append(fp)
+
+
+def _committed_stop_row(dsn, repo: str, pr: int, *,
+                        reason="kronos judge stopped the loop: dead end"):
+    """Exactly the row writes.stop() commits — inserted directly, as if the
+    process died between the DB COMMIT and the state flush."""
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute(
+            "INSERT INTO neo_actions(repo,pr_number,head_sha,phase,"
+            "builder_round,verdict,credits,detail) "
+            "VALUES (%s,%s,%s,'escalated',0,'PARKED',0,%s)",
+            (repo, pr, HEAD, json.dumps({
+                "reason": reason, "advisor_round": 6,
+                "advice_id": f"kronos-stop:{repo}#{pr}",
+                "kronos_stop": True, "kronos": True})))
+
+
+def test_stop_committed_without_outbox_still_alerts_after_a_crash(
+        fresh, tmp_path, monkeypatch):
+    """Process death right after the stop's COMMIT: the fresh pass has an
+    EMPTY outbox and must still alert the owner — reconstructed from the
+    committed marker — and mark the row notified so the next pass stays
+    quiet."""
+    dsn = fresh
+    repo, pr = "o/r", 620
+    _builder_rounds(dsn, repo, pr, 5)
+    _quiet(dsn, repo, pr)
+    _committed_stop_row(dsn, repo, pr)
+
+    from src.kronos import KronosState
+    state = KronosState(str(tmp_path / "state.json"))   # FRESH: outbox empty
+    services = _RealWritesSweepServices(dsn, pulls_head=f"{HEAD[:39]}5")
+    alerter = _CapturingAlerter()
+    monkeypatch.setattr("src.kronos.__main__._alerter",
+                        lambda cfg2, state2, now_fn, **kw: alerter)
+    monkeypatch.setattr("src.github_app.GitHubApp", _FakeTokenApp)
+    lines: list[str] = []
+    _run_judge_sweep(_cfg(tmp_path, dsn), dsn, services, state,
+                     lines.append, monkeypatch=monkeypatch)
+    fps = [fp for fp, _s, _b in alerter.alerts]
+    assert "loop:o/r#620" in fps, \
+        f"the owner was never told about the committed stop: {fps}"
+    assert services.summit_consumers == [], \
+        "a committed stop was sent to Summit"
+    with psycopg.connect(dsn, row_factory=dict_row) as c:
+        row = c.execute(
+            "SELECT detail FROM neo_actions WHERE repo=%s AND pr_number=%s "
+            "AND phase='escalated'", (repo, pr)).fetchone()
+    detail = row["detail"]
+    if isinstance(detail, str):
+        detail = json.loads(detail)
+    assert detail.get("kronos_notified") is True, \
+        "the durable delivered-flag was not written after delivery"
+    alerts_after_one = list(alerter.alerts)
+    _run_judge_sweep(_cfg(tmp_path, dsn), dsn, services, state,
+                     lambda l: None, monkeypatch=monkeypatch)
+    assert alerter.alerts == alerts_after_one, \
+        "the second pass re-alerted a notified decision"
+
+
+def test_committed_escalation_comment_reconstructed_after_a_crash(
+        fresh, tmp_path, monkeypatch):
+    """The escalated decision's explanatory comment survives the same crash
+    window: rebuilt from the marker's plan, delivered once, never twice."""
+    dsn = fresh
+    repo, pr = "o/r", 621
+    _builder_rounds(dsn, repo, pr, 5)
+    _quiet(dsn, repo, pr)
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute(
+            "INSERT INTO neo_actions(repo,pr_number,head_sha,phase,"
+            "builder_round,verdict,credits,detail) "
+            "VALUES (%s,%s,%s,'escalated',6,'ESCALATE',0,%s)",
+            (repo, pr, HEAD, json.dumps({
+                "reason": "kronos judge: one escalated round with Summit's plan",
+                "advisor_round": 6, "advice_id": f"kronos:{repo}#{pr}",
+                "installation_id": 4242, "kronos": True,
+                "work_order": {"route": "summit",
+                               "summary": "the plan",
+                               "steps_count": 1}})))
+
+    from src.kronos import KronosState
+    state = KronosState(str(tmp_path / "state.json"))
+    services = _RealWritesSweepServices(dsn, pulls_head=f"{HEAD[:39]}5")
+    alerter = _CapturingAlerter()
+    monkeypatch.setattr("src.kronos.__main__._alerter",
+                        lambda cfg2, state2, now_fn, **kw: alerter)
+    monkeypatch.setattr("src.github_app.GitHubApp", _FakeTokenApp)
+    _run_judge_sweep(_cfg(tmp_path, dsn), dsn, services, state,
+                     lambda l: None, monkeypatch=monkeypatch)
+    assert len(services.comment_urls) == 1, \
+        f"the reconstructed comment was not delivered: {services.comment_urls}"
+    assert alerter.alerts == [], \
+        "an escalation raised an owner alert"
+    assert services.summit_consumers == []
+    _run_judge_sweep(_cfg(tmp_path, dsn), dsn, services, state,
+                     lambda l: None, monkeypatch=monkeypatch)
+    assert len(services.comment_urls) == 1, \
+        "the second pass re-posted the comment"
+
+
+# ---------------------------------------------------------------------------
+# r4 MEDIUM F — the job-conflict alert stays open while the conflicting
+# round job exists in ANY state (PARKED, DONE — the unique key still blocks)
+# ---------------------------------------------------------------------------
+
+def test_job_conflict_alert_stays_open_through_parked_and_done_rows(
+        fresh, tmp_path, monkeypatch):
+    """The r3 resolution closed the alert whenever no queued/running job
+    matched — a PARKED or DONE round-six job kept blocking every future
+    write while the alert claimed the problem was gone."""
+    dsn = fresh
+    repo, pr = "o/r", 630
+    # the parked round-six job exists BEFORE the loop's own round-5 job (so
+    # the identity lookup still reads the round-5 payload, newest first)
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute(
+            "INSERT INTO neo_jobs (kind, repo, pr_number, head_sha, "
+            "wake_color, builder_round, state, outcome, payload) "
+            "VALUES ('builder', %s, %s, %s, false, 6, 'parked', "
+            "'parked', '{}')",
+            (repo, pr, f"{HEAD[:39]}5"))
+    _zeus_pr(dsn, repo, pr, install=4242)
+    _quiet(dsn, repo, pr)
+
+    services = _RealWritesSweepServices(dsn, pulls_head=f"{HEAD[:39]}5")
+    services.summit_answer = json.dumps(
+        {"progress": "yes", "plan": "one more round",
+         "reason": "worth it"})
+    from src.kronos import KronosState
+    from src.kronos.__main__ import _resolve_fixed
+    state = KronosState(str(tmp_path / "state.json"))
+    alerter = _CapturingAlerter()
+    monkeypatch.setattr("src.kronos.__main__._alerter",
+                        lambda cfg2, state2, now_fn, **kw: alerter)
+    lines: list[str] = []
+    _run_judge_sweep(_cfg(tmp_path, dsn), dsn, services, state,
+                     lines.append, monkeypatch=monkeypatch)
+    assert "job-conflict:o/r#630" in state.slot("open_alerts"), \
+        (f"the conflict was never alerted: {lines}")
+    assert state.slot("job_conflicts").get("o/r#630") == 6, \
+        "the conflicting round was not recorded for the resolution pass"
+    # PARKED blocking job: the resolution pass must keep it open
+    _resolve_fixed(_cfg(tmp_path, dsn), state, [], services.db(dsn),
+                   lambda l: None, now_fn=lambda: 1.0)
+    assert "job-conflict:o/r#630" in state.slot("open_alerts"), \
+        "a PARKED blocking job resolved the alert"
+    # DONE blocking job: STILL open
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute(
+            "UPDATE neo_jobs SET state='done', outcome='done' "
+            "WHERE kind='builder' AND repo=%s AND pr_number=%s "
+            "AND builder_round=6", (repo, pr))
+    _resolve_fixed(_cfg(tmp_path, dsn), state, [], services.db(dsn),
+                   lambda l: None, now_fn=lambda: 1.0)
+    assert "job-conflict:o/r#630" in state.slot("open_alerts"), \
+        "a DONE blocking job resolved the alert"
+    # the row is gone -> closes
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute(
+            "DELETE FROM neo_jobs WHERE kind='builder' AND repo=%s "
+            "AND pr_number=%s AND builder_round=6", (repo, pr))
+    _resolve_fixed(_cfg(tmp_path, dsn), state, [], services.db(dsn),
+                   lambda l: None, now_fn=lambda: 1.0)
+    assert "job-conflict:o/r#630" not in state.slot("open_alerts"), \
+        "the alert never closed after the blocking job was deleted"

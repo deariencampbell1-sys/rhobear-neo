@@ -76,6 +76,16 @@ def _defer_reason(cur, repo: str, pr: int, advisor_round: int, *,
         "AND repo = %s AND pr_number = %s LIMIT 1", (repo, pr)).fetchone()
     if row:
         return "deferred: Zeus advisor escalation is in flight"
+    # r4 (HIGH C): Zeus's take_escalation now leaves a durable in-flight
+    # marker (authorized interop change) until its outcome records. The old
+    # quiet-window recency check could NOT see a just-consumed marker over
+    # stale history; this one can, and Kronos defers whenever it exists.
+    row = cur.execute(
+        "SELECT 1 FROM neo_actions WHERE phase='escalation-inflight' "
+        "AND repo = %s AND pr_number = %s LIMIT 1", (repo, pr)).fetchone()
+    if row:
+        return ("deferred: Zeus escalation is mid-flight (the consumed "
+                "advice's in-flight marker is present)")
     row = cur.execute(
         "SELECT 1 FROM neo_actions WHERE phase='escalated' "
         "AND detail->'advisor_round' IS NOT NULL "
@@ -228,6 +238,33 @@ class SqlWrites:
                     (repo, pr, head_sha, json.dumps(detail or {})))
                 conn.commit()
                 return True, "stop marker recorded (Zeus is off this PR)"
+            except Exception:
+                conn.rollback()
+                raise
+
+    def mark_notified(self, repo: str, pr: int) -> int:
+        """r4 HIGH D — the durable delivered-flag on this PR's committed
+        Kronos decision rows (stop marker and/or escalated marker). The
+        notification reconstruction (src/kronos/judge.py) skips rows that
+        carry it, so a committed decision is re-notified at most once more
+        (at-least-once alerting). Kronos's OWN rows only — the WHERE clause
+        pins detail.kronos."""
+        with self._connect() as conn:
+            try:
+                cur = conn.execute(
+                    "UPDATE neo_actions SET detail = jsonb_set("
+                    "detail, '{kronos_notified}', 'true'::jsonb) "
+                    "WHERE repo=%s AND pr_number=%s AND phase='escalated' "
+                    "AND COALESCE(detail->'kronos_notified',"
+                    "'false'::jsonb) <> 'true'::jsonb "
+                    "AND (detail->'kronos_stop' = 'true'::jsonb "
+                    "     OR (detail->'kronos' = 'true'::jsonb "
+                    "         AND position('kronos:' in "
+                    "                      detail->>'advice_id') = 1))",
+                    (repo, pr))
+                marked = cur.rowcount
+                conn.commit()
+                return marked
             except Exception:
                 conn.rollback()
                 raise

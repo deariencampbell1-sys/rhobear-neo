@@ -57,9 +57,10 @@ class FakeDbR3:
     def __init__(self, *, rounds=None, escalating=False, escalated=False,
                  merged=False, ready=False, assessments=None, jobs=None,
                  actions_with_install=None, sweep_page=None, greens=0,
-                 ready_on_newest_head=False):
+                 ready_on_newest_head=False, inflight=False):
         self.rounds = rounds if rounds is not None else _rounds()
         self.escalating = escalating
+        self.inflight = inflight
         self.escalated = escalated
         self.merged = merged
         self.ready = ready
@@ -84,6 +85,8 @@ class FakeDbR3:
             return [{"n": 1}] if self.ready else []
         if "phase = 'merged'" in s or "phase='merged'" in s:
             return [{"n": 1}] if self.merged else []
+        if "phase='escalation-inflight'" in s:
+            return [{"n": 1}] if self.inflight else []
         if "phase='escalating'" in s or "phase = 'escalating'" in s:
             return [{"repo": "o/r", "pr": 1}] if self.escalating else []
         if "phase='escalated'" in s or "phase = 'escalated'" in s:
@@ -1112,3 +1115,255 @@ def test_reviews_timeout_defers_before_the_model():
     outcome = _judge_pr(db, github=_Boom(), http=http)
     assert outcome.action == "deferred", outcome
     assert http.calls == []
+def test_zeus_inflight_marker_defers_before_the_model():
+    """r4 HIGH C — Zeus's take_escalation now leaves a durable in-flight
+    marker (authorized interop change); Kronos defers whenever it exists,
+    before the model is ever asked."""
+    db = FakeDbR3(inflight=True)
+    http = FakeHttpR3(GOOD_NO)
+    writes = FakeWritesR3()
+    outcome = _judge_pr(db, http=http, writes=writes)
+    assert outcome.action == "deferred", outcome
+    assert "in-flight" in outcome.reason.lower(), outcome
+    assert http.calls == [], "the model was called over Zeus's in-flight marker"
+    assert writes.stops == [] and writes.escalates == []
+# ---------------------------------------------------------------------------
+# r4 HIGH D — the outbox is RECONSTRUCTED from durable DB state: a committed
+# decision never loses its notification to a process death between the DB
+# COMMIT and the state flush
+# ---------------------------------------------------------------------------
+
+class _NotificationDbR4:
+    """The reconstruction's read side: canned decision rows + a round count.
+    Branches on the real query shapes so a fake leak cannot hide."""
+
+    def __init__(self, decisions=(), builder_rounds=5):
+        self.decisions = list(decisions)
+        self.builder_rounds = builder_rounds
+        self.queries: list[str] = []
+
+    def rows(self, sql, params=()):
+        s = " ".join(str(sql).split())
+        self.queries.append(s)
+        if "COUNT(*)" in s:
+            return [{"n": self.builder_rounds}]
+        if "phase='escalated'" in s and "kronos_notified" in s:
+            return list(self.decisions)
+        return []
+
+
+def test_reconstruction_rebuilds_a_committed_stop_notification():
+    from src.kronos.judge import drain_notify_outbox
+    from src.kronos.judge import reconstruct_pending_notifications
+    db = _NotificationDbR4(decisions=[{
+        "repo": "o/r", "pr_number": 52,
+        "detail": {"reason": "kronos judge stopped the loop: dead end",
+                   "advisor_round": 6,
+                   "advice_id": "kronos-stop:o/r#52",
+                   "kronos_stop": True, "kronos": True}}])
+    state = FakeStateR3()
+    n = reconstruct_pending_notifications(db, state)
+    assert n == 1
+    box = state.slot("notify_outbox")
+    assert "o/r#52" in box
+    entry = box["o/r#52"]
+    assert entry["needs_alert"] is True, "the owner alert was not rebuilt"
+    assert entry["alert_fp"] == "loop:o/r#52"
+    assert entry["needs_comment"] is True
+    assert "dead end" in entry["comment"]
+    assert "5 fix rounds" in entry["comment"]
+    # delivery marks the durable flag through on_delivered
+    delivered: list[dict] = []
+    comments = FakeCommentsR3()
+    alerter = FakeAlerterR3()
+    drain_notify_outbox(state, comments, alerter,
+                        on_delivered=delivered.append)
+    assert delivered and delivered[0]["alert_fp"] == "loop:o/r#52"
+    assert comments.posted and alerter.alerts
+    assert state.slot("notify_outbox") == {}, \
+        "a fully delivered entry stayed in the outbox"
+
+
+def test_reconstruction_rebuilds_the_escalated_comment():
+    from src.kronos.judge import reconstruct_pending_notifications
+    db = _NotificationDbR4(decisions=[{
+        "repo": "o/r", "pr_number": 53,
+        "detail": {"reason": "converging, one more round",
+                   "advisor_round": 6, "advice_id": "kronos:o/r#53",
+                   "kronos": True,
+                   "work_order": {"summary": "the plan"}}}])
+    state = FakeStateR3()
+    assert reconstruct_pending_notifications(db, state) == 1
+    entry = state.slot("notify_outbox")["o/r#53"]
+    assert entry["needs_comment"] is True
+    assert entry["needs_alert"] is False, \
+        "an escalation carries a comment, never an owner alert"
+    assert "the plan" in entry["comment"]
+
+
+def test_reconstruction_does_not_duplicate_a_pending_entry():
+    from src.kronos.judge import reconstruct_pending_notifications
+    db = _NotificationDbR4(decisions=[{
+        "repo": "o/r", "pr_number": 52,
+        "detail": {"reason": "r", "advisor_round": 6,
+                   "advice_id": "kronos-stop:o/r#52",
+                   "kronos_stop": True, "kronos": True}}])
+    state = FakeStateR3()
+    state.slot("notify_outbox")["o/r#52"] = {"needs_comment": True,
+                                            "comment": "pending"}
+    assert reconstruct_pending_notifications(db, state) == 0
+    assert state.slot("notify_outbox")["o/r#52"]["comment"] == "pending", \
+        "an existing pending entry was clobbered"
+
+
+# ---------------------------------------------------------------------------
+# r4 MEDIUM E — ONE global deadline: token mints and the outbox drain obey it
+# ---------------------------------------------------------------------------
+
+class _RecordingAppR4:
+    """GitHubApp stand-in: records the http_timeout it was built with."""
+
+    instances: list = []
+
+    def __init__(self, app_id, key_pem, *a, http_timeout=30, **k):
+        self.app_id = app_id
+        self.key_pem = key_pem
+        self.http_timeout = http_timeout
+        _RecordingAppR4.instances.append(self)
+
+    def token_for_repo(self, repo, installation_id=None, permissions=None):
+        return "tok"
+
+    def jwt(self):
+        return "jwt"
+
+
+def test_token_mint_timeout_is_bounded_by_the_remaining_budget(monkeypatch):
+    """A slow token endpoint cannot eat the pass budget: the mint's HTTP
+    timeout is what is LEFT (never the client's free-standing 30 s)."""
+    import src.github_app as github_app
+    from src.kronos import __main__ as km
+    monkeypatch.setattr(github_app, "GitHubApp", _RecordingAppR4)
+    _RecordingAppR4.instances.clear()
+    km._readonly_token(_cfg(), "o/r", "42", left_fn=lambda: 2.4)
+    assert _RecordingAppR4.instances, "no mint was attempted"
+    assert _RecordingAppR4.instances[-1].http_timeout == 2, \
+        ("the mint ran with an unbounded timeout: "
+         f"{_RecordingAppR4.instances[-1].http_timeout}")
+
+
+def test_no_token_mint_starts_past_the_deadline(monkeypatch):
+    import src.github_app as github_app
+    from src.kronos import __main__ as km
+    monkeypatch.setattr(github_app, "GitHubApp", _RecordingAppR4)
+    _RecordingAppR4.instances.clear()
+    with pytest.raises(km.BudgetSpent):
+        km._readonly_token(_cfg(), "o/r", "42", left_fn=lambda: 0.0)
+    assert _RecordingAppR4.instances == [], \
+        "a call was STARTED after the deadline"
+
+
+def test_outbox_drain_stops_at_the_deadline():
+    from src.kronos.judge import drain_notify_outbox
+    state = FakeStateR3()
+    box = state.slot("notify_outbox")
+    for i in range(3):
+        box[f"o/r#{i}"] = {"repo": "o/r", "pr": i,
+                           "comment": f"c{i}", "needs_comment": True,
+                           "alert_fp": None, "needs_alert": False}
+    posted: list[str] = []
+    delivered: list[dict] = []
+
+    def _comments(repo, pr, body):
+        posted.append(f"{repo}#{pr}")
+
+    calls = {"n": 0}
+
+    def _budget():
+        calls["n"] += 1
+        return 10.0 if calls["n"] == 1 else 0.0
+
+    drain_notify_outbox(state, _comments, FakeAlerterR3(),
+                        budget_left=_budget, on_delivered=delivered.append)
+    assert len(posted) == 1, f"the drain ignored the deadline: {posted}"
+    assert len(delivered) == 1, "the delivered entry was not flagged"
+    assert len(box) == 2, "delivered entries stayed in the outbox"
+
+
+def test_sweep_defers_when_the_budget_dies_before_the_token_mint(
+        monkeypatch, tmp_path):
+    """A backlog of PRs plus a mint that eats the clock: the sweep stops at
+    the deadline instead of starting another call past it."""
+    import os
+    import tempfile
+
+    import src.github_app as github_app
+    from src.kronos import KronosState
+    from src.kronos.__main__ import _judge_sweep
+
+    clock = [0.0]
+
+    class _BurnDb(FakeDbR3):
+        """A two-PR page; the install-id lookup of the SECOND PR consumes
+        the whole budget (a slow identity read). The mints themselves do
+        not burn — the sweep must still stop before the second mint."""
+
+        def __init__(self, *a, page=None, **k):
+            super().__init__(*a, **k)
+            self.page_rows = list(page or [])
+            self._job_queries = 0
+
+        def rows(self, sql, params=()):
+            s = " ".join(str(sql).split())
+            if "NOT EXISTS" in s:
+                self.sweep_calls.append((s, tuple(params)))
+                return list(self.page_rows)
+            if "FROM neo_jobs" in s:
+                self._job_queries += 1
+                if self._job_queries >= 2:
+                    clock[0] += 100.0
+            return FakeDbR3.rows(self, sql, params)
+
+    monkeypatch.setattr(github_app, "GitHubApp", _RecordingAppR4)
+    db = _BurnDb(jobs=[{"payload": {"installation_id": 4242}}],
+                 page=[{"repo": "o/r", "pr_number": 61, "rounds": 5,
+                        "head_sha": HEAD},
+                       {"repo": "o/r", "pr_number": 62, "rounds": 5,
+                        "head_sha": HEAD}])
+    services = _SweepServices(db)
+    with tempfile.TemporaryDirectory() as td:
+        state = KronosState(os.path.join(td, "state.json"))
+        lines: list[str] = []
+        _judge_sweep(_cfg(), state, db, services, lines.append,
+                     now_fn=lambda: 0.0, left_fn=lambda: 100.0 - clock[0],
+                     clamp=lambda t: t)
+    assert len(services.summit_calls) <= 1, \
+        f"the sweep judged past the deadline: {len(services.summit_calls)}"
+    assert any("budget" in l.lower() for l in lines), lines
+
+
+# ---------------------------------------------------------------------------
+# r4 MEDIUM F — the job-conflict alert stays open while the conflicting
+# round job exists in ANY state (the round is recorded at alert time)
+# ---------------------------------------------------------------------------
+
+def test_job_conflict_alert_needs_the_recorded_round_gone(monkeypatch,
+                                                          tmp_path):
+    from src.kronos import KronosState
+    from src.kronos.__main__ import _resolve_fixed
+    cfg = _cfg()
+    state = KronosState(":memory:")
+    state.slot("open_alerts")["job-conflict:o/r#52"] = "x"
+    state.slot("job_conflicts")["o/r#52"] = 6
+    alerter = FakeAlerterR3()
+    monkeypatch.setattr("src.kronos.__main__._alerter",
+                        lambda cfg2, state2, now_fn, **kw: alerter)
+    # the blocking round-6 job row still exists (ANY state) -> stays open
+    db = FakeDbR3(jobs=[{"builder_round": 6}])
+    _resolve_fixed(cfg, state, [], db, lambda l: None, now_fn=lambda: 1.0)
+    assert "job-conflict:o/r#52" in state.slot("open_alerts"), \
+        "the conflict alert closed while the blocking job row still exists"
+    # the row is gone -> closes
+    db = FakeDbR3(jobs=[])
+    _resolve_fixed(cfg, state, [], db, lambda l: None, now_fn=lambda: 1.0)
+    assert "job-conflict:o/r#52" not in state.slot("open_alerts")

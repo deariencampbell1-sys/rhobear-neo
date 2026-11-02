@@ -72,8 +72,9 @@ from .checks import (
     postgres_reachable,
 )
 from .config import KronosConfig
-from .judge import drain_notify_outbox, judge_pr
-from .store import SqlWrites
+from .judge import (drain_notify_outbox, judge_pr,
+                    reconstruct_pending_notifications)
+from .store import ROUND_CEILING, SqlWrites
 
 log = logging.getLogger("rhobear_neo.kronos")
 
@@ -81,6 +82,20 @@ log = logging.getLogger("rhobear_neo.kronos")
 _RUNNER_TIMEOUT_SECS = 30
 _HTTP_TIMEOUT_SECS = 30
 _DB_TIMEOUT_SECS = 15
+
+
+class BudgetSpent(RuntimeError):
+    """r4 MEDIUM E — the pass budget is gone: no NEW call may start. The
+    work is deferred to the next pass instead of overrunning the deadline."""
+
+
+def _mint_timeout(left_fn) -> int:
+    """r4 MEDIUM E — a token mint's HTTP timeout is bounded by what is LEFT
+    of the pass budget (the App client's own default is a free-standing
+    30 s)."""
+    if left_fn is None:
+        return _HTTP_TIMEOUT_SECS
+    return max(1, min(_HTTP_TIMEOUT_SECS, int(left_fn())))
 
 #: The judge sweep's page (HIGH 3, r3): filtered, quiet, undecided PRs only,
 #: keyset-paged past the persisted cursor. The NOT EXISTS clause drops
@@ -425,7 +440,10 @@ def _alerter(cfg: KronosConfig, state: KronosState, now_fn,
     from ..github_app import GitHubApp
     client = GithubIssueClient(
         cfg.alert_repo,
-        lambda: GitHubApp(cfg.zeus_app_id, cfg.zeus_app_key
+        # r4 MEDIUM E — the token MINT is bounded by the budget too: the
+        # App client's HTTP timeout is what is LEFT, never a free 30 s.
+        lambda: GitHubApp(cfg.zeus_app_id, cfg.zeus_app_key,
+                          http_timeout=_mint_timeout(left_fn)
                           ).token_for_repo(cfg.alert_repo),
         label=cfg.alert_label,
         http=(None if (services is None or left_fn is None)
@@ -452,10 +470,17 @@ def _alert_once(cfg, state, out, *, fingerprint, subject, body, now_fn,
         out(f"kronos alert: {fingerprint} failed: {type(exc).__name__}")
 
 
-def _readonly_token(cfg, repo: str, install_id: str) -> str:
-    """The judge's read-only installation token (never the write token)."""
+def _readonly_token(cfg, repo: str, install_id: str,
+                    *, left_fn=None) -> str:
+    """The judge's read-only installation token (never the write token).
+    r4 MEDIUM E — the mint never starts past the deadline (BudgetSpent) and
+    its HTTP timeout is bounded by what is LEFT of the pass budget."""
     from ..github_app import GitHubApp
-    app = GitHubApp(cfg.zeus_app_id, cfg.zeus_app_key)
+    if left_fn is not None and left_fn() <= 0:
+        raise BudgetSpent(
+            "pass budget exhausted before the read-only token mint")
+    app = GitHubApp(cfg.zeus_app_id, cfg.zeus_app_key,
+                    http_timeout=_mint_timeout(left_fn))
     return app.token_for_repo(repo, installation_id=int(install_id) if
                               install_id.isdigit() else None,
                               permissions={"contents": "read",
@@ -464,11 +489,17 @@ def _readonly_token(cfg, repo: str, install_id: str) -> str:
 
 def _pr_commenter(services, cfg, left_fn=None):
     """Post the judge's ONE PR comment as the Zeus App (timeout clamped to
-    the remaining pass budget, MEDIUM 3)."""
+    the remaining pass budget, MEDIUM 3). r4 MEDIUM E — the token mint is
+    bounded and never starts past the deadline: a BudgetSpent leaves the
+    comment pending in the outbox for the next pass."""
     from ..github_app import GitHubApp
 
     def _comment(repo: str, pr: int, body: str) -> None:
-        app = GitHubApp(cfg.zeus_app_id, cfg.zeus_app_key)
+        if left_fn is not None and left_fn() <= 0:
+            raise BudgetSpent(
+                "pass budget exhausted before the PR comment")
+        app = GitHubApp(cfg.zeus_app_id, cfg.zeus_app_key,
+                        http_timeout=_mint_timeout(left_fn))
         token = app.token_for_repo(repo)
         timeout = _HTTP_TIMEOUT_SECS if left_fn is None else \
             max(1, min(_HTTP_TIMEOUT_SECS, int(left_fn())))
@@ -548,8 +579,33 @@ def _judge_sweep(cfg, state, db, services, out, *, now_fn, left_fn, clamp):
     alerter = _alerter(cfg, state, now_fn, services=services,
                        left_fn=left_fn)
     comments = _pr_commenter(services, cfg, left_fn)
+
+    def _on_notify_delivered(entry: dict) -> None:
+        """r4 HIGH D — the durable delivered-flag on the decision's marker
+        row: the reconstruction never re-creates a notified entry."""
+        try:
+            writes.mark_notified(str(entry.get("repo")),
+                                 int(entry.get("pr") or 0))
+        except Exception as exc:  # noqa: BLE001 — at-least-once alerting
+            log.info("kronos notify: delivered-flag write failed for "
+                     "%s#%s (%s) — the reconstruction may notify once more",
+                     entry.get("repo"), entry.get("pr"), type(exc).__name__)
+
+    # r4 HIGH D — a committed decision's notifications survive a process
+    # death between the DB COMMIT and the state flush: rebuild what the DB
+    # says is un-notified BEFORE draining.
+    try:
+        recreated = reconstruct_pending_notifications(db, state)
+        if recreated:
+            out(f"kronos judge: reconstructed {recreated} pending "
+                f"notification(s) from committed decisions")
+    except Exception as exc:  # noqa: BLE001 — the sweep still runs
+        out(f"kronos judge: notification reconstruction failed: "
+            f"{type(exc).__name__}")
     # r3 HIGH 7 — deliver what a previous pass still owes (comment/alert).
-    drain_notify_outbox(state, comments, alerter)
+    # r4 MEDIUM E — the drain respects the same global deadline.
+    drain_notify_outbox(state, comments, alerter, budget_left=left_fn,
+                        on_delivered=_on_notify_delivered)
     cursor_slot = state.slot("judge_cursor")
     cur_repo = str(cursor_slot.get("repo") or "")
     cur_pr = int(cursor_slot.get("pr") or 0)
@@ -571,7 +627,14 @@ def _judge_sweep(cfg, state, db, services, out, *, now_fn, left_fn, clamp):
         repo, pr = str(row["repo"]), int(row["pr_number"])
         install_id = install_id_for(db, repo, pr)
         try:
-            read_token = _readonly_token(cfg, repo, install_id)
+            # r4 MEDIUM E — the clock is checked AGAIN right before the
+            # mint: a token mint never starts past the deadline.
+            read_token = _readonly_token(cfg, repo, install_id,
+                                         left_fn=left_fn)
+        except BudgetSpent:
+            out(f"kronos judge: {repo}#{pr}: pass budget exhausted before "
+                f"the token mint — deferred to the next pass")
+            break
         except Exception as exc:  # noqa: BLE001 — loud, then judge anyway
             out(f"kronos judge: {repo}#{pr}: read-only "
                 f"token unavailable ({type(exc).__name__}) — judging "
@@ -672,7 +735,9 @@ def _resolve_fixed(cfg, state, results, db, out, *, now_fn,
                     continue
                 if loop_resolved(db, repo, int(pr)):
                     note = f"{repo}#{pr} left the loop"
-                elif not _round_job_active(db, repo, int(pr)):
+                elif not _round_job_exists(db, repo, int(pr),
+                                           _conflict_round(state, repo,
+                                                           int(pr))):
                     note = "the blocking job is gone"
                 else:
                     continue
@@ -687,15 +752,30 @@ def _resolve_fixed(cfg, state, results, db, out, *, now_fn,
                 f"{type(exc).__name__}: {exc}")
 
 
-def _round_job_active(db, repo: str, pr: int) -> bool:
-    """True while a non-final builder job still exists for the PR (the
-    job-conflict alert stays open until it is gone)."""
+def _conflict_round(state, repo: str, pr: int) -> int:
+    """r4 MEDIUM F — the round whose fresh-only insert conflicted (recorded
+    when the job-conflict alert fired). Unknown -> the round-six ceiling:
+    the judge can only ever conflict on round 6 (it refuses at 6 stored
+    rounds, so its new round is always 6)."""
+    try:
+        value = (state.slot("job_conflicts") or {}).get(f"{repo}#{pr}")
+        return int(value) if value is not None else ROUND_CEILING
+    except (TypeError, ValueError):
+        return ROUND_CEILING
+
+
+def _round_job_exists(db, repo: str, pr: int, builder_round: int) -> bool:
+    """r4 MEDIUM F — True while the CONFLICTING round's builder job still
+    exists in ANY state (queued, running, parked, done — the unique key
+    blocks the fresh-only insert regardless). The r3 check matched only
+    queued/running, so a PARKED or DONE blocking job closed the alert while
+    the row still prevented every future write."""
     if db is None:
         return True  # cannot prove it is gone: stay open
     rows = db.rows(
         "SELECT 1 FROM neo_jobs WHERE kind='builder' AND repo=%s "
-        "AND pr_number=%s AND state IN ('queued','running') LIMIT 1",
-        (repo, pr))
+        "AND pr_number=%s AND builder_round=%s LIMIT 1",
+        (repo, pr, int(builder_round)))
     return bool(rows)
 
 

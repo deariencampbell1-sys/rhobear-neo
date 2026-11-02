@@ -540,10 +540,13 @@ def _outbox_entry(repo: str, pr: int, *, comment: str | None,
             "needs_alert": alert_fp is not None}
 
 
-def _deliver_entry(state, entry: dict, comments, alerter) -> bool:
+def _deliver_entry(state, entry: dict, comments, alerter,
+                   on_delivered=None) -> bool:
     """One delivery attempt for an outbox entry. The comment and the alert
     fail INDEPENDENTLY (a 403 comment never swallows the owner alert).
-    Returns True when nothing is pending any more."""
+    Returns True when nothing is pending any more. `on_delivered` (r4
+    HIGH D) fires exactly once when the entry becomes fully delivered —
+    the caller records the durable delivered-flag there."""
     if entry.get("needs_comment") and entry.get("comment"):
         try:
             comments(entry["repo"], int(entry["pr"]), entry["comment"])
@@ -566,20 +569,129 @@ def _deliver_entry(state, entry: dict, comments, alerter) -> bool:
             log.warning("kronos notify: owner alert %s failed (%s) — stays "
                         "in the outbox", entry["alert_fp"],
                         type(exc).__name__)
-    return not (entry.get("needs_comment") or entry.get("needs_alert"))
+    done = not (entry.get("needs_comment") or entry.get("needs_alert"))
+    if done and on_delivered is not None:
+        try:
+            on_delivered(entry)
+        except Exception as exc:  # noqa: BLE001 — delivery already happened
+            log.warning("kronos notify: delivered-flag write failed for "
+                        "%s#%s (%s) — the reconstruction may notify once "
+                        "more", entry.get("repo"), entry.get("pr"),
+                        type(exc).__name__)
+    return done
 
 
-def drain_notify_outbox(state, comments, alerter) -> None:
+def drain_notify_outbox(state, comments, alerter, *, budget_left=None,
+                        on_delivered=None) -> None:
     """Retry every pending notification from earlier passes. An entry leaves
-    the outbox only when its comment AND its alert are both delivered."""
+    the outbox only when its comment AND its alert are both delivered.
+    r4 MEDIUM E — the clock is checked BEFORE each entry: once the pass
+    budget is gone the drain stops and the rest stay pending (never a call
+    started past the deadline)."""
     box = state.slot("notify_outbox")
     for key in list(box):
+        if budget_left is not None and budget_left() <= 0:
+            log.info("kronos notify: pass budget gone — %d outbox "
+                     "entries stay pending", len(box))
+            break
         entry = box.get(key)
         if not isinstance(entry, dict):
             box.pop(key, None)
             continue
-        if _deliver_entry(state, entry, comments, alerter):
+        if _deliver_entry(state, entry, comments, alerter,
+                          on_delivered=on_delivered):
             box.pop(key, None)
+
+
+# ---------------------------------------------------------------------------
+# r4 HIGH D — the outbox is RECONSTRUCTED from durable DB state
+# ---------------------------------------------------------------------------
+
+#: Committed Kronos decisions (the stop marker, or Kronos's own escalation
+#: row — both carry detail.kronos) whose owner notification was never marked
+#: delivered. The old outbox lived only in the state file: a process death
+#: between the DB COMMIT and the state flush lost the entry and the owner
+#: never heard. The DB rows are the durable record.
+_NOTIFY_RECONSTRUCT_SQL = (
+    "SELECT repo, pr_number, detail FROM neo_actions "
+    "WHERE phase='escalated' "
+    "AND COALESCE(detail->'kronos_notified','false'::jsonb) "
+    "<> 'true'::jsonb "
+    "AND (detail->'kronos_stop' = 'true'::jsonb "
+    "     OR (detail->'kronos' = 'true'::jsonb "
+    "         AND position('kronos:' in "
+    "                      detail->>'advice_id') = 1)) "
+    "ORDER BY id"
+)
+
+
+def _round_count(db, repo: str, pr: int) -> int:
+    try:
+        rows = db.rows(
+            "SELECT COUNT(*) AS n FROM neo_actions WHERE repo=%s "
+            "AND pr_number=%s AND phase='builder'", (repo, pr))
+        return int(rows[0]["n"]) if rows else 0
+    except Exception:  # noqa: BLE001 — the comment's wording, best-effort
+        return 0
+
+
+def reconstruct_pending_notifications(db, state) -> int:
+    """HIGH D (r4): rebuild outbox entries for every COMMITTED Kronos
+    decision whose notification was never durably marked delivered — the
+    process-death window between the DB COMMIT and the state flush. Called
+    at the start of every judge sweep, BEFORE the outbox drains, so a
+    committed stop still alerts on a fresh pass. `mark_notified` (the
+    durable delivered-flag on the marker row) is written by the sweep's
+    on_delivered callback when the entry fully delivers; a marker is
+    therefore re-notified at most once more (at-least-once alerting).
+    Returns the number of entries (re)created."""
+    if db is None:
+        return 0
+    rows = db.rows(_NOTIFY_RECONSTRUCT_SQL)
+    recreated = 0
+    box = state.slot("notify_outbox")
+    for r in rows or []:
+        repo, pr = str(r.get("repo")), int(r.get("pr_number") or 0)
+        detail = r.get("detail") or {}
+        if isinstance(detail, str):
+            try:
+                detail = json.loads(detail)
+            except (TypeError, ValueError):
+                detail = {}
+        detail = detail if isinstance(detail, dict) else {}
+        key = f"{repo}#{pr}"
+        if key in box:
+            continue  # an undelivered entry is already pending
+        reason = str(detail.get("reason") or "")
+        rounds = _round_count(db, repo, pr)
+        if detail.get("kronos_stop") is True:
+            entry = _outbox_entry(
+                repo, pr,
+                comment=("**Kronos · stopped: 5 rounds but still red**\n\n"
+                         f"{rounds} fix rounds without two greens; nothing "
+                         "will improve by iterating in the same "
+                         "direction.\n\n"
+                         f"Reason: {reason}\n\n"
+                         "This needs a decision from a person. Zeus is off "
+                         "this PR — never a 7th round."),
+                alert_fp=f"loop:{repo}#{pr}",
+                alert_subject=f"Kronos stopped Zeus on #{pr} — needs you",
+                alert_body=f"{repo}#{pr}: {reason}")
+        else:
+            work_order = detail.get("work_order") or {}
+            plan = str(work_order.get("summary") or "")
+            entry = _outbox_entry(
+                repo, pr,
+                comment=("**Kronos · judged this loop**\n\n"
+                         f"{rounds} fix rounds without two greens; asking "
+                         "whether iterating further helps.\n\n"
+                         f"Reason: {reason}\n\n"
+                         f"Proposal (one escalated round, never a 7th):\n\n"
+                         f"{plan}"),
+                alert_fp=None, alert_subject="", alert_body="")
+        box[key] = entry
+        recreated += 1
+    return recreated
 
 
 # ---------------------------------------------------------------------------
@@ -620,6 +732,16 @@ def judge_pr(cfg, db, *, comments, alerter, state, repo: str, pr: int,
     if db.rows("SELECT 1 FROM neo_actions WHERE phase='escalating' "
                "AND repo = %s AND pr_number = %s LIMIT 1", (repo, pr)):
         return JudgeOutcome("skip", "Zeus advisor escalation is in flight")
+    # r4 HIGH C — Zeus's take_escalation leaves a durable in-flight marker
+    # (authorized interop change) until its outcome records: defer whenever
+    # it exists. This closes the consume-then-act gap over stale history,
+    # where the quiet-window recency defer could not see the marker.
+    if db.rows("SELECT 1 FROM neo_actions WHERE phase='escalation-inflight' "
+               "AND repo = %s AND pr_number = %s LIMIT 1", (repo, pr)):
+        return JudgeOutcome(
+            "deferred",
+            "Zeus escalation is mid-flight (in-flight marker present) — "
+            "deferring")
     if db.rows("SELECT 1 FROM neo_actions WHERE phase='escalated' "
                "AND detail->'advisor_round' IS NOT NULL "
                "AND repo = %s AND pr_number = %s LIMIT 1", (repo, pr)):
@@ -798,6 +920,13 @@ def _escalate(cfg, writes, comments, alerter, state, marker, repo, pr, rounds,
             # r3 HIGH 1 — the fresh-only insert hit an EXISTING job row: the
             # owner is told (Kronos never re-arms it; that is the ruling).
             fp = f"job-conflict:{repo}#{pr}"
+            # r4 MEDIUM F — record WHICH round conflicted so the resolution
+            # pass can check that exact job's existence in ANY state.
+            try:
+                state.slot("job_conflicts")[f"{repo}#{pr}"] = int(new_round)
+            except Exception as exc:  # noqa: BLE001 — never stops the sweep
+                log.warning("kronos job-conflict round not recorded (%s)",
+                            type(exc).__name__)
             try:
                 alerter.alert(
                     fp, f"Kronos: a round-{new_round} Zeus job already "
