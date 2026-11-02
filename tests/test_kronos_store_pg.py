@@ -212,3 +212,82 @@ def test_concurrent_escalations_produce_exactly_one_row(fresh):
             "AND repo=%s AND pr_number=%s AND builder_round=6",
             (repo, pr)).fetchone()[0]
     assert n == 1, "two builder jobs for the same round"
+
+
+# ---------------------------------------------------------------------------
+# r3 (HIGH 1) — the job write is FRESH-ONLY: a pre-existing job (parked or
+# expired-running) is never re-armed; on conflict the decision defers and
+# the owner is alerted (the alert half is tests/test_kronos_r3.py).
+# ---------------------------------------------------------------------------
+
+def _backdate(dsn, repo: str, pr: int, *, hours: float = 3.0) -> None:
+    """Make the PR look quiet: at judge time a real loop's rows are hours
+    old. (The r3 store defers on recent activity — Zeus may be mid-flight.)"""
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute(
+            "UPDATE neo_actions SET created_at = now() - make_interval("
+            "hours => %s) WHERE repo=%s AND pr_number=%s",
+            (hours, repo, pr))
+        c.execute(
+            "UPDATE neo_jobs SET created_at = now() - make_interval("
+            "hours => %s), updated_at = now() - make_interval(hours => %s) "
+            "WHERE kind='builder' AND repo=%s AND pr_number=%s",
+            (hours, hours, repo, pr))
+
+
+def test_pre_existing_parked_round_six_job_is_never_rearmed(fresh):
+    """HIGH 1 — an orphan/legacy round-six job parked in neo_jobs must stay
+    parked: Kronos's write is a fresh-only INSERT ... ON CONFLICT DO NOTHING,
+    never the re-arming upsert Jobs.create_builder uses."""
+    repo, pr = "o/r", 900
+    _builder_rounds(fresh, repo, pr, 5)
+    with psycopg.connect(fresh, autocommit=True) as c:
+        c.execute(
+            "INSERT INTO neo_jobs (kind, repo, pr_number, head_sha, "
+            "wake_color, builder_round, state, outcome, payload) "
+            "VALUES ('builder', %s, %s, %s, false, 6, 'parked', 'parked', '{}')",
+            (repo, pr, "h" * 40))
+    _backdate(fresh, repo, pr)
+    writes = SqlWrites(fresh)
+    ok, note = writes.escalate(
+        repo, pr, "h" * 40, advisor_round=6,
+        detail={"advisor_round": 6}, builder_payload={"escalated": True})
+    assert not ok, "Kronos re-armed an existing parked round-six job"
+    assert "already exists" in note.lower(), note
+    with psycopg.connect(fresh) as c:
+        row = c.execute(
+            "SELECT state, outcome FROM neo_jobs WHERE kind='builder' "
+            "AND repo=%s AND pr_number=%s AND builder_round=6",
+            (repo, pr)).fetchone()
+    assert row == ("parked", "parked"), \
+        f"the parked job was re-queued: {row}"
+    assert _escalated_rows(fresh, repo, pr) == [], \
+        "the escalated marker was written despite the job conflict"
+
+
+def test_pre_existing_expired_running_job_is_never_rearmed(fresh):
+    """HIGH 1 — a round-six job whose lease expired (the old upsert's
+    re-arm branch) must NOT be re-queued by Kronos."""
+    repo, pr = "o/r", 901
+    _builder_rounds(fresh, repo, pr, 5)
+    with psycopg.connect(fresh, autocommit=True) as c:
+        c.execute(
+            "INSERT INTO neo_jobs (kind, repo, pr_number, head_sha, "
+            "wake_color, builder_round, state, lease_expires, payload) "
+            "VALUES ('builder', %s, %s, %s, false, 6, 'running', "
+            "now() - interval '1 hour', '{}')",
+            (repo, pr, "h" * 40))
+    _backdate(fresh, repo, pr)
+    writes = SqlWrites(fresh)
+    ok, note = writes.escalate(
+        repo, pr, "h" * 40, advisor_round=6,
+        detail={"advisor_round": 6}, builder_payload={"escalated": True})
+    assert not ok, "Kronos re-armed an expired-running round-six job"
+    assert "already exists" in note.lower(), note
+    with psycopg.connect(fresh) as c:
+        row = c.execute(
+            "SELECT state FROM neo_jobs WHERE kind='builder' "
+            "AND repo=%s AND pr_number=%s AND builder_round=6",
+            (repo, pr)).fetchone()
+    assert row == ("running",), f"the expired job was re-queued: {row}"
+    assert _escalated_rows(fresh, repo, pr) == []
