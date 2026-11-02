@@ -885,3 +885,230 @@ def test_state_is_not_documented_as_a_remedy_ledger():
     from src.kronos import KronosState
     doc = KronosState.__doc__ or ""
     assert "remedy ledger" not in doc, doc
+
+
+# ===========================================================================
+# r4 (ASTRA re-review, issuecomment-6580532298) — fix round 4
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# r4 HIGH A — the review proof is TRI-STATE (PROVEN_GREEN / PROVEN_NOT_GREEN /
+# UNREADABLE). An unreadable or PARTIAL review fetch defers (fail closed),
+# both BEFORE the model and under the decision CAS. The reviews endpoint is
+# PAGINATED, and a non-empty current head SHA is required.
+# ---------------------------------------------------------------------------
+
+class FakePagedGithubR4:
+    """api.github.com with page-controlled reviews and fault injection. The
+    reviews list is served per page (?page=N); status/raw overrides fail the
+    fetch the way a 403/500/garbage body does in production."""
+
+    def __init__(self, *, head: str = HEAD, reviews_pages=None,
+                 reviews_status: int = 200, reviews_raw=None,
+                 pulls_status: int = 200, pulls_raw=None,
+                 page_status_overrides=None):
+        self.head = head
+        self.reviews_pages = list(reviews_pages or [])
+        self.reviews_status = reviews_status
+        self.reviews_raw = reviews_raw
+        self.pulls_status = pulls_status
+        self.pulls_raw = pulls_raw
+        self.page_status_overrides = dict(page_status_overrides or {})
+        self.calls: list[dict] = []
+
+    def __call__(self, method, url, *, headers=None, body=None, timeout=30):
+        self.calls.append({"method": method, "url": url, "timeout": timeout})
+        if "/reviews" in url:
+            from urllib.parse import parse_qs, urlsplit
+            page = int((parse_qs(urlsplit(url).query).get("page")
+                        or ["1"])[0])
+            status = self.page_status_overrides.get(page, self.reviews_status)
+            if self.reviews_raw is not None:
+                return status, self.reviews_raw
+            idx = page - 1
+            pages = self.reviews_pages or [[]]
+            if idx >= len(pages):
+                return status, json.dumps([])
+            return status, json.dumps(pages[idx])
+        if "/pulls/" in url:
+            if self.pulls_raw is not None:
+                return self.pulls_status, self.pulls_raw
+            return self.pulls_status, json.dumps(
+                {"state": "open", "merged": False, "draft": False,
+                 "head": {"sha": self.head}})
+        return 200, "{}"
+
+
+def _dummy_reviews(n: int, *, commit: str = "d" * 40) -> list[dict]:
+    return [{"user": {"login": f"filler-{i}"}, "state": "COMMENTED",
+             "commit_id": commit} for i in range(n)]
+
+
+def _apollo_approval(*, commit: str = HEAD) -> dict:
+    return {"user": {"login": APOLLO}, "state": "APPROVED",
+            "commit_id": commit}
+
+
+def _second_approval(*, commit: str = HEAD) -> dict:
+    return {"user": {"login": "the-architect"}, "state": "APPROVED",
+            "commit_id": commit}
+
+
+def test_reviews_403_defers_before_the_model():
+    """A 403 from the reviews endpoint is UNREADABLE, not 'no proof': the
+    judge defers (fail closed) — it never sends the PR to Summit on an
+    unproven gate."""
+    db = FakeDbR3()
+    github = FakePagedGithubR4(reviews_status=403,
+                               reviews_pages=[[_apollo_approval()]])
+    http = FakeHttpR3(GOOD_NO)
+    writes = FakeWritesR3()
+    outcome = _judge_pr(db, github=github, http=http, writes=writes)
+    assert outcome.action == "deferred", outcome
+    assert "unreadable" in outcome.reason.lower(), outcome
+    assert http.calls == [], "the model was called on an unreadable review gate"
+    assert writes.stops == [] and writes.escalates == []
+
+
+def test_reviews_500_at_the_write_defers_under_the_cas():
+    """The reviews endpoint starts answering 500 between the model call and
+    the CAS write: the authority re-check must refuse (UNREADABLE is not
+    'not green') — no stop marker, no comment, no alert."""
+    db = FakeDbR3()
+    github = FakePagedGithubR4(reviews_pages=[[_apollo_approval()]])
+    http = FakeHttpR3(GOOD_NO, on_call=lambda: setattr(
+        github, "reviews_status", 500))
+    writes = FakeWritesR3()
+    comments = FakeCommentsR3()
+    alerter = FakeAlerterR3()
+    state = FakeStateR3()
+    outcome = _judge_pr(db, github=github, http=http, writes=writes,
+                        comments=comments, alerter=alerter, state=state)
+    assert outcome.action == "deferred", outcome
+    assert writes.authority_results, "the CAS never re-checked the reviews"
+    assert any("unreadable" in r.lower() for r in writes.authority_results), \
+        writes.authority_results
+    assert writes.stops == [] and writes.escalates == []
+    assert comments.posted == [] and alerter.alerts == []
+    assert "o/r#52" not in state.slot("judged")
+
+
+def test_reviews_invalid_json_defers_before_the_model():
+    """A malformed reviews body is UNREADABLE — defer, never judge blind."""
+    db = FakeDbR3()
+    github = FakePagedGithubR4(reviews_raw="<html>gateway error</html>")
+    http = FakeHttpR3(GOOD_NO)
+    outcome = _judge_pr(db, github=github, http=http)
+    assert outcome.action == "deferred", outcome
+    assert http.calls == []
+
+
+def test_reviews_second_page_is_consulted_before_the_model():
+    """The two-green proof must paginate: Apollo's approval fills page 1
+    (exactly PER_PAGE rows) and the second approval sits on page 2 — the PR
+    is PROVEN green and skipped, no Summit call."""
+    from src.kronos.judge import REVIEWS_PER_PAGE
+    page1 = _dummy_reviews(REVIEWS_PER_PAGE - 1) + [_apollo_approval()]
+    db = FakeDbR3()
+    github = FakePagedGithubR4(reviews_pages=[page1, [_second_approval()]])
+    http = FakeHttpR3(GOOD_NO)
+    outcome = _judge_pr(db, github=github, http=http)
+    assert outcome.action == "skip", outcome
+    review_calls = [c for c in github.calls if "/reviews" in c["url"]]
+    assert len(review_calls) >= 2, \
+        f"the reviews endpoint was not paginated: {review_calls}"
+    assert any("page=2" in c["url"] for c in review_calls), review_calls
+    assert http.calls == []
+
+
+def test_reviews_second_page_green_at_the_write_refuses_the_cas():
+    """The SAME paginated proof under the CAS: the second approval arrives on
+    page 2 while the write is in flight — the authority re-check refuses."""
+    from src.kronos.judge import REVIEWS_PER_PAGE
+    page1 = _dummy_reviews(REVIEWS_PER_PAGE - 1) + [_apollo_approval()]
+    db = FakeDbR3()
+    github = FakePagedGithubR4(reviews_pages=[[_apollo_approval()]])
+
+    def _grow_pages():
+        github.reviews_pages = [page1, [_second_approval()]]
+
+    http = FakeHttpR3(GOOD_NO, on_call=_grow_pages)
+    writes = FakeWritesR3()
+    outcome = _judge_pr(db, github=github, http=http, writes=writes)
+    assert outcome.action == "deferred", outcome
+    assert any("green" in r.lower() for r in writes.authority_results), \
+        writes.authority_results
+    assert writes.stops == [] and writes.escalates == []
+
+
+def test_partial_page_failure_defers_before_the_model():
+    """Page 1 is a FULL page and page 2 fails (500): the fetch is PARTIAL —
+    an approval may hide on the missing page — so the proof is UNREADABLE
+    and the judge defers. Treating a partial fetch as 'not green' sends
+    actually-green PRs to Summit."""
+    from src.kronos.judge import REVIEWS_PER_PAGE
+    page1 = _dummy_reviews(REVIEWS_PER_PAGE)   # full page -> page 2 exists
+    db = FakeDbR3()
+    github = FakePagedGithubR4(reviews_pages=[page1],
+                               page_status_overrides={2: 500})
+    http = FakeHttpR3(GOOD_NO)
+    outcome = _judge_pr(db, github=github, http=http)
+    assert outcome.action == "deferred", outcome
+    assert "unreadable" in outcome.reason.lower(), outcome
+    assert http.calls == []
+
+
+def test_partial_page_failure_at_the_write_defers_under_the_cas():
+    """The CAS sees a partial fetch too: page 1 grows to a full page and
+    page 2 starts failing while the model answers — the write is refused."""
+    from src.kronos.judge import REVIEWS_PER_PAGE
+    full1 = _dummy_reviews(REVIEWS_PER_PAGE - 1) + [_apollo_approval()]
+    db = FakeDbR3()
+    github = FakePagedGithubR4(reviews_pages=[[_apollo_approval()]])
+
+    def _break_paging():
+        github.reviews_pages = [full1]
+        github.page_status_overrides = {2: 503}
+
+    http = FakeHttpR3(GOOD_NO, on_call=_break_paging)
+    writes = FakeWritesR3()
+    outcome = _judge_pr(db, github=github, http=http, writes=writes)
+    assert outcome.action == "deferred", outcome
+    assert any("unreadable" in r.lower() for r in writes.authority_results), \
+        writes.authority_results
+    assert writes.stops == [] and writes.escalates == []
+
+
+def test_missing_head_sha_defers_before_the_model():
+    """A 200 pulls response with NO head SHA proves nothing about the current
+    head — it must not pass the gate (the r3 code accepted it and skipped the
+    head comparison)."""
+    db = FakeDbR3()
+    github = FakePagedGithubR4(
+        pulls_raw=json.dumps({"state": "open", "merged": False,
+                              "draft": False, "head": {}}))
+    http = FakeHttpR3(GOOD_NO)
+    writes = FakeWritesR3()
+    outcome = _judge_pr(db, github=github, http=http, writes=writes)
+    assert outcome.action == "deferred", outcome
+    assert http.calls == [], "the model was called without a provable head"
+    assert writes.stops == [] and writes.escalates == []
+
+
+def test_reviews_timeout_defers_before_the_model():
+    """A transport failure (timeout) while fetching reviews is UNREADABLE —
+    defer, never treat the exception as 'no approvals'."""
+    db = FakeDbR3()
+
+    class _Boom:
+        def __call__(self, method, url, *, headers=None, body=None,
+                     timeout=30):
+            if "/reviews" in url:
+                raise TimeoutError("timed out")
+            return 200, json.dumps({"state": "open", "merged": False,
+                                    "head": {"sha": HEAD}})
+
+    http = FakeHttpR3(GOOD_NO)
+    outcome = _judge_pr(db, github=_Boom(), http=http)
+    assert outcome.action == "deferred", outcome
+    assert http.calls == []

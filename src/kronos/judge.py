@@ -18,6 +18,14 @@ the PR's CURRENT state is proven, never assumed from the round history:
   - the SAME-head two-green proof (Apollo ACCEPT + a second approval, both
     bound to the current head — the merge rule's greens (b)+(c)) -> skip.
 
+r4 (HIGH A): the review proof is TRI-STATE (PROVEN_GREEN / PROVEN_NOT_GREEN /
+UNREADABLE) and PAGINATED. A reviews fetch that fails (403/500/timeout/garbage)
+or cannot be proven complete (a full page whose successor is unreadable) is
+UNREADABLE — the judge DEFERS (fail closed), both before the model and under
+the decision CAS; it never reads as "not green". A 200 pulls response without
+a head SHA is also unreadable: the same-head proof requires a non-empty
+current head.
+
 r3 (HIGH 6): the installation identity must be PROVEN from the authoritative
 rows Zeus writes (neo_jobs.payload / a recorded identity) — Zeus's builder
 action rows do not carry it. Unproven -> the judge defers loudly instead of
@@ -100,6 +108,20 @@ REDACT_FAILED_REASON = (
 
 API_GITHUB = "https://api.github.com"
 
+# r4 (HIGH A) — the review proof is TRI-STATE. A review fetch that fails, is
+# partial, or cannot be proven complete is UNREADABLE — never "no proof":
+# the judge defers (fail closed) instead of sending an actually-green PR to
+# Summit. The reviews endpoint is paginated, and the current head SHA must
+# be non-empty for any head-bound proof.
+REVIEWS_PER_PAGE = 100
+#: Pages fetched before a still-full stream counts as UNREADABLE (the proof
+#: must be able to say "I saw every review"; 10 x 100 reviews is far beyond
+#: any real fix-loop PR).
+MAX_REVIEW_PAGES = 10
+PROVEN_GREEN = "proven-green"
+PROVEN_NOT_GREEN = "proven-not-green"
+UNREADABLE = "unreadable"
+
 
 class JudgeTimeout(Exception):
     """Summit did not answer inside the budget — a stop, not a retry."""
@@ -148,52 +170,99 @@ def pr_authoritative(github, repo: str, pr: int, *, token: str = "",
         return PRAuthState(False, f"GitHub PR state -> HTTP {status}")
     try:
         data = json.loads(raw)
-        return PRAuthState(
-            True, "",
-            merged=bool(data.get("merged")),
-            closed=str(data.get("state") or "") == "closed",
-            head_sha=str((data.get("head") or {}).get("sha") or ""))
     except (TypeError, ValueError) as exc:
         return PRAuthState(False, f"GitHub PR state malformed: "
                                   f"{type(exc).__name__}")
+    # r4 (HIGH A) — a 200 WITHOUT a head SHA proves nothing about the
+    # current head: the head comparison and the same-head greens could
+    # silently pass. Fail closed.
+    head_sha = str((data.get("head") or {}).get("sha") or "")
+    if not head_sha:
+        return PRAuthState(False, "GitHub PR state carries no head SHA")
+    return PRAuthState(
+        True, "",
+        merged=bool(data.get("merged")),
+        closed=str(data.get("state") or "") == "closed",
+        head_sha=head_sha)
+
+
+def review_proof(github, repo: str, pr: int, head_sha: str, *,
+                 token: str = "", timeout: int = 15,
+                 apollo_login: str = "rhobear-reviews[bot]",
+                 per_page: int = REVIEWS_PER_PAGE,
+                 max_pages: int = MAX_REVIEW_PAGES) -> str:
+    """The SAME-head review proof as a TRI-STATE (r4 HIGH A):
+
+      PROVEN_GREEN      Apollo's ACCEPT plus a second approval, both bound to
+                        this exact head — merge rule greens (b)+(c);
+      PROVEN_NOT_GREEN  every relevant review was READ and the proof is
+                        absent;
+      UNREADABLE        the fetch failed (transport, non-200, malformed), OR
+                        it cannot be proven complete (a full page whose
+                        successor is unreadable, or more than `max_pages`
+                        pages) — an approval may hide on the missing data.
+
+    Only a PROVEN_GREEN may skip a PR. UNREADABLE defers (fail closed),
+    both before the model and inside the decision CAS. Reviews are
+    PAGINATED: page after page until a short page proves the end."""
+    if not head_sha:
+        return UNREADABLE
+    headers = {"Accept": "application/vnd.github+json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    green1 = green2 = False
+    page = 1
+    while True:
+        try:
+            status, raw = github(
+                "GET",
+                f"{API_GITHUB}/repos/{repo}/pulls/{pr}/reviews"
+                f"?per_page={int(per_page)}&page={page}",
+                headers=headers, timeout=timeout)
+        except Exception:  # noqa: BLE001 — unreadable, not a crash
+            return UNREADABLE
+        if status != 200:
+            return UNREADABLE
+        try:
+            reviews = json.loads(raw)
+        except (TypeError, ValueError):
+            return UNREADABLE
+        if not isinstance(reviews, list):
+            return UNREADABLE
+        for review in reviews:
+            if not isinstance(review, dict):
+                continue
+            if str(review.get("state") or "") != "APPROVED":
+                continue
+            if str(review.get("commit_id") or "") != head_sha:
+                continue
+            login = str((review.get("user") or {}).get("login") or "")
+            if login and login == apollo_login:
+                green1 = True
+            else:
+                green2 = True
+        if len(reviews) < per_page:
+            # A short page proves the stream ended — the read is COMPLETE.
+            break
+        page += 1
+        if page > max_pages:
+            # Still full after max_pages: completeness is unprovable here.
+            return UNREADABLE
+    if green1 and green2:
+        return PROVEN_GREEN
+    return PROVEN_NOT_GREEN
 
 
 def two_greens_on_head(github, repo: str, pr: int, head_sha: str, *,
                        token: str = "", timeout: int = 15,
                        apollo_login: str = "rhobear-reviews[bot]") -> bool:
-    """The SAME-head two-green proof (merge rule greens (b)+(c), read-only):
-    Apollo's ACCEPT review on this exact head plus a second approval
-    (architect or trusted reviewer) on the same head. A fetch failure is
-    `no proof` — the gate only ever SKIPS on positive evidence."""
-    headers = {"Accept": "application/vnd.github+json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    try:
-        status, raw = github(
-            "GET", f"{API_GITHUB}/repos/{repo}/pulls/{pr}/reviews?per_page=100",
-            headers=headers, timeout=timeout)
-    except Exception:  # noqa: BLE001 — no proof is not a crash
-        return False
-    if status != 200:
-        return False
-    try:
-        reviews = json.loads(raw)
-    except (TypeError, ValueError):
-        return False
-    green1 = green2 = False
-    for review in reviews or []:
-        if not isinstance(review, dict):
-            continue
-        if str(review.get("state") or "") != "APPROVED":
-            continue
-        if str(review.get("commit_id") or "") != head_sha:
-            continue
-        login = str((review.get("user") or {}).get("login") or "")
-        if login and login == apollo_login:
-            green1 = True
-        else:
-            green2 = True
-    return green1 and green2
+    """Boolean view of the same-head two-green proof (r4 HIGH A): True only
+    on PROVEN_GREEN. UNREADABLE and PROVEN_NOT_GREEN are both False here —
+    the judge's gate itself uses `review_proof` so an unreadable fetch
+    defers instead of reading as 'not green'."""
+    return review_proof(github, repo, pr, head_sha, token=token,
+                        timeout=timeout, apollo_login=apollo_login) \
+        == PROVEN_GREEN
 
 
 # ---------------------------------------------------------------------------
@@ -588,14 +657,27 @@ def judge_pr(cfg, db, *, comments, alerter, state, repo: str, pr: int,
     if state_now.merged or state_now.closed:
         return JudgeOutcome("skip",
                             "merged/closed on GitHub — nothing to judge")
-    if state_now.head_sha and state_now.head_sha != head_sha:
+    # r4 HIGH A — the same-head proof needs a non-empty current head SHA and
+    # a tri-state review read: UNREADABLE defers (fail closed), never reads
+    # as "not green".
+    if not head_sha:
+        return JudgeOutcome(
+            "deferred",
+            "no recorded head SHA — the same-head greens cannot be proven")
+    if state_now.head_sha != head_sha:
         return JudgeOutcome(
             "deferred",
             f"PR head moved ({state_now.head_sha[:12]} != recorded "
             f"{head_sha[:12]}) — Zeus is mid-flight on a newer head")
-    if state_now.head_sha and two_greens_on_head(
-            github, repo, pr, state_now.head_sha, token=read_token,
-            timeout=github_timeout, apollo_login=apollo_login):
+    proof = review_proof(github, repo, pr, state_now.head_sha,
+                         token=read_token, timeout=github_timeout,
+                         apollo_login=apollo_login)
+    if proof == UNREADABLE:
+        return JudgeOutcome(
+            "deferred",
+            "review state unreadable (reviews fetch failed or was partial) "
+            "— deferring (fail closed)")
+    if proof == PROVEN_GREEN:
         return JudgeOutcome(
             "skip", "two greens on the current head — the loop is over")
 
@@ -604,19 +686,28 @@ def judge_pr(cfg, db, *, comments, alerter, state, repo: str, pr: int,
 
     def _authority() -> tuple[bool, str]:
         """r3 HIGH 2 — the SAME proof again, under the decision CAS (the
-        writer holds the per-PR advisory lock while this runs)."""
+        writer holds the per-PR advisory lock while this runs). r4 HIGH A —
+        the review read is the tri-state `review_proof`: UNREADABLE refuses
+        the write (fail closed), it never reads as "not green"."""
         st = pr_authoritative(github, repo, pr, token=read_token,
                               timeout=github_timeout)
         if not st.ok:
             return False, f"GitHub state unreadable at the write: {st.reason}"
         if st.merged or st.closed:
             return False, "PR merged/closed before the write"
-        if st.head_sha and st.head_sha != head_sha:
+        if not st.head_sha:
+            return False, "no current head SHA at the write"
+        if st.head_sha != head_sha:
             return False, (f"PR head moved before the write "
                            f"({st.head_sha[:12]} != {head_sha[:12]})")
-        if st.head_sha and two_greens_on_head(
-                github, repo, pr, st.head_sha, token=read_token,
-                timeout=github_timeout, apollo_login=apollo_login):
+        proof = review_proof(github, repo, pr, st.head_sha, token=read_token,
+                             timeout=github_timeout,
+                             apollo_login=apollo_login)
+        if proof == UNREADABLE:
+            return False, ("review state unreadable at the write (reviews "
+                           "fetch failed or was partial) — deferring "
+                           "(fail closed)")
+        if proof == PROVEN_GREEN:
             return False, "two greens on the current head before the write"
         return True, ""
 
