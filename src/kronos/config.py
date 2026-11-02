@@ -56,8 +56,13 @@ class KronosConfig:
     # --- state ---
     reviews_database_url: str = field(default_factory=lambda: _get(
         "REVIEWS_DATABASE_URL"))
+    # HIGH 1 — the state dir is DURABLE: the r1 default (/run/rhobear-kronos)
+    # is a RuntimeDirectory that systemd wipes when this oneshot stops (and
+    # a reboot clears /run), so the alert dedupe, flap windows and judged
+    # markers started empty EVERY five-minute pass. The unit mounts a
+    # StateDirectory at /var/lib/rhobear-kronos and points this at it.
     state_dir: str = field(default_factory=lambda: _get(
-        "RHOBEAR_KRONOS_STATE_DIR", "/run/rhobear-kronos"))
+        "RHOBEAR_KRONOS_STATE_DIR", "/var/lib/rhobear-kronos"))
 
     # --- GitHub identities: the two Apps ---
     # App ids are not secrets. Keys: PEM path (vault-env's decoded alias) or
@@ -125,11 +130,15 @@ class KronosConfig:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def required() -> "KronosConfig":
+    def required(state_dir: str | None = None) -> "KronosConfig":
         """A config fit for a real pass. Missing required env raises
         RuntimeError naming the VAULT key to provision — values are never
-        printed, logged or stored."""
-        cfg = KronosConfig()
+        printed, logged or stored. (HIGH 9: every real pass boots through
+        this, and the documented vault key PATH files are loaded into the
+        App keys HERE, once — call sites pass PEM text to GitHubApp, never
+        a path string.)"""
+        cfg = KronosConfig(state_dir=state_dir) if state_dir \
+            else KronosConfig()
         missing: list[str] = []
         if not cfg.reviews_database_url:
             missing.append(

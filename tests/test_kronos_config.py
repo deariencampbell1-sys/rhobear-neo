@@ -125,6 +125,9 @@ def test_app_identity_gets_the_loaded_pem_never_the_path(monkeypatch,
     monkeypatch.setenv("RHOBEAR_KRONOS_ZEUS_APP_ID", "999")
     monkeypatch.setenv("RHOBEAR_KRONOS_ZEUS_APP_KEY_PATH", str(pem))
     monkeypatch.delenv("RHOBEAR_KRONOS_ZEUS_APP_KEY", raising=False)
+    # the reviews App identity, as fake test values (required() wants both)
+    monkeypatch.setenv("RHOBEAR_KRONOS_REVIEWS_APP_ID", "2")
+    monkeypatch.setenv("RHOBEAR_KRONOS_REVIEWS_APP_KEY", "fake")
     monkeypatch.setenv("REVIEWS_DATABASE_URL", "postgresql://fake/fake")
 
     seen: list[tuple[str, str]] = []

@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import subprocess
 
+import pytest
+
 from src.kronos.__main__ import main, run_pass
 from src.kronos.checks import CheckResult
 from src.kronos.config import KronosConfig
@@ -135,7 +137,7 @@ def test_lock_release_never_unlinks_the_lockfile(tmp_path):
     file on POSIX: a waiter that opened the old inode between unlock and
     unlink would hold a lock on a file the next pass replaces — two passes
     both believing they own the lock. The inode must be stable."""
-    import fcntl
+    fcntl = pytest.importorskip("fcntl", reason="POSIX flock only")
     import os
     from src.kronos import PassLock
 
@@ -182,18 +184,27 @@ def test_lock_is_reacquirable_after_release(tmp_path):
 
 class _FakeAlerter:
     """Stands in for the GitHub Alerter (the thing under test is run_pass's
-    dispatch, not the GitHub client)."""
+    dispatch, not the GitHub client). Carries the same 6-hour dedupe
+    semantics as the real Alerter so repeat passes are honest."""
 
-    def __init__(self):
+    def __init__(self, clock=None, window_secs: int = 6 * 3600):
         self.alerts: list[tuple[str, str, str]] = []
-        self.resolved: list[str] = []
+        self.closes: list[str] = []      # (the resolved() method must keep
+        self.window: dict[str, float] = {}  # its name — do NOT shadow it)
+        self.clock = clock or [1_000_000.0]
+        self.window_secs = window_secs
 
     def alert(self, fingerprint, subject, body):
+        last = self.window.get(fingerprint)
+        if last is not None and self.clock[0] - last < self.window_secs:
+            return "suppressed"
+        self.window[fingerprint] = self.clock[0]
         self.alerts.append((fingerprint, subject, body))
         return "created"
 
     def resolved(self, fingerprint, note):
-        self.resolved.append(fingerprint)
+        self.closes.append(fingerprint)
+        self.window.pop(fingerprint, None)
 
 
 def _run_pass(services, tmp_path, *, state=None, cfg=None, out=None,
@@ -224,7 +235,7 @@ def test_unrunnable_check_becomes_broken_and_alerts(tmp_path, monkeypatch):
     fake.results = None
     alerter = _FakeAlerter()
     monkeypatch.setattr("src.kronos.__main__._alerter",
-                        lambda cfg, state, now_fn: alerter)
+                        lambda cfg, state, now_fn, **kw: alerter)
     rc, lines, _state = _run_pass(fake, tmp_path)
     assert rc == 0, "a broken check must never crash the pass"
     assert any("unit:rhobear-neo" in l and "broken" in l and
@@ -247,7 +258,7 @@ def test_every_broken_check_alerts_with_a_stable_fingerprint(tmp_path,
     fake.runner = db_down_runner
     alerter = _FakeAlerter()
     monkeypatch.setattr("src.kronos.__main__._alerter",
-                        lambda cfg, state, now_fn: alerter)
+                        lambda cfg, state, now_fn, **kw: alerter)
     _rc, _lines, _state = _run_pass(fake, tmp_path)
     fingerprints = {fp for fp, _s, _b in alerter.alerts}
     assert "unit-down:rhobear-neo" in fingerprints, fingerprints
@@ -260,16 +271,22 @@ def test_every_broken_check_alerts_with_a_stable_fingerprint(tmp_path,
     # fixed: the unit is active again -> the alert closes
     fake.runner = FakeServices().runner
     _rc3, _l3, _s3 = _run_pass(fake, tmp_path)
-    assert "unit-down:rhobear-neo" in alerter.resolved, alerter.resolved
+    assert "unit-down:rhobear-neo" in alerter.closes, alerter.closes
 
 
 def test_failed_close_is_retried_next_pass(tmp_path, monkeypatch):
     """HIGH 8 — a resolve that raises must NOT drop the open alert: the
     entry stays and the next pass retries the close."""
     fake = FakeServices()
+
+    def failing_runner(argv, *, timeout=30):
+        return subprocess.CompletedProcess(argv, 3, stdout="failed\n",
+                                           stderr="")
+
+    fake.runner = failing_runner
     alerter = _FakeAlerter()
     monkeypatch.setattr("src.kronos.__main__._alerter",
-                        lambda cfg, state, now_fn: alerter)
+                        lambda cfg, state, now_fn, **kw: alerter)
     _rc, _lines, state = _run_pass(fake, tmp_path)
     assert state.slot("open_alerts"), "nothing was alerted"
 
@@ -284,16 +301,16 @@ def test_failed_close_is_retried_next_pass(tmp_path, monkeypatch):
             raise RuntimeError("github down")
 
     monkeypatch.setattr("src.kronos.__main__._alerter",
-                        lambda cfg, state, now_fn: Exploding())
+                        lambda cfg, state, now_fn, **kw: Exploding())
     _rc2, lines2, state2 = _run_pass(fake, tmp_path)
     assert any("resolve failed" in l for l in lines2), lines2
     assert state2.slot("open_alerts"), "a failed close dropped the alert"
 
     # next pass: the close succeeds and the entry clears
     monkeypatch.setattr("src.kronos.__main__._alerter",
-                        lambda cfg, state, now_fn: alerter)
+                        lambda cfg, state, now_fn, **kw: alerter)
     _rc3, _l3, state3 = _run_pass(fake, tmp_path)
-    assert "unit-down:rhobear-neo" in alerter.resolved
+    assert "unit-down:rhobear-neo" in alerter.closes
     assert "unit-down:rhobear-neo" not in state3.slot("open_alerts")
 
 
@@ -309,7 +326,7 @@ def test_broken_unit_alert_body_carries_the_journal_tail(tmp_path,
         if "is-active" in argv:
             return subprocess.CompletedProcess(argv, 3, stdout="failed\n",
                                                stderr="")
-        if argv[:2] == ("journalctl", "-u"):
+        if argv[0] == "journalctl":
             return subprocess.CompletedProcess(
                 argv, 0, stdout="2026-11-01T10:00:00 boom 1\n"
                                 "2026-11-01T10:00:01 boom 2\n", stderr="")
@@ -320,7 +337,7 @@ def test_broken_unit_alert_body_carries_the_journal_tail(tmp_path,
     fake.runner = runner
     alerter = _FakeAlerter()
     monkeypatch.setattr("src.kronos.__main__._alerter",
-                        lambda cfg, state, now_fn: alerter)
+                        lambda cfg, state, now_fn, **kw: alerter)
     _rc, _lines, _state = _run_pass(fake, tmp_path)
     bodies = " ".join(b for _fp, _s, b in alerter.alerts)
     assert "boom 1" in bodies and "boom 2" in bodies, alerter.alerts
@@ -340,12 +357,17 @@ class _Clock:
 
 class _JudgeServices(FakeServices):
     """A fake sweep environment: 5 builder rounds in the DB, an http that
-    records the timeout the judge was given."""
+    records the timeout the judge was given. NOTE: FakeServices.__init__
+    sets self.http = [] (a recording LIST for the dry-run tests) — here the
+    http METHOD must win, so the recording list is dropped on purpose."""
 
     def __init__(self):
         super().__init__()
         self.judge_timeouts: list[int] = []
         self.comment_timeouts: list[int] = []
+        # the inherited recording list would shadow the http() method below
+        del self.http  # noqa: W420 — restore the class method
+        self.http_log: list[tuple] = []
 
     def db(self, dsn):
         class _Db:
@@ -354,6 +376,11 @@ class _JudgeServices(FakeServices):
                     return [{"repo": "o/r", "pr_number": 52,
                              "rounds": 5, "head_sha": "f" * 40,
                              "detail": "{}"}]
+                if "ORDER BY id ASC" in sql:
+                    return [{"round": i, "head_sha": f"{i:04d}" * 10,
+                             "verdict": "BOUNCE", "tree_sha": f"t{i}",
+                             "diff_stat": "", "created_at": 0}
+                            for i in range(1, 6)]
                 return []
 
         return _Db()
@@ -408,12 +435,12 @@ def test_judge_and_comment_timeouts_are_clamped_to_the_budget(tmp_path,
 
     alerter = _FakeAlerter()
     monkeypatch.setattr("src.kronos.__main__._alerter",
-                        lambda cfg2, state, now_fn: alerter)
+                        lambda cfg2, state, now_fn, **kw: alerter)
 
     state = KronosState(str(tmp_path / "state.json"))
-    rc, _lines, _s = run_pass(cfg, dry_run=False, state=state,
-                              services=services, out=lambda l: None,
-                              now_fn=clock, mono_fn=clock)
+    rc = run_pass(cfg, dry_run=False, state=state,
+                  services=services, out=lambda l: None,
+                  now_fn=clock, mono_fn=clock)
     assert rc == 0
     assert services.judge_timeouts, "the judge never ran"
     assert max(services.judge_timeouts) <= 40, \

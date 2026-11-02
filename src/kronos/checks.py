@@ -14,7 +14,7 @@ see without root, never more.
 """
 from __future__ import annotations
 
-import socket
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
@@ -52,22 +52,35 @@ def _iso_ts(value) -> float:
 
 # ---------------------------------------------------------------------------
 # HTTP health — the three loopback services answer POST-only webhooks, so
-# "listening and answering" is the health signal (connection refused/timeout
-# is broken; any HTTP response means the process is alive).
+# "answering an HTTP request at all" is the health signal (r2, MEDIUM 2: a
+# real bounded HTTP request — TCP-connect-only called a service that binds
+# but never answers healthy). Connection refused / timeout / no response is
+# broken; ANY status (even 404 on a GET against a POST-only webhook) is ok.
 # ---------------------------------------------------------------------------
 
-def http_health(name: str, url: str, *, timeout: float = 5.0,
-                connect=None) -> CheckResult:
-    parts = urlsplit(url)
-    host, port = parts.hostname or "127.0.0.1", parts.port or 80
-    connect = connect or socket.create_connection
+def _default_http_request(url: str, timeout: float) -> tuple[int, str]:
+    """One bounded GET. Returns (status, body); raises on no-HTTP."""
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(url, method="GET")
     try:
-        with connect((host, port), timeout=timeout):
-            return CheckResult(name, OK, f"listening on {host}:{port}")
-    except OSError as exc:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read(4096).decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read(4096).decode("utf-8", "replace")
+
+
+def http_health(name: str, url: str, *, timeout: float = 5.0,
+                request=None) -> CheckResult:
+    request = request or _default_http_request
+    try:
+        status, _body = request(url, timeout)
+    except Exception as exc:  # noqa: BLE001 — one line, no body dumped
         return CheckResult(name, BROKEN,
-                           f"not listening on {host}:{port}: "
+                           f"no HTTP answer from {url}: "
                            f"{type(exc).__name__}")
+    return CheckResult(name, OK,
+                       f"answering HTTP {status} on {url}")
 
 
 # ---------------------------------------------------------------------------
@@ -93,17 +106,22 @@ def unit_active(name: str, unit: str, *, runner) -> CheckResult:
 
 def journal_tail(unit: str, *, runner, lines: int = 20) -> str:
     """The unit's last `lines` journal lines — via journalctl when readable,
-    else via `systemctl status` (unprivileged, systemd prints them)."""
+    else via `systemctl status` (unprivileged, systemd prints them).
+
+    r2 (MEDIUM 2): reads subprocess' REAL field (returncode) — the r1 code
+    looked for an `rc` attribute a CompletedProcess does not carry.
+    """
     res = runner(["journalctl", "-u", unit, "-n", str(lines),
                   "--no-pager", "-o", "short-iso"])
     out = (getattr(res, "stdout", "") or "").strip()
-    if getattr(res, "rc", 0) == 0 and out:
+    if getattr(res, "returncode", 1) == 0 and out:
         return out
     status = runner(["systemctl", "status", unit, "-n", str(lines),
                      "--no-pager", "-l"])
-    return ((getattr(status, "stdout", "") or "")
-            or f"journal unreadable without root "
-               f"(rc={getattr(res, 'rc', '?')})")
+    fallback = ((getattr(status, "stdout", "") or "").strip())
+    return fallback or (
+        f"journal unreadable without root "
+        f"(returncode={getattr(res, 'returncode', '?')})")
 
 
 def nrestarts(unit: str, *, runner) -> int:
@@ -272,3 +290,47 @@ def credit_gated_installs(name: str, *, db, owner_install_id: str) -> CheckResul
     ids = ", ".join(str(r["install_id"]) for r in rows[:5])
     return CheckResult(name, BROKEN,
                        f"{len(rows)} install(s) gated for credits: {ids}")
+
+
+# ---------------------------------------------------------------------------
+# r2 alert-resolution queries (read-only) — every alert kind can CLOSE
+# ---------------------------------------------------------------------------
+
+def loop_resolved(db, repo: str, pr: int) -> bool:
+    """The judged-loop alert (`loop:o/r#52`) closes when the PR is out of
+    the loop: merged, or two distinct heads judged green."""
+    if db is None:
+        return False
+    merged = db.rows(
+        "SELECT 1 FROM neo_actions WHERE repo = %s AND pr_number = %s "
+        "AND phase = 'merged' LIMIT 1", (repo, pr))
+    if merged:
+        return True
+    greens = db.rows(
+        "SELECT COUNT(DISTINCT head_sha) AS greens FROM neo_actions "
+        "WHERE repo = %s AND pr_number = %s AND phase = 'builder' "
+        "AND verdict = 'ACCEPT'", (repo, pr))
+    return bool(greens) and int(greens[0].get("greens") or 0) >= 2
+
+
+def list_deliveries_via_app(http_opener=None):
+    """Factory: GET /app/hook/deliveries with the given App JWT (page 1).
+    (Moved here r2 — it is a CHECK input, not a remedy; the remedies module
+    is retired by the read-only ruling.)"""
+    from urllib.request import Request, build_opener
+
+    def _list(jwt: str, *, per_page: int = 100):
+        opener = http_opener or build_opener()
+        req = Request(
+            f"{API_GITHUB}/app/hook/deliveries?per_page={per_page}",
+            method="GET", headers={
+                "Accept": "application/vnd.github+json",
+                "Authorization": f"Bearer {jwt}",
+                "X-GitHub-Api-Version": "2022-11-28",
+            })
+        with opener.open(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    return _list
+
+
+API_GITHUB = "https://api.github.com"

@@ -1,6 +1,6 @@
 """Kronos — watches every service, and judges bad fix loops.
 
-W1-08-r1. One daemon, two jobs (owner, 2026-10-25: "Kronos and the escalator
+W1-08-r2. One daemon, two jobs (owner, 2026-10-25: "Kronos and the escalator
 are supposed to be one and the same"):
 
   1. Watches every review service on a 5-minute timer (one pass per firing,
@@ -8,19 +8,27 @@ are supposed to be one and the same"):
      unit health, HTTP health of the three loopback services, Postgres,
      failed webhook deliveries for BOTH Apps, PRs with a delivery but no
      Apollo review after 30 minutes, Zeus jobs stuck in a non-final phase,
-     and installs gated for credits (alerted, never silent). Remedies knock
-     heads loose: restart the dead unit (allow-list only, once per hour per
-     target), redeliver failed hook deliveries, re-queue a stuck job — then
-     alert on GitHub (one issue per problem in the reviews-app repo, label
-     `kronos`, opened as the Zeus App; commented and closed when fixed;
-     never the same fingerprint twice inside 6 hours).
+     and installs gated for credits. Every problem ALERTS on GitHub (one
+     issue per problem in the reviews-app repo, label `kronos`, opened as
+     the Zeus App; commented and closed when fixed; never the same
+     fingerprint twice inside 6 hours) — and the ledger persists in a
+     DURABLE state file across passes.
+
+     r2 RULING (Morpheus, 2026-11-02): Kronos is READ-ONLY on other
+     services. It observes; it NEVER restarts, never kills, never edits a
+     unit, never redelivers a webhook, never re-queues or releases a job.
+     The r1 remedies are retired (they were drift against the Locked
+     clause): every problem they used to paper over now raises the alert,
+     and the alert closes when the problem is fixed.
 
   2. Judges bad fix loops: when a PR reaches 5 Zeus fix rounds without two
      greens, Kronos sends the round history to Summit through RouteGate
-     (consumer `reviews:kronos/<install_id>`, read-only installation token).
-     `yes` -> one escalated Zeus round whose brief is the plan; `no`, a bad
-     answer or a timeout -> Zeus stops on that PR, one comment with the
-     reason, the owner alerted. Never a 7th round.
+     (consumer `reviews:kronos/<install_id>`, read-only installation token
+     in a trusted header, never in a model message). `yes` -> one escalated
+     Zeus round whose brief is the plan; `no`, a bad answer or a timeout ->
+     Zeus stops on that PR, one comment with the reason, the owner alerted.
+     Never a 7th round — the ceiling is enforced read-side AND by the
+     atomic compare-and-set writer (src/kronos/store.py).
 
 Read-only on other services' CODE: this package edits only its own files and
 shares state with Zeus only through the database rows Zeus already consumes
@@ -76,11 +84,19 @@ class KronosState:
 class PassLock:
     """The one-pass-at-a-time lock: flock (POSIX) with an O_EXCL fallback for
     platforms without fcntl. A pass that cannot take the lock exits
-    immediately — the timer fires again in 5 minutes."""
+    immediately — the timer fires again in 5 minutes.
+
+    MEDIUM 1: on the flock path the lockfile is NEVER unlinked — release
+    unlocks and closes, and the stable inode IS the lock (a waiter that
+    opened the old inode during an unlock+unlink window could otherwise hold
+    a lock on a file the next pass replaces, leaving two passes both
+    believing they own the pass). Only the non-fcntl O_EXCL fallback unlinks
+    on release — there the file itself is the only lock state."""
 
     def __init__(self, path: str):
         self._path = Path(path)
         self._fd = None
+        self._mode = "flock"
 
     def acquire(self) -> bool:
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -89,6 +105,7 @@ class PassLock:
         except ImportError:
             fcntl = None  # type: ignore[assignment]
         else:
+            self._mode = "flock"
             self._fd = os.open(str(self._path),
                                os.O_CREAT | os.O_RDWR, 0o600)
             try:
@@ -100,6 +117,7 @@ class PassLock:
                 return False
         # Non-POSIX fallback: exclusive create. A stale lock from a killed
         # pass is older than any pass budget, so it is broken after 10 min.
+        self._mode = "exclusive"
         try:
             self._fd = os.open(str(self._path),
                                os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
@@ -119,6 +137,14 @@ class PassLock:
             return False
 
     def release(self) -> None:
+        """Unlock and close — on the flock path NEVER unlink the lockfile.
+
+        MEDIUM 1: release() used to unlink pass.lock. A waiting second
+        process can open and lock the OLD inode between the unlock and the
+        unlink while a third creates/locks a NEW inode at the same path —
+        two passes both believing they own the pass. The file stays; the
+        stable inode is the lock. (The non-fcntl O_EXCL fallback still
+        unlinks: there the file itself is the only lock state.)"""
         if self._fd is None:
             return
         try:
@@ -131,7 +157,8 @@ class PassLock:
         except OSError:
             pass
         self._fd = None
-        try:
-            self._path.unlink()
-        except OSError:
-            pass
+        if self._mode == "exclusive":
+            try:
+                self._path.unlink()
+            except OSError:
+                pass

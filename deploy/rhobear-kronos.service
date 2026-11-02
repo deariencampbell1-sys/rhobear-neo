@@ -1,35 +1,29 @@
 # rhobear-kronos — the service watcher and the judge of bad fix loops.
 #
 # SPEC ONLY — nothing in this lane installs, enables or starts this unit.
-# The manager installs it (M-11 also installs the sudoers line quoted below).
+# The manager installs it.
+#
+# READ-ONLY WATCHER (r2 ruling, Morpheus 2026-11-02): Kronos observes; it
+# never restarts, never kills, never edits a unit, never redelivers a
+# webhook, never re-queues a job. There is NO privilege grant and NO restart
+# permission of any kind — the r1 restart remedy and its privilege boundary
+# are retired (drift against the Locked clause: read-only on other services).
+# A problem that r1 would have "remedied" raises an alert instead, and the
+# alert is closed when the problem is fixed.
 #
 # Keys are delivered by /opt/rhobear/bin/vault-env (W1-03's helper) into
 # /run/rhobear-kronos/env (dir 0700, file 0600) via EnvironmentFile=. If the
 # helper is not installed yet, this unit fails loudly at ExecStartPre — that
 # is deliberate; Kronos never reads the vault itself and ships no key loader.
 # The names the manager provisions (the two App private keys are not in the
-# vault yet; M-11 files them before production moves):
+# vault yet; M-11 files them before production moves) — note the key PATH
+# vars: config.py loads the PEM from that file once at boot (HIGH 9), it is
+# never passed to the signer as text-in-env:
 #
 #   # /etc/rhobear/vault-env/names/rhobear-kronos
 #   RHOBEAR_KRONOS_REVIEWS_APP_KEY_PATH=RHOBEAR_REVIEWS_GH_APP_KEY_B64
 #   RHOBEAR_KRONOS_ZEUS_APP_KEY_PATH=RHOBEAR_ZEUS_GH_APP_KEY_B64
 #   REVIEWS_DATABASE_URL=REVIEWS_DATABASE_URL
-#
-# Privilege boundary (M-11 installs exactly this sudoers line — the restart
-# remedy in src/kronos/remedies.py calls it with `sudo -n`, and its
-# allow-list in code refuses anything else):
-#
-#   rhobear-kronos ALL=(root) NOPASSWD: \
-#       /usr/bin/systemctl restart rhobear-reviews.service, \
-#       /usr/bin/systemctl restart rhobear-reviews-dash.service, \
-#       /usr/bin/systemctl restart rhobear-neo.service, \
-#       /usr/bin/systemctl restart rhobear-neo-builder.service
-#
-# Why NoNewPrivileges is NOT set here (a deviation from the sibling units,
-# deliberate and required): the kernel forbids setuid elevation under it, so
-# sudo could never elevate and the brief's restart remedy would be dead
-# code. The sudoers line above — one binary, four units, no password — is
-# the boundary instead. Everything else in the hardening set holds.
 
 [Unit]
 Description=rhobear-kronos — watches every service, and judges bad fix loops
@@ -42,10 +36,20 @@ User=rhobear-kronos
 Group=rhobear-kronos
 WorkingDirectory=/opt/rhobear/rhobear-kronos
 # One timer firing = one pass (--once). The timer file wakes every 5 minutes;
-# the pass itself runs on a 4-minute budget and takes /run/rhobear-kronos/
-# pass.lock so two passes can never overlap.
+# the pass itself runs on a 4-minute budget and takes <state-dir>/pass.lock
+# so two passes can never overlap.
+# The /run directory is ONLY the vault-env handoff (env file, recreated by
+# ExecStartPre every run — ephemeral by design).
 RuntimeDirectory=rhobear-kronos
 RuntimeDirectoryMode=0700
+# HIGH 1 — the LEDGER (alert dedupe, flap windows, judged markers) must
+# survive this oneshot's exit AND a reboot. A RuntimeDirectory is wiped when
+# the service stops, so r1's ledger started empty EVERY five-minute pass.
+# The state lives in a StateDirectory instead (durable, 0700, owned by the
+# unit user); the flock pass lock lives there too.
+StateDirectory=rhobear-kronos
+StateDirectoryMode=0700
+Environment=RHOBEAR_KRONOS_STATE_DIR=/var/lib/rhobear-kronos
 ExecStartPre=+/usr/bin/env PATH=/usr/bin:/bin /opt/rhobear/bin/vault-env rhobear-kronos
 EnvironmentFile=-/run/rhobear-kronos/env
 Environment=PATH=/usr/local/bin:/usr/bin:/bin:/opt/rhobear/rhobear-kronos/.venv/bin
@@ -56,14 +60,15 @@ TimeoutStartSec=300
 StandardOutput=journal
 StandardError=journal
 
-# Hardening. ProtectSystem=full (not strict) so sudo's /run/sudo state is
-# writable for the allow-listed restarts; /run/rhobear-kronos is the only
-# other path this unit writes (state.json, pass.lock).
+# Hardening. With the restart remedy retired there is nothing that needs
+# setuid elevation, so NoNewPrivileges=true holds (the r1 deviation that
+# allowed the retired remedy's privilege grant is gone with the remedies).
+NoNewPrivileges=true
 ProtectSystem=full
 ProtectHome=true
 PrivateTmp=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-ReadWritePaths=/run/rhobear-kronos
+ReadWritePaths=/run/rhobear-kronos /var/lib/rhobear-kronos
 
 [Install]
 WantedBy=multi-user.target

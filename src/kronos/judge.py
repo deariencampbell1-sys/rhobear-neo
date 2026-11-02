@@ -6,6 +6,11 @@ build_report) to Summit through RouteGate, consumer
 `reviews:kronos/<install_id>`, carrying a READ-ONLY installation token
 ({contents: read, pull_requests: read} — never the write token).
 
+r2 (HIGH 7): the installation token travels in a TRUSTED HEADER
+(`X-RHOBEAR-Install-Token`), NEVER in model-visible message content — r1
+pasted it into the user message, so a model echo would leak it into logs,
+comments and the DB.
+
 The answer is JSON {"progress": "yes"|"no", "plan": "...", "reason": "..."}:
 
   yes          -> ONE escalated Zeus round whose brief is the plan
@@ -14,10 +19,15 @@ The answer is JSON {"progress": "yes"|"no", "plan": "...", "reason": "..."}:
   no / bad / timeout
                -> Zeus stops on that PR: Kronos writes the stop marker Zeus
                   checks on every dispatch (already_escalated), posts ONE
-                  comment with the reason on the PR, and alerts the owner.
+                  comment with the reason, and alerts the owner.
 
-Never a 7th round: 5 normal rounds + at most 1 escalated round = 6, and the
-stop marker parks every further bounce.
+Never a 7th round: 5 normal rounds + at most 1 escalated round = 6. r2
+(HIGH 6) enforces the ceiling THREE ways: the sweep only triggers at >= 5
+stored rounds; judge_pr refuses to decide at >= 6 STORED rounds (the stored
+number, not the list length); and the write itself is an atomic
+compare-and-set in src/kronos/store.py — one advisory-locked transaction
+that re-checks the ceiling and the Zeus deconfliction before inserting. A
+lost race DEFERS: no marker, no comment, no alert — Zeus's path owns the PR.
 
 Deconfliction with Zeus's own advisor escalation (src/escalation.py, W1-10's
 file — read, never touched): while a phase='escalating' marker exists, or an
@@ -30,13 +40,22 @@ detail.kronos_stop explaining the judgment. Zeus's neo_worker checks
 `already_escalated()` (detail->'advisor_round' IS NOT NULL) BEFORE any
 further round, so the PR can never reach round 7 — that marker is the one
 piece of shared state the judge writes, and its detail says exactly why.
+
+r2 (HIGH 2): the judge writes ONLY through the atomic `writes` adapter —
+never through the read-only rows adapter (r1 called db.record()/
+db.create_builder() on an object that has neither, so neither Summit
+decision could ever be recorded).
+
+r2 (HIGH 7): EVERY model output string is redacted (fail closed) before it
+reaches the DB, a PR comment, an alert, a log or the returned outcome. If
+the redactor itself fails, the judge stops the loop with a FIXED literal
+reason — no model text is used at all.
 """
 from __future__ import annotations
 
 import json
 import logging
 import urllib.error
-import urllib.request
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
@@ -48,14 +67,22 @@ REPORT_BUDGET_CHARS = 8000
 
 READONLY_PERMISSIONS = {"contents": "read", "pull_requests": "read"}
 
+REDACT_FAILED_REASON = (
+    "judge answer withheld: redaction failed (fail closed) — "
+    "no model text used")
+
 
 class JudgeTimeout(Exception):
     """Summit did not answer inside the budget — a stop, not a retry."""
 
 
+class RedactionFailed(RuntimeError):
+    """The redactor failed — model text may NOT be used (fail closed)."""
+
+
 @dataclass
 class JudgeOutcome:
-    action: str          # escalated | stopped | skip
+    action: str          # escalated | stopped | deferred | skip
     reason: str
     plan: str = ""
 
@@ -220,11 +247,16 @@ def build_report(history: list[dict], *, budget: int = REPORT_BUDGET_CHARS,
 # ---------------------------------------------------------------------------
 
 def ask_summit(routegate_url: str, model: str, report: str, *,
-               install_id: str, read_token: str, http,
+               install_id: str, read_token: str = "", http,
                timeout: int = 300) -> dict:
-    """One chat completion asking for the JSON verdict. Raises JudgeTimeout
-    on a timeout; returns the parsed answer dict (validated) or raises
-    ValueError on a bad shape."""
+    """One chat completion asking for the JSON verdict.
+
+    The read-only installation token rides in the trusted
+    `X-RHOBEAR-Install-Token` header — NEVER in a model message (r2, HIGH 7;
+    the brief's "with a read-only installation token" is honored through the
+    credential channel, not the prompt). Raises JudgeTimeout on a timeout;
+    returns the parsed answer dict (validated) or raises ValueError on a bad
+    shape."""
     consumer = f"reviews:kronos/{install_id}" if install_id \
         else "reviews:kronos"
     body = {
@@ -238,14 +270,15 @@ def ask_summit(routegate_url: str, model: str, report: str, *,
                         "round with your plan could plausibly reach green; "
                         '"no" means stop and hand it to a person.'},
             {"role": "user",
-             "content": f"Read-only installation token (contents:read, "
-                        f"pull_requests:read): {read_token}\n\n"
-                        f"Fix-loop history for this PR:\n\n{report}"},
+             "content": f"Fix-loop history for this PR:\n\n{report}"},
         ],
         "max_tokens": 2000,
     }
     headers = {"Content-Type": "application/json",
                "X-RHOBEAR-Consumer": consumer}
+    if read_token:
+        # Trusted header channel — the model never sees credential text.
+        headers["X-RHOBEAR-Install-Token"] = read_token
     try:
         status, raw = http("POST",
                            routegate_url.rstrip("/") + "/v1/chat/completions",
@@ -291,23 +324,60 @@ def parse_judge_answer(content: str) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
+# redaction (HIGH 7) — fail closed
+# ---------------------------------------------------------------------------
+
+def _redact(text: str) -> str:
+    """Model output is untrusted text that may echo secrets — the same
+    redaction Zeus applies to advisor work orders, reused read-only.
+
+    r2: FAILS CLOSED. The r1 version returned the ORIGINAL text when the
+    redactor raised (or returned an unexpected shape) — a redaction failure
+    must never leak the raw text; it must raise RedactionFailed."""
+    try:
+        from ..redact import redact_data
+        out = redact_data({"plan": str(text or "")})
+        if not isinstance(out, dict) or "plan" not in out:
+            raise RedactionFailed("redactor returned an unexpected shape")
+        return str(out.get("plan") or "")
+    except RedactionFailed:
+        raise
+    except Exception as exc:  # noqa: BLE001 — any redactor failure is fatal
+        raise RedactionFailed(
+            f"redaction failed: {type(exc).__name__}") from exc
+
+
+# ---------------------------------------------------------------------------
 # the flow
 # ---------------------------------------------------------------------------
 
 def judge_pr(cfg, db, *, comments, alerter, state, repo: str, pr: int,
-             head_sha: str, install_id: str, read_token: str, http,
-             now_fn, dry_run: bool = False) -> JudgeOutcome:
-    """Judge one PR (or defer). Writes only the two state shapes Zeus
-    already consumes; posts ONE PR comment; alerts on a stop."""
+             head_sha: str, install_id: str, read_token: str = "", http,
+             now_fn, writes, dry_run: bool = False,
+             timeout: int | None = None) -> JudgeOutcome:
+    """Judge one PR (or defer). Writes ONLY through the atomic CAS `writes`
+    adapter (src/kronos/store.py) — never through the read-only rows
+    adapter (that was HIGH 2). Posts ONE PR comment; alerts on a stop.
+
+    `timeout` (optional) is the ALREADY-CLAMPED Summit timeout the sweep
+    computed from the remaining pass budget (MEDIUM 3)."""
     marker_slot = state.slot("judged")
     marker = f"{repo}#{pr}"
     rounds = round_history(db, repo, pr)
     if len(rounds) < JUDGE_ROUNDS_TRIGGER:
         return JudgeOutcome("skip", f"{len(rounds)} rounds < "
                                     f"{JUDGE_ROUNDS_TRIGGER}")
+    # HIGH 6 — the ceiling reads the STORED round number, not the list
+    # length: five rows numbered 1,2,3,4,6 are already at the ceiling.
+    stored_max = max(r["round"] for r in rounds)
+    if stored_max >= 6:
+        return JudgeOutcome("skip",
+                            f"round-six ceiling: {stored_max} builder "
+                            f"rounds recorded, never a 7th")
     if marker in marker_slot:
         return JudgeOutcome("skip", "already judged by kronos")
-    # Deconfliction with Zeus's own advisor path (read-only checks):
+    # Deconfliction with Zeus's own advisor path (read-only pre-checks; the
+    # authoritative re-check happens inside the CAS write):
     if db.rows("SELECT 1 FROM neo_actions WHERE phase='escalating' "
                "AND repo = %s AND pr_number = %s LIMIT 1", (repo, pr)):
         return JudgeOutcome("skip", "Zeus advisor escalation is in flight")
@@ -321,93 +391,120 @@ def judge_pr(cfg, db, *, comments, alerter, state, repo: str, pr: int,
     if dry_run:
         return JudgeOutcome("skip", "dry-run")
 
+    summit_timeout = timeout if timeout is not None else cfg.judge_timeout_secs
     try:
         _validate_loopback(cfg.routegate_url)
         answer = ask_summit(cfg.routegate_url, cfg.judge_model, report,
                             install_id=install_id, read_token=read_token,
-                            http=http, timeout=cfg.judge_timeout_secs)
+                            http=http, timeout=summit_timeout)
     except JudgeTimeout as exc:
-        return _stop(db, comments, alerter, state, marker, repo, pr,
-                     rounds, reason=f"judge timeout: {exc}", dry_run=dry_run)
+        return _stop(writes, comments, alerter, state, marker, repo, pr,
+                     rounds, reason=f"judge timeout: {exc}",
+                     dry_run=dry_run)
     except ValueError as exc:
-        return _stop(db, comments, alerter, state, marker, repo, pr,
-                     rounds, reason=f"bad judge answer: {exc}", dry_run=dry_run)
+        return _stop(writes, comments, alerter, state, marker, repo, pr,
+                     rounds, reason=f"bad judge answer: {exc}",
+                     dry_run=dry_run)
+
+    # HIGH 7 — redact EVERY model output string BEFORE anything sees it.
+    # Fail closed on ANY redaction failure: no model text is used at all.
+    try:
+        plan_r = _redact(answer["plan"])
+        reason_r = _redact(answer["reason"])
+    except Exception:  # noqa: BLE001 — a redaction failure is fail-closed
+        return _stop(writes, comments, alerter, state, marker, repo, pr,
+                     rounds, reason=REDACT_FAILED_REASON, dry_run=dry_run)
 
     if answer["progress"] == "yes":
-        return _escalate(cfg, db, comments, state, marker, repo, pr,
-                         head_sha, rounds, answer, install_id=install_id)
-    return _stop(db, comments, alerter, state, marker, repo, pr, rounds,
-                 reason=answer["reason"], dry_run=dry_run)
+        if not plan_r.strip():
+            # The whole plan redacted away — nothing safe to brief a builder
+            # with; a `yes` without a usable plan is a bad answer.
+            return _stop(writes, comments, alerter, state, marker, repo, pr,
+                         rounds, reason="judge plan was unusable after "
+                                        "redaction", dry_run=dry_run)
+        return _escalate(cfg, writes, comments, state, marker, repo, pr,
+                         rounds, plan_r, reason_r, install_id=install_id)
+    return _stop(writes, comments, alerter, state, marker, repo, pr, rounds,
+                 reason=reason_r, dry_run=dry_run)
 
 
-def _escalate(cfg, db, comments, state, marker, repo, pr, head_sha,
-              rounds, answer, *, install_id: str) -> JudgeOutcome:
+def _escalate(cfg, writes, comments, state, marker, repo, pr, rounds,
+              plan_r, reason_r, *, install_id: str) -> JudgeOutcome:
     """`yes` -> the ONE escalated Zeus round whose brief is the plan."""
-    new_round = len(rounds) + 1
-    plan = answer["plan"]
-    redacted_plan = _redact(plan)
+    head_sha = str(rounds[-1]["head_sha"])
+    stored_max = max(r["round"] for r in rounds)
+    new_round = stored_max + 1
+    detail = {
+        "reason": "kronos judge: one escalated round with Summit's plan",
+        "advisor_round": new_round,
+        "advice_id": f"kronos:{repo}#{pr}",
+        "installation_id": install_id,
+        "kronos": True,
+        "work_order": {
+            "route": cfg.judge_model,
+            "summary": plan_r,
+            "steps_count": 1,
+        },
+    }
     work_order = {
         "route": cfg.judge_model,
-        "summary": redacted_plan,
-        "root_cause": answer["reason"],
-        "steps": [{"file": "plan", "change": redacted_plan}],
+        "summary": plan_r,
+        "root_cause": reason_r,
+        "steps": [{"file": "plan", "change": plan_r}],
         "tests": [],
         "risks": "",
     }
-    db.record(repo, pr, head_sha, "escalated", verdict="ESCALATE",
-              builder_round=new_round,
-              detail={
-                  "reason": "kronos judge: one escalated round with "
-                            "Summit's plan",
-                  "advisor_round": new_round,
-                  "advice_id": f"kronos:{repo}#{pr}",
-                  "installation_id": install_id,
-                  "kronos": True,
-                  "work_order": {
-                      "route": work_order["route"],
-                      "summary": redacted_plan,
-                      "steps_count": len(work_order["steps"]),
-                  },
-              })
-    db.create_builder(repo, pr, head_sha, new_round, payload={
-        "verdict": "BOUNCE-BUILDER",
-        "head_sha": head_sha,
-        "phase": "escalated",
-        "round": new_round,
-        "context": "kronos:escalated",
-        "escalated": True,
-        "work_order": work_order,
-        "installation_id": install_id,
-    })
+    ok, note = writes.escalate(
+        repo, pr, head_sha, advisor_round=new_round,
+        detail=detail, builder_payload={
+            "verdict": "BOUNCE-BUILDER",
+            "head_sha": head_sha,
+            "phase": "escalated",
+            "round": new_round,
+            "context": "kronos:escalated",
+            "escalated": True,
+            "work_order": work_order,
+            "installation_id": install_id,
+        })
+    if not ok:
+        # HIGH 6 — the CAS deferred (Zeus won, or the ceiling was hit in the
+        # meantime): no marker, no comment, no alert — Zeus's path owns it.
+        log.info("kronos judge deferred %s#%s: %s", repo, pr, note)
+        return JudgeOutcome("deferred", note)
     state.slot("judged")[marker] = now_iso()
     comment = (
         "**Kronos · judged this loop**\n\n"
         f"{len(rounds)} fix rounds without two greens; asking whether "
         "iterating further helps.\n\n"
-        f"Reason: {answer['reason']}\n\n"
-        f"Proposal (one escalated round, never a 7th):\n\n{redacted_plan}"
+        f"Reason: {reason_r}\n\n"
+        f"Proposal (one escalated round, never a 7th):\n\n{plan_r}"
     )
     comments(repo, pr, comment)
     log.info("kronos judged %s#%s: escalated round %d", repo, pr, new_round)
-    return JudgeOutcome("escalated", answer["reason"], plan=plan)
+    return JudgeOutcome("escalated", reason_r, plan=plan_r)
 
 
-def _stop(db, comments, alerter, state, marker, repo, pr, rounds, *,
+def _stop(writes, comments, alerter, state, marker, repo, pr, rounds, *,
           reason: str, dry_run: bool = False) -> JudgeOutcome:
     """`no` / bad answer / timeout -> Zeus stops on that PR, one comment,
-    the owner alerted."""
+    the owner alerted. `reason` must already be redacted (or a fixed
+    literal) — it lands in the DB, a comment, an alert and the log."""
     head_sha = str(rounds[-1]["head_sha"]) if rounds else ""
-    new_round = len(rounds) + 1
+    stored_max = max(r["round"] for r in rounds) if rounds else 0
+    new_round = stored_max + 1
     if not dry_run:
-        db.record(repo, pr, head_sha, "escalated", verdict="PARKED",
-                  builder_round=0,
-                  detail={
-                      "reason": f"kronos judge stopped the loop: {reason}",
-                      "advisor_round": new_round,
-                      "advice_id": f"kronos-stop:{repo}#{pr}",
-                      "kronos_stop": True,
-                      "kronos": True,
-                  })
+        ok, note = writes.stop(
+            repo, pr, head_sha, advisor_round=new_round,
+            detail={
+                "reason": f"kronos judge stopped the loop: {reason}",
+                "advisor_round": new_round,
+                "advice_id": f"kronos-stop:{repo}#{pr}",
+                "kronos_stop": True,
+                "kronos": True,
+            })
+        if not ok:
+            log.info("kronos judge deferred stop %s#%s: %s", repo, pr, note)
+            return JudgeOutcome("deferred", note)
         state.slot("judged")[marker] = now_iso()
         comments(repo, pr, (
             "**Kronos · stopped: 5 rounds but still red**\n\n"
@@ -423,19 +520,6 @@ def _stop(db, comments, alerter, state, marker, repo, pr, rounds, *,
             f"{repo}#{pr}: {reason}")
     log.warning("kronos stopped %s#%s: %s", repo, pr, reason)
     return JudgeOutcome("stopped", reason)
-
-
-def _redact(text: str) -> str:
-    """Summit's plan is model output that may echo secrets — the same
-    redaction Zeus applies to advisor work orders, reused read-only."""
-    try:
-        from ..redact import redact_data
-        out = redact_data({"plan": text})
-        if isinstance(out, dict):
-            return str(out.get("plan") or text)
-        return text
-    except Exception:  # noqa: BLE001 — redaction must never break the flow
-        return text
 
 
 def now_iso() -> str:
