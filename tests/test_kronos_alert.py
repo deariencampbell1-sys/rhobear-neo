@@ -25,11 +25,9 @@ class FakeIssues:
 
     def create(self, title: str, body: str, labels: list[str]):
         self._next += 1
-        fp = ""
-        for line in body.splitlines():
-            if line.startswith("<!-- kronos-fingerprint:"):
-                fp = line.split(":", 1)[1].strip().strip("-").strip()
-                break
+        import re
+        m = re.search(r"<!-- kronos-fingerprint: (.+?) -->", body)
+        fp = m.group(1) if m else ""
         issue = {"number": self._next, "title": title, "body": body,
                  "labels": labels, "open": True, "fingerprint": fp}
         self.created.append(issue)
@@ -39,6 +37,8 @@ class FakeIssues:
         self.comments.append((number, body))
 
     def close(self, number: int, note: str):
+        if note:
+            self.comments.append((number, note))
         for issue in self.created:
             if issue["number"] == number:
                 issue["open"] = False

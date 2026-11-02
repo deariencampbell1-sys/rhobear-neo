@@ -58,6 +58,6 @@ def test_loop_is_reported_with_both_shas():
     from src.kronos.judge import loop_note
     rounds = [_round(2, "b" * 40, tree="c" * 40),
               _round(3, "e" * 40, tree="c" * 40)]
-    note = loop_note(same_commit_loop(rounds))
+    note = loop_note(same_commit_loop(rounds), rounds)
     assert "b" * 40 in note and "e" * 40 in note
     assert "2" in note and "3" in note

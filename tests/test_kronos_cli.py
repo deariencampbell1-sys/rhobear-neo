@@ -39,10 +39,16 @@ def test_once_dry_run_prints_one_line_per_check(capsys, tmp_path):
               _services=fake)
     out = capsys.readouterr().out
     assert rc == 0
-    assert "kronos check webhook" in out
-    assert "kronos check unit:rhobear-neo" in out
     lines = [l for l in out.splitlines() if l.startswith("kronos check ")]
-    assert len(lines) == len(fake.results)
+    # the default check set: 3 HTTP healths + 4 units + postgres = 8 lines,
+    # exactly one per check
+    assert len(lines) == 8, lines
+    assert len(set(lines)) == 8, lines
+    for name in ("webhook", "zeus", "routegate", "postgres",
+                 "unit:rhobear-reviews", "unit:rhobear-reviews-dash",
+                 "unit:rhobear-neo", "unit:rhobear-neo-builder"):
+        assert any(l.startswith(f"kronos check {name}:") for l in lines), \
+            (name, lines)
     assert fake.restart_calls == [], "dry-run never restarts anything"
     assert fake.http == [], "dry-run never calls GitHub or RouteGate"
 

@@ -1,0 +1,18 @@
+# rhobear-kronos.timer — Kronos wakes every 5 minutes.
+#
+# SPEC ONLY — nothing in this lane enables or starts this timer.
+# Persistent=true: the old watchdog died in September and nobody noticed —
+# a sleeping box must never skip the wake.
+
+[Unit]
+Description=rhobear-kronos timer — every 5 minutes, one pass per firing
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=true
+Unit=rhobear-kronos.service
+
+[Install]
+WantedBy=timers.target

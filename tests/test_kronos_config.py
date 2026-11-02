@@ -53,6 +53,11 @@ def test_key_is_read_from_path_or_text(monkeypatch, tmp_path):
     pem = tmp_path / "zeus.pem"
     pem.write_text("-----BEGIN FAKE TEST KEY-----\nnot-a-key\n", encoding="utf-8")
     monkeypatch.setenv("RHOBEAR_KRONOS_ZEUS_APP_KEY_PATH", str(pem))
+    # the rest of the required set, as fake test values
+    monkeypatch.setenv("REVIEWS_DATABASE_URL", "postgresql://fake/fake")
+    monkeypatch.setenv("RHOBEAR_KRONOS_ZEUS_APP_ID", "1")
+    monkeypatch.setenv("RHOBEAR_KRONOS_REVIEWS_APP_ID", "2")
+    monkeypatch.setenv("RHOBEAR_KRONOS_REVIEWS_APP_KEY", "fake")
     cfg = KronosConfig.required()
     assert "FAKE TEST KEY" in cfg.zeus_app_key
 

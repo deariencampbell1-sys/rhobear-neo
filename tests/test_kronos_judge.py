@@ -184,10 +184,11 @@ def test_timeout_raises_judge_timeout():
 # the judge flow
 # ---------------------------------------------------------------------------
 
-def _run_judge(db: FakeDb, http, *, install_id="9999", read_token="ro-token"):
+def _run_judge(db: FakeDb, http, *, install_id="9999", read_token="ro-token",
+               state=None):
     comments = FakeComments()
     alerter = FakeAlerter()
-    state = FakeState()
+    state = state or FakeState()
     out = judge.judge_pr(
         _cfg(), db, comments=comments, alerter=alerter, state=state,
         repo="o/r", pr=52, head_sha="f" * 40, install_id=install_id,
@@ -260,9 +261,11 @@ def test_bad_answer_stops():
 def test_judge_never_fires_twice_for_the_same_pr():
     db = FakeDb(rounds=_rounds(5))
     http = FakeHttp(content=GOOD_YES)
-    out1, *_ = _run_judge(db, http)
+    shared_state = FakeState()
+    out1, *_ = _run_judge(db, http, state=shared_state)
     # a second pass on the same PR (state remembers the judgment)
-    out2, comments2, alerter2, _ = _run_judge(db, http)
+    out2, comments2, alerter2, _ = _run_judge(db, http, state=shared_state)
+    assert out1.action == "escalated"
     assert out2.action == "skip"
     assert len(db.builder_jobs) == 1, "never a second escalated round"
 
@@ -289,13 +292,18 @@ def test_trigger_threshold_is_five():
 
 
 def test_judge_report_carries_verdicts_findings_and_diff_stats():
-    db = FakeDb(rounds=_rounds(3),
+    rounds = _rounds(5)
+    rounds[1]["diff_stat"] = "3 files changed, +120/-40"
+    db = FakeDb(rounds=rounds,
                 assessments=[{"repo": "o/r", "pr_number": 52,
-                              "head_sha": _rounds(3)[0]["head_sha"],
-                              "findings": "3 HIGH findings: sql injection"}])
+                              "head_sha": rounds[0]["head_sha"],
+                              "data": {"findings": [
+                                  {"severity": "HIGH",
+                                   "title": "sql injection"}]}}])
     http = FakeHttp(content=GOOD_YES)
     _run_judge(db, http)
     sent = json.loads(http.calls[0]["body"])["messages"][-1]["content"]
     assert "BOUNCE" in sent, "verdicts travel in the report"
-    assert "3 HIGH findings: sql injection" in sent, "Apollo's findings travel"
-    assert "round 2 findings" in sent, "the round history travels"
+    assert "sql injection" in sent, "Apollo's findings travel"
+    assert "round 5" in sent, "the round history travels"
+    assert "3 files changed, +120/-40" in sent, "diff stats travel"

@@ -5,6 +5,8 @@ to a bounded size, and the report must SAY what it dropped — never silently.
 """
 from __future__ import annotations
 
+import re
+
 from src.kronos.judge import REPORT_BUDGET_CHARS, build_report
 
 
@@ -37,7 +39,9 @@ def test_report_is_bounded():
     assert "dropped" in report.lower(), (
         "a truncated report must say what it dropped"
     )
-    assert "200" in report, "the dropped size should be stated"
+    assert re.search(r"dropped \d[\d,]* chars", report), (
+        "the dropped size should be stated: " + report[-200:]
+    )
 
 
 def test_small_report_is_verbatim():

@@ -29,8 +29,8 @@ class FakeResult:
     """What a subprocess runner returns (rc/stdout shape of subprocess.run)."""
 
     rc: int
-    out: str = ""
-    err: str = ""
+    stdout: str = ""
+    stderr: str = ""
 
 
 class FakeRunner:
@@ -82,7 +82,7 @@ def test_journal_permission_falls_back_to_status():
     via `systemctl status` (systemd prints the recent lines itself)."""
     runner = FakeRunner({
         ("journalctl", "-u", "rhobear-neo", "-n", "20", "--no-pager",
-         "-o", "short-iso"): FakeResult(1, "", "Hint: You are currently not "
+         "-o", "short-iso"): FakeResult(1, stderr="Hint: You are currently not "
                                               "seeing messages from other users and the system\n"),
         ("systemctl", "status", "rhobear-neo", "-n", "20", "--no-pager", "-l"):
             FakeResult(0, "● rhobear-neo.service - ...\nNov 01 10:00:00 box boom[1]: died\n"),
@@ -130,10 +130,10 @@ def test_flapping_unit_is_reported_once():
     # outside the window the detector re-arms from the current count
     should3, state3 = flap_status(state2, "rhobear-neo", nrestarts=11,
                                   now=now + 6 * 60 + 601)
-    assert should3 is False, "11 restarts with base 6 is 5, but the window restarted"
-    should4, _ = flap_status(state3, "rhobear-neo", nrestarts=12,
+    assert should3 is False, "the window restarted from the current count"
+    should4, _ = flap_status(state3, "rhobear-neo", nrestarts=16,
                              now=now + 6 * 60 + 660)
-    assert should4 is True
+    assert should4 is True, "5 more restarts inside the new window flap again"
 
 
 def test_flap_report_carries_the_count():

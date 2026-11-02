@@ -1,0 +1,69 @@
+# rhobear-kronos — the service watcher and the judge of bad fix loops.
+#
+# SPEC ONLY — nothing in this lane installs, enables or starts this unit.
+# The manager installs it (M-11 also installs the sudoers line quoted below).
+#
+# Keys are delivered by /opt/rhobear/bin/vault-env (W1-03's helper) into
+# /run/rhobear-kronos/env (dir 0700, file 0600) via EnvironmentFile=. If the
+# helper is not installed yet, this unit fails loudly at ExecStartPre — that
+# is deliberate; Kronos never reads the vault itself and ships no key loader.
+# The names the manager provisions (the two App private keys are not in the
+# vault yet; M-11 files them before production moves):
+#
+#   # /etc/rhobear/vault-env/names/rhobear-kronos
+#   RHOBEAR_KRONOS_REVIEWS_APP_KEY_PATH=RHOBEAR_REVIEWS_GH_APP_KEY_B64
+#   RHOBEAR_KRONOS_ZEUS_APP_KEY_PATH=RHOBEAR_ZEUS_GH_APP_KEY_B64
+#   REVIEWS_DATABASE_URL=REVIEWS_DATABASE_URL
+#
+# Privilege boundary (M-11 installs exactly this sudoers line — the restart
+# remedy in src/kronos/remedies.py calls it with `sudo -n`, and its
+# allow-list in code refuses anything else):
+#
+#   rhobear-kronos ALL=(root) NOPASSWD: \
+#       /usr/bin/systemctl restart rhobear-reviews.service, \
+#       /usr/bin/systemctl restart rhobear-reviews-dash.service, \
+#       /usr/bin/systemctl restart rhobear-neo.service, \
+#       /usr/bin/systemctl restart rhobear-neo-builder.service
+#
+# Why NoNewPrivileges is NOT set here (a deviation from the sibling units,
+# deliberate and required): the kernel forbids setuid elevation under it, so
+# sudo could never elevate and the brief's restart remedy would be dead
+# code. The sudoers line above — one binary, four units, no password — is
+# the boundary instead. Everything else in the hardening set holds.
+
+[Unit]
+Description=rhobear-kronos — watches every service, and judges bad fix loops
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=rhobear-kronos
+Group=rhobear-kronos
+WorkingDirectory=/opt/rhobear/rhobear-kronos
+# One timer firing = one pass (--once). The timer file wakes every 5 minutes;
+# the pass itself runs on a 4-minute budget and takes /run/rhobear-kronos/
+# pass.lock so two passes can never overlap.
+RuntimeDirectory=rhobear-kronos
+RuntimeDirectoryMode=0700
+ExecStartPre=+/usr/bin/env PATH=/usr/bin:/bin /opt/rhobear/bin/vault-env rhobear-kronos
+EnvironmentFile=-/run/rhobear-kronos/env
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/opt/rhobear/rhobear-kronos/.venv/bin
+ExecStart=/opt/rhobear/rhobear-kronos/.venv/bin/python -m src.kronos --once
+# A failed pass must not hammer: the timer re-fires anyway.
+Restart=no
+TimeoutStartSec=300
+StandardOutput=journal
+StandardError=journal
+
+# Hardening. ProtectSystem=full (not strict) so sudo's /run/sudo state is
+# writable for the allow-listed restarts; /run/rhobear-kronos is the only
+# other path this unit writes (state.json, pass.lock).
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/run/rhobear-kronos
+
+[Install]
+WantedBy=multi-user.target

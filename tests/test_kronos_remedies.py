@@ -53,7 +53,8 @@ def test_restart_unit_uses_sudo_systemctl_and_allow_list():
     runner = FakeRunner()
     ok, note = restart_unit(runner, "rhobear-neo")
     assert ok is True
-    assert runner.calls == [["sudo", "-n", "/usr/bin/systemctl", "restart",
+    assert runner.calls == [["/usr/bin/sudo", "-n",
+                             "/usr/bin/systemctl", "restart",
                              "rhobear-neo"]], runner.calls
 
 
@@ -133,6 +134,8 @@ class FakeIssues:
         self.comments.append((number, body))
 
     def close(self, number: int, note: str):
+        if note:
+            self.comments.append((number, note))
         for issue in self.created:
             if issue["number"] == number:
                 issue["open"] = False
@@ -140,10 +143,9 @@ class FakeIssues:
 
 
 def fingerprint_of(body: str) -> str:
-    for line in body.splitlines():
-        if line.startswith("<!-- kronos-fingerprint:"):
-            return line.split(":", 1)[1].strip().removeprefix("<!--").strip()
-    return ""
+    import re
+    m = re.search(r"<!-- kronos-fingerprint: (.+?) -->", body)
+    return m.group(1) if m else ""
 
 
 def test_dead_unit_restarted_once_then_alerted(tmp_path):

@@ -84,11 +84,8 @@ def test_unit_quotes_the_sudoers_line_for_the_manager():
 
 def test_timer_wakes_every_five_minutes():
     d = _directives(TIMER.read_text(encoding="utf-8"))
-    assert any("OnUnitActiveSec" in v or "OnCalendar" in v
-               for v in d.get("OnUnitActiveSec", []) + d.get("OnCalendar", [])), \
-        d
     every5 = any(
-        v in ("5min", "5 min") or "5min" in v.replace(" ", "")
+        v.replace(" ", "").startswith("5min")
         for v in d.get("OnUnitActiveSec", []))
     calendar5 = any("0/5" in v or "*/5" in v
                     for v in d.get("OnCalendar", []))
