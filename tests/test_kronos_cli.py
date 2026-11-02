@@ -60,6 +60,29 @@ def test_once_dry_run_writes_no_state_file(capsys, tmp_path):
         f"dry-run wrote {list(tmp_path.iterdir())}"
 
 
+def test_once_dry_run_never_restarts_a_broken_unit(capsys, tmp_path):
+    """The changes-nothing guarantee, exercised: a dead unit is reported in
+    dry-run, never restarted."""
+    fake = FakeServices()
+
+    def failing_runner(argv):
+        if "is-active" in argv:
+            return type("R", (), {"rc": 3, "stdout": "failed\n",
+                                  "stderr": ""})()
+        if "restart" in argv:
+            fake.restart_calls.append(list(argv))
+        return type("R", (), {"rc": 0, "stdout": "", "stderr": ""})()
+
+    fake.runner = failing_runner
+    rc = main(["--once", "--dry-run", "--state-dir", str(tmp_path)],
+              _services=fake)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert any("unit:rhobear-neo" in l and "broken" in l
+               for l in out.splitlines()), out
+    assert fake.restart_calls == [], "dry-run restarted a dead unit"
+
+
 def test_pass_lock_prevents_two_passes_at_once(capsys, tmp_path):
     """A held lock makes the second pass exit immediately without running."""
     from src.kronos import PassLock
