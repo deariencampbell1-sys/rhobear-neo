@@ -490,7 +490,7 @@ def _consume_and_act(state, repo: str, pr: int, head_sha: str,
     # left behind is removed now, and ONLY now. A failure here is retried by
     # the stale reclaim (a crashed caller cannot strand the marker).
     try:
-        state.clear_inflight_markers(repo, pr)
+        state.clear_inflight_markers(repo, pr, advice_id)
     except Exception as exc:  # noqa: BLE001 — the stale reclaim covers it
         log.warning("could not clear the in-flight marker for %s#%s "
                     "(the stale reclaim will): %s", repo, pr, exc)

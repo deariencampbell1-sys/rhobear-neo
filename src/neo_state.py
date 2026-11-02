@@ -239,18 +239,24 @@ class NeoState:
                 ).fetchone()
                 newest_id = newest[0] if newest else None
                 if newest is not None and newest_id == (advice_id or ""):
-                    # Still the newest escalation — consume it AND any
-                    # superseded older rows (they are stale; nothing newer
-                    # exists to protect). r4 (HIGH C): RE-PHASE to the
-                    # durable in-flight marker instead of deleting.
+                    # Only the advice that won the take becomes in-flight.
+                    # Older queued advice is superseded, not consumed: making
+                    # it in-flight would let it resurrect after this outcome.
+                    c.execute(
+                        "DELETE FROM neo_actions WHERE repo=%s AND pr_number=%s "
+                        "AND phase='escalating' "
+                        "AND COALESCE(detail->>'advice_id', '')<>%s",
+                        (repo, pr, advice_id or ""),
+                    )
                     c.execute(
                         "UPDATE neo_actions SET phase=%s, "
                         "detail = detail || %s::jsonb "
                         "WHERE repo=%s AND pr_number=%s "
-                        "AND phase='escalating'",
+                        "AND phase='escalating' "
+                        "AND COALESCE(detail->>'advice_id', '')=%s",
                         (ESCALATION_INFLIGHT_PHASE,
                          json.dumps({"consumed_at": time.time()}),
-                         repo, pr),
+                         repo, pr, advice_id or ""),
                     )
                     c.commit()
                     return True
@@ -267,22 +273,39 @@ class NeoState:
                 c.rollback()
                 raise
 
-    def clear_inflight_markers(self, repo: str, pr: int) -> int:
-        """r4 (HIGH C): remove the PR's in-flight escalation markers once the
-        outcome is recorded (escalate_pr's escalated row, or the park row the
-        give-up / failed-advice paths write). This — and the stale reclaim —
-        is the ONLY thing that removes them. Under the per-PR advisory lock;
-        returns the number of rows removed."""
+    def clear_inflight_markers(
+            self, repo: str, pr: int, advice_id: str | None = None) -> int:
+        """Remove only the advice whose terminal outcome just recorded.
+
+        The live flow supplies advice_id. For legacy singleton callers, an
+        omitted id is accepted only with exactly one marker under the PR lock;
+        multiple owners must never be removed without a supplied identity.
+        """
         with psycopg.connect(self.dsn, autocommit=False) as c:
             try:
                 c.execute(
                     "SELECT pg_advisory_xact_lock(hashtext(%s))",
                     (f"{repo}:{pr}",),
                 )
+                if advice_id is None:
+                    # Preserve the pre-r5 single-marker test/consumer contract,
+                    # but fail closed on ambiguous multi-advice cleanup.
+                    owners = c.execute(
+                        "SELECT COALESCE(detail->>'advice_id', '') "
+                        "FROM neo_actions WHERE repo=%s AND pr_number=%s "
+                        "AND phase=%s LIMIT 2",
+                        (repo, pr, ESCALATION_INFLIGHT_PHASE),
+                    ).fetchall()
+                    if len(owners) > 1:
+                        raise ValueError("advice_id required for multiple in-flight owners")
+                    if not owners:
+                        c.rollback()
+                        return 0
+                    advice_id = owners[0][0]
                 cur = c.execute(
                     "DELETE FROM neo_actions WHERE repo=%s AND pr_number=%s "
-                    "AND phase=%s",
-                    (repo, pr, ESCALATION_INFLIGHT_PHASE),
+                    "AND phase=%s AND COALESCE(detail->>'advice_id', '')=%s",
+                    (repo, pr, ESCALATION_INFLIGHT_PHASE, advice_id),
                 )
                 removed = cur.rowcount
                 c.commit()
@@ -300,13 +323,14 @@ class NeoState:
         restored, consumed_at stripped) so the advice re-enters the normal
         recovery pipeline (escalate_pr is idempotent per advice_id) — UNLESS
         a newer escalating marker already owns the PR, in which case the
-        stale marker is simply dropped. Returns one row per reclaimed
-        marker."""
+        stale marker is simply dropped. Process newest first and compare
+        durable ids under each PR lock: an older recovered marker cannot
+        supersede a newer advice. Returns one row per reclaimed marker."""
         now = time.time()
         with self._conn() as c:
             rows = c.execute(
                 "SELECT id, repo, pr_number, detail FROM neo_actions "
-                "WHERE phase=%s ORDER BY id",
+                "WHERE phase=%s ORDER BY id DESC",
                 (ESCALATION_INFLIGHT_PHASE,),
             ).fetchall()
         out: list[dict] = []
@@ -336,10 +360,14 @@ class NeoState:
                     if not still:
                         c.rollback()
                         continue
+                    # Supersession is ordered by durable row id, not merely
+                    # the presence of any escalating row: older A must never
+                    # supersede newer B. Include live in-flight owners too.
                     newer = c.execute(
                         "SELECT 1 FROM neo_actions WHERE repo=%s "
-                        "AND pr_number=%s AND phase='escalating' LIMIT 1",
-                        (repo, pr),
+                        "AND pr_number=%s AND id>%s "
+                        "AND (phase='escalating' OR phase=%s) LIMIT 1",
+                        (repo, pr, row_id, ESCALATION_INFLIGHT_PHASE),
                     ).fetchone()
                     if newer:
                         c.execute(
