@@ -86,6 +86,10 @@ _DB_TIMEOUT_SECS = 15
 #: keyset-paged past the persisted cursor. The NOT EXISTS clause drops
 #: terminal rows (merged/ready) and decided rows (any escalated marker with
 #: an advisor_round — Kronos's stop, Kronos's escalation, Zeus's own).
+#: r4 (HIGH B): the NOT EXISTS is correlated on BOTH columns of the OUTER
+#: row — `other.repo = neo_actions.repo` (the unqualified `repo` used to
+#: bind to the INNER neo_actions row, so a same-numbered PR in ANOTHER
+#: repository suppressed this PR from every page forever).
 _JUDGE_SWEEP_SQL = (
     "SELECT repo, pr_number, "
     "MAX(builder_round) AS rounds, "
@@ -98,7 +102,7 @@ _JUDGE_SWEEP_SQL = (
     "AND MAX(created_at) < now() - make_interval(secs => %s) "
     "AND NOT EXISTS ("
     "  SELECT 1 FROM neo_actions AS other "
-    "  WHERE other.repo = repo "
+    "  WHERE other.repo = neo_actions.repo "
     "    AND other.pr_number = neo_actions.pr_number "
     "    AND (other.phase IN ('merged', 'ready') "
     "         OR (other.phase = 'escalated' "

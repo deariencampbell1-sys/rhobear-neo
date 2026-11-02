@@ -370,3 +370,33 @@ def test_unproven_identity_defers_loudly(fresh, tmp_path, monkeypatch):
     assert any("deferred" in l.lower() or "unproven" in l.lower()
                for l in lines), lines
     assert "o/r#701" not in state.slot("judged")
+# ---------------------------------------------------------------------------
+# r4 HIGH B — a cross-repository PR-number collision must not suppress loops
+# ---------------------------------------------------------------------------
+
+def test_two_repos_same_pr_number_both_served(fresh, tmp_path, monkeypatch):
+    """Repo A's PR #800 has a ready row (terminal); repo B's UNRELATED PR
+    #800 has five unproductive rounds. The r3 NOT EXISTS correlated only the
+    PR number (`other.repo = repo` bound the unqualified column to the INNER
+    neo_actions row), so repo B's PR vanished from every judge page forever.
+    Repo B's PR must still be judged; repo A's must stay excluded."""
+    dsn = fresh
+    _zeus_pr(dsn, "o/ready", 800, install=11)
+    NeoState(dsn).record("o/ready", 800, HEAD, "ready", verdict="ACCEPT",
+                         detail={})
+    _quiet(dsn, "o/ready", 800)
+    _zeus_pr(dsn, "o/live", 800, install=22)
+    _quiet(dsn, "o/live", 800)
+
+    services = _SweepServices(dsn, pulls_head=f"{HEAD[:39]}5")
+    from src.kronos import KronosState
+    state = KronosState(str(tmp_path / "state.json"))
+    lines: list[str] = []
+    _run_judge_sweep(_cfg(tmp_path, dsn), dsn, services, state,
+                     lines.append, monkeypatch=monkeypatch)
+    assert services.summit_consumers == ["reviews:kronos/22"], \
+        (f"repo B's PR #800 was suppressed by repo A's terminal row: "
+         f"{services.summit_consumers}")
+    assert "o/live#800" in state.slot("judged"), state.slot("judged")
+    assert "o/ready#800" not in state.slot("judged"), \
+        "repo A's terminal PR was judged after all"
