@@ -100,11 +100,17 @@ def test_timer_is_persistent():
     assert d.get("Persistent") == ["true"]
 
 
-def test_units_verify_clean():
-    """`systemd-analyze verify` exits 0. ExecStart binaries live under the
-    deployed /opt tree, which CI boxes do not have — systemd-analyze then
-    only notes the missing interpreter (exit 0), which is what the sibling
-    units' test accepts too."""
+def test_units_verify_clean(tmp_path):
+    """`systemd-analyze verify` clean.
+
+    The ExecStart binaries live under the deployed /opt tree, which CI boxes
+    do not have — verify there only notes the missing interpreter (and exits
+    1, like it does for the sibling rhobear-neo units). So when the deployed
+    layout is absent, the verify runs inside a SYNTHETIC root
+    (--root=): the units plus the exact ExecStart paths as stub
+    executables. Exit 0 with zero output is the clean verdict; no root and
+    no systemd unit is started.
+    """
     if shutil.which("systemd-analyze") is None:
         pytest.skip("systemd-analyze not available")
     proc = subprocess.run(
@@ -112,10 +118,41 @@ def test_units_verify_clean():
         capture_output=True, text=True,
     )
     out = (proc.stdout + proc.stderr).strip()
-    assert proc.returncode == 0, f"systemd-analyze verify failed:\n{out}"
-    real_warnings = [
-        line for line in out.splitlines()
-        if "warning" in line.lower()
-        and "not executable" not in line
-    ]
-    assert not real_warnings, out
+    if proc.returncode == 0:
+        assert not [l for l in out.splitlines()
+                    if "warning" in l.lower() and "not executable" not in l], out
+        return
+    # Deployed layout absent -> synthetic root (the not-executable note is
+    # the trigger; anything else failing means a real unit problem).
+    if not all("not executable" in l for l in out.splitlines()):
+        pytest.fail(f"systemd-analyze verify failed:\n{out}")
+    root = tmp_path / "fakeroot"
+    (root / "etc/systemd/system").mkdir(parents=True)
+    (root / "usr/lib/systemd/system").mkdir(parents=True)
+    (root / "opt/rhobear/rhobear-kronos/.venv/bin").mkdir(parents=True)
+    (root / "opt/rhobear/bin").mkdir(parents=True)
+    (root / "usr/bin").mkdir(parents=True)
+    shutil.copy(SERVICE, root / "etc/systemd/system/rhobear-kronos.service")
+    shutil.copy(TIMER, root / "etc/systemd/system/rhobear-kronos.timer")
+    for target, source in (
+        ("opt/rhobear/rhobear-kronos/.venv/bin/python", "/usr/bin/python3"),
+        ("usr/bin/env", "/usr/bin/env"),
+    ):
+        if os.path.exists(source):
+            shutil.copy(source, root / target)
+            os.chmod(root / target, 0o755)
+    stub = root / "opt/rhobear/bin/vault-env"
+    stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    os.chmod(stub, 0o755)
+    for unit in ("sysinit.target", "basic.target"):
+        src = f"/usr/lib/systemd/system/{unit}"
+        if os.path.exists(src):
+            shutil.copy(src, root / "usr/lib/systemd/system" / unit)
+    proc2 = subprocess.run(
+        ["systemd-analyze", "verify",
+         f"--root={root}", "rhobear-kronos.service", "rhobear-kronos.timer"],
+        capture_output=True, text=True,
+    )
+    out2 = (proc2.stdout + proc2.stderr).strip()
+    assert proc2.returncode == 0, f"systemd-analyze verify failed:\n{out2}"
+    assert out2 == "", f"verify must be clean, got: {out2}"
