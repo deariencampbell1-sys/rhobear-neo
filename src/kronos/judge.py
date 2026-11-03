@@ -541,7 +541,7 @@ def _outbox_entry(repo: str, pr: int, *, comment: str | None,
 
 
 def _deliver_entry(state, entry: dict, comments, alerter,
-                   on_delivered=None) -> bool:
+                   on_delivered=None, budget_left=None) -> bool:
     """One delivery attempt for an outbox entry. The comment and the alert
     fail INDEPENDENTLY (a 403 comment never swallows the owner alert).
     Returns True when nothing is pending any more. `on_delivered` (r4
@@ -555,7 +555,11 @@ def _deliver_entry(state, entry: dict, comments, alerter,
             log.warning("kronos notify: comment for %s#%s failed (%s) — "
                         "stays in the outbox", entry["repo"], entry["pr"],
                         type(exc).__name__)
-    if entry.get("needs_alert") and entry.get("alert_fp"):
+    if (entry.get("needs_alert") and entry.get("alert_fp")
+            and budget_left is not None and budget_left() <= 0):
+        log.info("kronos notify: pass budget gone — alert %s stays "
+                 "pending", entry["alert_fp"])
+    elif entry.get("needs_alert") and entry.get("alert_fp"):
         try:
             alerter.alert(entry["alert_fp"], entry["alert_subject"],
                           entry["alert_body"])
@@ -599,7 +603,8 @@ def drain_notify_outbox(state, comments, alerter, *, budget_left=None,
             box.pop(key, None)
             continue
         if _deliver_entry(state, entry, comments, alerter,
-                          on_delivered=on_delivered):
+                          on_delivered=on_delivered,
+                          budget_left=budget_left):
             box.pop(key, None)
 
 
