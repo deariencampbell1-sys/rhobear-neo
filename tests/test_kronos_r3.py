@@ -1367,3 +1367,28 @@ def test_job_conflict_alert_needs_the_recorded_round_gone(monkeypatch,
     db = FakeDbR3(jobs=[])
     _resolve_fixed(cfg, state, [], db, lambda l: None, now_fn=lambda: 1.0)
     assert "job-conflict:o/r#52" not in state.slot("open_alerts")
+
+
+def test_budget_expiring_between_comment_and_alert_defers_the_alert():
+    """MEDIUM 1 residual: the clock is spent by the comment; the owner alert
+    (token mint + HTTP) must NOT start, and the entry stays pending."""
+    from src.kronos.judge import _outbox_entry, drain_notify_outbox
+    state = FakeStateR3()
+    alerter = FakeAlerterR3()
+    clock = {"left": 5.0}
+
+    class _Comments(FakeCommentsR3):
+        def __call__(self, repo, pr, body):
+            super().__call__(repo, pr, body)
+            clock["left"] = 0.0  # the comment used the last of the budget
+
+    comments = _Comments()
+    state.slot("notify_outbox")["o/r#9"] = _outbox_entry(
+        "o/r", 9, comment="c", alert_fp="fp", alert_subject="s",
+        alert_body="b")
+    drain_notify_outbox(state, comments, alerter,
+                        budget_left=lambda: clock["left"])
+    assert comments.posted, "the comment should have been sent"
+    assert alerter.alerts == [], "an alert started past the pass deadline"
+    entry = state.slot("notify_outbox")["o/r#9"]
+    assert entry["needs_alert"] is True and entry["needs_comment"] is False
