@@ -9,6 +9,7 @@ button and the credit meter.
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 
 import psycopg  # psycopg3
@@ -49,6 +50,44 @@ def _started_at(detail: dict, created_at) -> float:
     except (TypeError, ValueError):
         pass
     return created_at.timestamp()
+
+
+def _builder_job_exists(c, repo: str, pr: int, builder_round) -> bool | None:
+    """True when the builder job of `builder_round` exists, False when it
+    does not, None when it cannot be told (no neo_jobs table).
+
+    r4 MEDIUM 2 — an escalated DECISION is a settled outcome only when its
+    builder job exists; a decision without its job is a PARTIAL outcome."""
+    try:
+        round_no = int(builder_round)
+    except (TypeError, ValueError):
+        return None
+    try:
+        # to_regclass never errors (it returns NULL for a missing table) —
+        # a failed SELECT would abort the caller's transaction.
+        has_table = c.execute(
+            "SELECT to_regclass('neo_jobs') IS NOT NULL").fetchone()[0]
+    except Exception:  # noqa: BLE001 — unknown, not "missing"
+        return None
+    if not has_table:
+        return None
+    row = c.execute(
+        "SELECT 1 FROM neo_jobs WHERE kind='builder' AND repo=%s AND "
+        "pr_number=%s AND builder_round=%s LIMIT 1",
+        (repo, pr, round_no)).fetchone()
+    return row is not None
+
+
+# r4 (HIGH C, authorized Zeus interop change — Morpheus ruling 2026-11-02):
+# take_escalation() no longer DELETES the consumed advice's rows. They are
+# re-phased to this marker phase with a consumed_at timestamp, so there is
+# never a window with no marker between the consume and the recorded outcome
+# (the gap Kronos's judge could previously fall into). The marker is removed
+# only when the outcome records (escalate_pr's escalated row / the park row),
+# and is reclaimable after ESCALATION_INFLIGHT_STALE_SECS so a crashed Zeus
+# cannot block a PR forever. Kronos defers whenever the marker exists.
+ESCALATION_INFLIGHT_PHASE = "escalation-inflight"
+ESCALATION_INFLIGHT_STALE_SECS = 3600
 
 
 _TRUE_STRINGS = frozenset({"true", "1", "yes", "y", "on", "success", "green"})
@@ -193,15 +232,24 @@ class NeoState:
         One transaction under the per-PR advisory lock
         (pg_advisory_xact_lock(hashtext(repo||':'||pr))): re-checks that no
         newer escalating row appeared since the recovery loop's snapshot, then
-        deletes exactly this advice's rows (never a newer escalation's marker).
-        The lock serializes this check-then-delete-all against a concurrent
-        submit_escalation / phase-row INSERT, so a freshly-inserted newer
-        escalation is never clobbered (defect 1).
+        consumes exactly this advice's rows (never a newer escalation's
+        marker). The lock serializes this check-then-consume-all against a
+        concurrent submit_escalation / phase-row INSERT, so a freshly-inserted
+        newer escalation is never clobbered (defect 1).
+
+        r4 (HIGH C, authorized interop change): a successful consume does NOT
+        delete the rows — it re-phases them to ESCALATION_INFLIGHT_PHASE with
+        a consumed_at timestamp, so no gap without a marker exists between
+        the consume and escalate_pr recording its outcome. The marker is
+        removed only when the outcome records (clear_inflight_markers, called
+        by the escalation flow after act()) and is reclaimable after
+        ESCALATION_INFLIGHT_STALE_SECS (reclaim_stale_inflight) so a crashed
+        Zeus cannot block a PR forever.
 
         Returns True when the advice was current and is consumed (caller acts
         on it), False when it was superseded (caller drops it, logged, without
-        creating a round).  In both cases this advice's own rows are removed so
-        stale markers never accumulate.
+        creating a round). In the superseded case this advice's own rows are
+        removed — a newer escalation's marker exists, so there is no gap.
         """
         with psycopg.connect(self.dsn, autocommit=False) as c:
             try:
@@ -217,13 +265,24 @@ class NeoState:
                 ).fetchone()
                 newest_id = newest[0] if newest else None
                 if newest is not None and newest_id == (advice_id or ""):
-                    # Still the newest escalation — consume it AND any
-                    # superseded older rows (they are stale; nothing newer
-                    # exists to protect).
+                    # Only the advice that won the take becomes in-flight.
+                    # Older queued advice is superseded, not consumed: making
+                    # it in-flight would let it resurrect after this outcome.
                     c.execute(
                         "DELETE FROM neo_actions WHERE repo=%s AND pr_number=%s "
-                        "AND phase='escalating'",
-                        (repo, pr),
+                        "AND phase='escalating' "
+                        "AND COALESCE(detail->>'advice_id', '')<>%s",
+                        (repo, pr, advice_id or ""),
+                    )
+                    c.execute(
+                        "UPDATE neo_actions SET phase=%s, "
+                        "detail = detail || %s::jsonb "
+                        "WHERE repo=%s AND pr_number=%s "
+                        "AND phase='escalating' "
+                        "AND COALESCE(detail->>'advice_id', '')=%s",
+                        (ESCALATION_INFLIGHT_PHASE,
+                         json.dumps({"consumed_at": time.time()}),
+                         repo, pr, advice_id or ""),
                     )
                     c.commit()
                     return True
@@ -239,6 +298,191 @@ class NeoState:
             except Exception:
                 c.rollback()
                 raise
+
+    def clear_inflight_markers(
+            self, repo: str, pr: int, advice_id: str | None = None) -> int:
+        """Remove only the advice whose terminal outcome just recorded.
+
+        The live flow supplies advice_id. For legacy singleton callers, an
+        omitted id is accepted only with exactly one marker under the PR lock;
+        multiple owners must never be removed without a supplied identity.
+        """
+        with psycopg.connect(self.dsn, autocommit=False) as c:
+            try:
+                c.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                    (f"{repo}:{pr}",),
+                )
+                if advice_id is None:
+                    # Preserve the pre-r5 single-marker test/consumer contract,
+                    # but fail closed on ambiguous multi-advice cleanup.
+                    owners = c.execute(
+                        "SELECT COALESCE(detail->>'advice_id', '') "
+                        "FROM neo_actions WHERE repo=%s AND pr_number=%s "
+                        "AND phase=%s LIMIT 2",
+                        (repo, pr, ESCALATION_INFLIGHT_PHASE),
+                    ).fetchall()
+                    if len(owners) > 1:
+                        raise ValueError("advice_id required for multiple in-flight owners")
+                    if not owners:
+                        c.rollback()
+                        return 0
+                    advice_id = owners[0][0]
+                cur = c.execute(
+                    "DELETE FROM neo_actions WHERE repo=%s AND pr_number=%s "
+                    "AND phase=%s AND COALESCE(detail->>'advice_id', '')=%s",
+                    (repo, pr, ESCALATION_INFLIGHT_PHASE, advice_id),
+                )
+                removed = cur.rowcount
+                c.commit()
+                return removed
+            except Exception:
+                c.rollback()
+                raise
+
+    def reclaim_stale_inflight(
+            self, *,
+            stale_secs: int = ESCALATION_INFLIGHT_STALE_SECS) -> list[dict]:
+        """r4 (HIGH C): the in-flight marker is reclaimable — a crashed Zeus
+        cannot block a PR forever. Every in-flight marker whose consumed_at
+        is older than `stale_secs` is re-phased back to 'escalating' (detail
+        restored, consumed_at stripped) so the advice re-enters the normal
+        recovery pipeline (escalate_pr is idempotent per advice_id) — UNLESS
+        a newer escalating marker already owns the PR, in which case the
+        stale marker is simply dropped. Process newest first and compare
+        durable ids under each PR lock: an older recovered marker cannot
+        supersede a newer advice. Returns one row per reclaimed marker."""
+        now = time.time()
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT id, repo, pr_number, detail FROM neo_actions "
+                "WHERE phase=%s ORDER BY id DESC",
+                (ESCALATION_INFLIGHT_PHASE,),
+            ).fetchall()
+        out: list[dict] = []
+        for row_id, repo, pr, detail in rows:
+            if isinstance(detail, str):
+                try:
+                    detail = json.loads(detail)
+                except (TypeError, ValueError):
+                    detail = {}
+            detail = detail or {}
+            try:
+                consumed = float(detail.get("consumed_at") or 0)
+            except (TypeError, ValueError):
+                consumed = 0.0
+            if consumed <= 0 or now - consumed < stale_secs:
+                continue  # fresh marker: Zeus may still be mid-act
+            with psycopg.connect(self.dsn, autocommit=False) as c:
+                try:
+                    c.execute(
+                        "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                        (f"{repo}:{pr}",),
+                    )
+                    still = c.execute(
+                        "SELECT detail FROM neo_actions "
+                        "WHERE id=%s AND phase=%s",
+                        (row_id, ESCALATION_INFLIGHT_PHASE),
+                    ).fetchone()
+                    if not still:
+                        c.rollback()
+                        continue
+                    # ABA guard: the staleness decision was made on a
+                    # snapshot taken before the lock. Re-read the LIVE
+                    # consumed_at; a marker that was reclaimed and re-taken
+                    # meanwhile (changed / fresh consumed_at) is untouched.
+                    live = still[0]
+                    if isinstance(live, str):
+                        try:
+                            live = json.loads(live)
+                        except (TypeError, ValueError):
+                            live = {}
+                    try:
+                        live_consumed = float((live or {}).get("consumed_at") or 0)
+                    except (TypeError, ValueError):
+                        live_consumed = 0.0
+                    if (live_consumed != consumed
+                            or live_consumed <= 0
+                            or time.time() - live_consumed < stale_secs):
+                        c.rollback()
+                        continue
+                    # MEDIUM 2: the outcome may have committed before the
+                    # cleanup failed/crashed. A settled advice (its escalated
+                    # row, or any later parked row) is cleared without
+                    # re-acting, so no contradictory decision is appended.
+                    # r4 MEDIUM 2: an escalated row is a SETTLED outcome only
+                    # when its builder JOB exists — the decision without its
+                    # job is a PARTIAL outcome: it is re-driven (the recovery
+                    # repairs the missing job), never cleared as if the
+                    # round were done.
+                    settled = c.execute(
+                        "SELECT 1 FROM neo_actions WHERE repo=%s "
+                        "AND pr_number=%s AND id>%s AND phase='parked' AND "
+                        "head_sha=(SELECT head_sha FROM neo_actions WHERE "
+                        "id=%s) LIMIT 1",
+                        (repo, pr, row_id, row_id),
+                    ).fetchone()
+                    if not settled:
+                        candidates = c.execute(
+                            "SELECT builder_round FROM neo_actions WHERE "
+                            "repo=%s AND pr_number=%s AND id>%s AND "
+                            "phase='escalated' AND "
+                            "COALESCE(detail->>%s, '')=%s ORDER BY id DESC",
+                            (repo, pr, row_id, "advice_id",
+                             str(detail.get("advice_id") or "")),
+                        ).fetchall()
+                        for (round_no,) in candidates:
+                            job_state = _builder_job_exists(c, repo, pr,
+                                                            round_no)
+                            if job_state is True:
+                                # the decision's job EXISTS: the outcome is
+                                # settled and the marker may be cleared.
+                                settled = True
+                                break
+                            # False: the decision's job is missing — a
+                            # partial outcome, not settled, it must be
+                            # repaired.
+                            # None: the job state cannot be TOLD (neo_jobs
+                            # unreachable, the round unparseable) — also
+                            # NOT settled: an unknown state must never be
+                            # read as "the round is done" (it would delete
+                            # the only recovery marker of a decision whose
+                            # builder job may never have been created).
+                            # Both keep the marker: the round is re-driven.
+                            continue
+                    if settled:
+                        c.execute(
+                            "DELETE FROM neo_actions WHERE id=%s", (row_id,))
+                        c.commit()
+                        out.append({"repo": repo, "pr": pr,
+                                    "action": "cleared (outcome already "
+                                              "recorded)"})
+                        continue
+                    # Supersession is ordered by durable row id, not merely
+                    # the presence of any escalating row: older A must never
+                    # supersede newer B. Include live in-flight owners too.
+                    newer = c.execute(
+                        "SELECT 1 FROM neo_actions WHERE repo=%s "
+                        "AND pr_number=%s AND id>%s "
+                        "AND (phase='escalating' OR phase=%s) LIMIT 1",
+                        (repo, pr, row_id, ESCALATION_INFLIGHT_PHASE),
+                    ).fetchone()
+                    if newer:
+                        c.execute(
+                            "DELETE FROM neo_actions WHERE id=%s", (row_id,))
+                        action = "dropped (a newer escalation owns the PR)"
+                    else:
+                        c.execute(
+                            "UPDATE neo_actions SET phase='escalating', "
+                            "detail = detail - 'consumed_at' WHERE id=%s",
+                            (row_id,))
+                        action = "re-recorded"
+                    c.commit()
+                    out.append({"repo": repo, "pr": pr, "action": action})
+                except Exception:
+                    c.rollback()
+                    raise
+        return out
 
     def record_escalating(self, repo: str, pr: int, head_sha: str, *,
                           verdict: str = "ESCALATE", builder_round: int = 0,
@@ -291,6 +535,65 @@ class NeoState:
             return int(row[0])
         except (TypeError, ValueError):
             return None
+
+    def advisor_escalation_detail(self, repo: str, pr: int, advice_id: str):
+        """The COMMITTED escalation decision for `advice_id`: its round, its
+        head_sha and its detail (the recorded plan).  None when this advice
+        has not escalated.
+
+        r4 MEDIUM 2 — the decision (the 'escalated' row) is written BEFORE
+        the builder job is created; when the job insert fails the decision
+        exists without its effect.  This is the durable record the recovery
+        needs to REPAIR that partial outcome (never park it, never write a
+        second decision)."""
+        if not advice_id:
+            return None
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT builder_round, head_sha, detail FROM neo_actions "
+                "WHERE repo=%s AND pr_number=%s AND phase='escalated' AND "
+                "detail->>'advice_id'=%s ORDER BY id DESC LIMIT 1",
+                (repo, pr, str(advice_id)),
+            ).fetchone()
+        if not row:
+            return None
+        detail = row[2]
+        if isinstance(detail, str):
+            try:
+                detail = json.loads(detail)
+            except (TypeError, ValueError):
+                detail = {}
+        try:
+            round_no = int(row[0])
+        except (TypeError, ValueError):
+            round_no = 0
+        return {"round": round_no, "head_sha": str(row[1] or ""),
+                "detail": detail if isinstance(detail, dict) else {}}
+
+    def builder_job_state(self, repo: str, pr: int, builder_round: int):
+        """The state of the builder job of `builder_round` ('queued',
+        'running', 'done', ...), or None when the job does not exist.
+
+        neo_jobs lives in the SAME database (ensure_schema delegates to
+        jobs.py) — this is the read side of the repair: a committed
+        decision whose job is missing is a PARTIAL outcome."""
+        try:
+            round_no = int(builder_round)
+        except (TypeError, ValueError):
+            return None
+        with self._conn() as c:
+            try:
+                has_table = c.execute(
+                    "SELECT to_regclass('neo_jobs') IS NOT NULL").fetchone()[0]
+            except Exception:  # noqa: BLE001 — unknown, not "missing"
+                return None
+            if not has_table:
+                return None
+            row = c.execute(
+                "SELECT state FROM neo_jobs WHERE kind='builder' AND repo=%s "
+                "AND pr_number=%s AND builder_round=%s LIMIT 1",
+                (repo, pr, round_no)).fetchone()
+        return str(row[0]) if row else None
 
     def already_escalated(self, repo: str, pr: int) -> bool:
         """True once this PR has had its ONE genuine advisor-escalated round.

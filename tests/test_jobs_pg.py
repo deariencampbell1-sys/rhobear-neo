@@ -603,6 +603,10 @@ class TestIdempotencyGate:
                     "headRefOid": SHA1,
                     "state": "OPEN",
                     "mergeable": "MERGEABLE",
+                    # the merge executor's fail-closed cross-repo check
+                    # reads this field: a PR view without it is NOT proof
+                    # that the PR lives in the target repo
+                    "isCrossRepository": False,
                     "reviews": [
                         {"body": "Looks good. COVERAGE: COMPLETE",
                          "commit_id": SHA1,

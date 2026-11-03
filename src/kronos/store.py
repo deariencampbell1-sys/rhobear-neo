@@ -1,0 +1,384 @@
+"""Kronos's ONLY writer — the two state shapes Zeus already consumes.
+
+r2 (HIGH 2 + HIGH 6): the r1 judge called db.record()/db.create_builder() on
+a READ-ONLY rows adapter that has neither, so neither Summit decision could
+ever be written. r2 gives the judge one writer with the same deconfliction
+semantics Zeus's own escalation path uses (src/escalation.py — read, never
+touched): ONE Postgres transaction per decision, under the per-PR advisory
+lock `pg_advisory_xact_lock(hashtext(repo||':'||pr))`, which re-checks
+BEFORE inserting:
+
+  - no `escalating` marker (Zeus's advisor path owns the PR),
+  - no `escalated` marker with an advisor_round (already escalated/stopped),
+  - no `merged` row (nothing left to judge — HIGH 2, r3),
+  - no `ready` row (Zeus accepted the PR — HIGH 2, r3),
+  - Zeus was not recently active on the PR (r3 HIGH 4: the consume-then-act
+    gap — Zeus's take_escalation commits the marker's deletion BEFORE
+    escalate_pr records the outcome, so in that window neither marker
+    exists; recent activity is the durable evidence that the PR is
+    mid-flight),
+  - MAX(builder_round) over builder rows < 6 (the round-six ceiling: 5
+    normal rounds + at most 1 escalated round = 6, NEVER a 7th),
+  - the new advisor_round itself <= 6,
+  - an injected `authority` callable (r3 HIGH 2) re-proves the PR's
+    GitHub-side state inside the lock before the write.
+
+If any check fails the decision is DEFERRED — (False, one-line reason), no
+row, no error — so a race with Zeus or a legacy/inconsistent history can
+never produce a second escalation or a 7th round.
+
+r3 (HIGH 1): the job write is a FRESH-ONLY
+`INSERT ... ON CONFLICT DO NOTHING` — never the re-arming upsert
+Jobs.create_builder uses. Kronos NEVER re-queues, re-arms or releases an
+existing job (the read-only ruling): if any job row already exists for the
+round — parked, expired-running, done, anything — the decision defers and
+the conflict is alerted by the caller. `escalate` inserts the neo_actions
+escalated row AND the round-N builder job in that same transaction; `stop`
+inserts only the stop marker Zeus's already_escalated() consumes.
+"""
+from __future__ import annotations
+
+import json
+
+import psycopg
+
+from . import BudgetSpent
+
+#: 5 normal Zeus fix rounds + at most 1 Kronos escalated round.
+ROUND_CEILING = 6
+
+#: The smallest remaining pass budget (seconds) at which a DB write may
+#: still START, or continue at a stage boundary.
+#:
+#: r5 MEDIUM 1 — the CONNECT is whole-second work.  libpq parses
+#: `connect_timeout` as a WHOLE number of seconds and truncates a
+#: fraction to 0, and 0 means "wait forever" (measured on the build box:
+#: a 0.2 s connect_timeout waited 130 s!).  Even a whole second can
+#: overshoot the request by up to a second (measured: a 1 s
+#: connect_timeout took 2.00 s).  So a DB write needs a whole second to
+#: connect, a second of headroom for that overshoot, and a second for
+#: its statements: below MIN_DB_START_SECS the write does not start at
+#: all (BudgetSpent) and is deferred to the next pass.
+MIN_DB_START_SECS = 3.0
+
+#: How many DB statements ONE write performs (the advisory lock, the
+#: defer reads, the action insert, the job insert, the commit).  The
+#: statement timeout is what is LEFT of the budget DIVIDED by them, so
+#: the SUM of the statements fits in the remaining budget — bounding each
+#: statement independently would let their sum overrun the deadline.
+WRITE_STATEMENTS = 6
+
+#: Default quiet window (seconds): a PR Zeus touched more recently than this
+#: may be inside the consume-then-act gap (HIGH 4) — defer.
+DEFAULT_QUIET_SECS = 3600
+
+#: The fresh-only job insert (HIGH 1, r3): ON CONFLICT DO NOTHING — a
+#: pre-existing row of the same round is NEVER re-armed. The caller alerts
+#: on the conflict.
+_JOBS_INSERT_FRESH = (
+    "INSERT INTO neo_jobs "
+    "(kind, repo, pr_number, head_sha, wake_color, builder_round, "
+    " state, payload, max_attempts) "
+    "VALUES ('builder', %s, %s, %s, false, %s, 'queued', %s, %s) "
+    "ON CONFLICT (repo, pr_number, builder_round) WHERE kind = 'builder' "
+    "DO NOTHING "
+    "RETURNING id"
+)
+
+JOB_EXISTS_REASON = (
+    "deferred: builder job for this round already exists "
+    "(fresh-only insert — never re-armed an existing job)")
+
+
+def _defer_reason(cur, repo: str, pr: int, advisor_round: int, *,
+                  quiet_secs: int = DEFAULT_QUIET_SECS) -> str:
+    """The reason the CAS must defer, or '' when the write may proceed.
+    Runs INSIDE the advisory-locked transaction (compare-and-set)."""
+    row = cur.execute(
+        "SELECT 1 FROM neo_actions WHERE phase='escalating' "
+        "AND repo = %s AND pr_number = %s LIMIT 1", (repo, pr)).fetchone()
+    if row:
+        return "deferred: Zeus advisor escalation is in flight"
+    # r4 (HIGH C): Zeus's take_escalation now leaves a durable in-flight
+    # marker (authorized interop change) until its outcome records. The old
+    # quiet-window recency check could NOT see a just-consumed marker over
+    # stale history; this one can, and Kronos defers whenever it exists.
+    row = cur.execute(
+        "SELECT 1 FROM neo_actions WHERE phase='escalation-inflight' "
+        "AND repo = %s AND pr_number = %s LIMIT 1", (repo, pr)).fetchone()
+    if row:
+        return ("deferred: Zeus escalation is mid-flight (the consumed "
+                "advice's in-flight marker is present)")
+    row = cur.execute(
+        "SELECT 1 FROM neo_actions WHERE phase='escalated' "
+        "AND detail->'advisor_round' IS NOT NULL "
+        "AND repo = %s AND pr_number = %s LIMIT 1", (repo, pr)).fetchone()
+    if row:
+        return "deferred: already escalated or stopped"
+    row = cur.execute(
+        "SELECT 1 FROM neo_actions WHERE repo = %s AND pr_number = %s "
+        "AND phase = 'merged' LIMIT 1", (repo, pr)).fetchone()
+    if row:
+        return "deferred: PR is merged (nothing left to judge)"
+    row = cur.execute(
+        "SELECT 1 FROM neo_actions WHERE repo = %s AND pr_number = %s "
+        "AND phase = 'ready' LIMIT 1", (repo, pr)).fetchone()
+    if row:
+        return "deferred: PR is ready (Zeus accepted it)"
+    # Round-six ceiling: a HARD safety check, ahead of the liveness defers.
+    max_round = cur.execute(
+        "SELECT COALESCE(MAX(builder_round), 0) FROM neo_actions "
+        "WHERE repo = %s AND pr_number = %s AND phase = 'builder'",
+        (repo, pr)).fetchone()[0]
+    if int(max_round or 0) >= ROUND_CEILING:
+        return (f"deferred: round-six ceiling — {int(max_round)} builder "
+                f"rounds already recorded, never a 7th")
+    if advisor_round > ROUND_CEILING:
+        return (f"deferred: refusing to create round {advisor_round} "
+                f"(ceiling {ROUND_CEILING})")
+    # HIGH 4 (r3): Zeus deletes the 'escalating' marker (take_escalation)
+    # BEFORE escalate_pr records the outcome. In that window neither marker
+    # exists; recent activity on the PR is the durable evidence that a Zeus
+    # escalation is mid-flight. The advisory lock does NOT serialize Zeus's
+    # whole action, so Kronos defers on recency instead.
+    row = cur.execute(
+        "SELECT EXTRACT(EPOCH FROM (now() - MAX(created_at))) FROM neo_actions "
+        "WHERE repo = %s AND pr_number = %s", (repo, pr)).fetchone()
+    age = row[0] if row and row[0] is not None else None
+    if age is not None and float(age) < quiet_secs:
+        return (f"deferred: Zeus touched this PR {int(float(age))}s ago "
+                f"(an escalation may be mid-flight; quiet window "
+                f"{quiet_secs}s)")
+    row = cur.execute(
+        "SELECT EXTRACT(EPOCH FROM (now() - MAX(updated_at))) FROM neo_jobs "
+        "WHERE kind='builder' AND repo = %s AND pr_number = %s",
+        (repo, pr)).fetchone()
+    age = row[0] if row and row[0] is not None else None
+    if age is not None and float(age) < quiet_secs:
+        return (f"deferred: this PR's Zeus job moved {int(float(age))}s ago "
+                f"(an escalation may be mid-flight; quiet window "
+                f"{quiet_secs}s)")
+    return ""
+
+
+class SqlWrites:
+    """The judge's writes against the shared reviews DSN. Every decision is
+    one transaction: lock -> re-check -> insert -> commit."""
+
+    def __init__(self, dsn: str, *, quiet_secs: int = DEFAULT_QUIET_SECS,
+                 connect_timeout: int = 15,
+                 statement_timeout_ms: int = 15000,
+                 budget_left=None):
+        self.dsn = dsn
+        self.quiet_secs = int(quiet_secs)
+        self.connect_timeout = max(1, int(connect_timeout))
+        self.statement_timeout_ms = max(1, int(statement_timeout_ms))
+        # r4 MEDIUM 1 — the pass budget (seconds LEFT).  The DB work of a
+        # pass is bounded by it: a write started at the end of the pass can
+        # never overrun the deadline.
+        self._budget_left = budget_left
+
+    def _budget_left_secs(self) -> float | None:
+        """Seconds LEFT of the pass budget (None = no budget bound)."""
+        if self._budget_left is None:
+            return None
+        return float(self._budget_left())
+
+    def _timeouts(self, left: float | None = None) -> tuple[int, int]:
+        """(connect_timeout, statement_timeout_ms) — what is LEFT of the pass
+        budget, never a free-standing cap that can overrun the deadline.
+
+        r4 MEDIUM 1: an exhausted budget means the write does not start at
+        all (BudgetSpent) — exactly like every other side effect of the
+        pass.  Without a pass budget the plain timeouts stand.
+
+        r5 MEDIUM 1: the CONNECT is whole-second work — libpq truncates a
+        fractional connect_timeout to 0, and 0 means "wait forever"
+        (measured: a 0.2 s connect_timeout waited 130 s!) — and even a
+        whole second can overshoot the request by up to a second
+        (measured: a 1 s connect_timeout took 2.00 s).  So the connect
+        takes at most floor(left) - 1 seconds: the connect can never
+        outlive the deadline it protects.  The statement timeout is
+        milliseconds and is what is left DIVIDED by the write's
+        statements, so their SUM fits in the remaining budget."""
+        connect = self.connect_timeout
+        statement = self.statement_timeout_ms
+        if left is None:
+            left = self._budget_left_secs()
+        if left is not None:
+            if left <= 0:
+                raise BudgetSpent(
+                    "pass budget exhausted before the DB write")
+            # The CONNECT may use at most HALF the remaining budget: its
+            # wall clock can exceed its timeout by up to a second, and the
+            # statements still need their share.
+            connect = max(1, min(connect, int(left / 2) - 1))
+            # The statements share what the connect leaves, DIVIDED by the
+            # write's statement count: bounding each statement
+            # independently would let their SUM overrun the deadline.
+            stmt_left = left - (connect + 1)
+            statement = max(1, min(statement,
+                                   int(stmt_left * 1000) // WRITE_STATEMENTS))
+        return connect, statement
+    def _stage_timeout(self, stage: str) -> int:
+        """The pass budget re-read at a DB STAGE boundary: the connect
+        itself consumed budget, so the statements are bounded by what is
+        LEFT NOW — and the stage does not start at all when too little is
+        left.
+
+        r5 MEDIUM 1.  Raises BudgetSpent; the caller rolls the transaction
+        back, so a refused write leaves NOTHING behind."""
+        left = self._budget_left_secs()
+        if left is None:
+            return self.statement_timeout_ms
+        if left < MIN_DB_START_SECS:
+            raise BudgetSpent(f"pass budget too small before {stage}")
+        return max(1, min(self.statement_timeout_ms,
+                          int(left * 1000) // WRITE_STATEMENTS))
+
+    def _require_budget(self, stage: str) -> None:
+        """r5 MEDIUM 1 — the budget is re-read at EVERY stage boundary of a
+        write (the connect, the lock and the defer reads all consume it).
+        A write whose budget died before its INSERT does not start the
+        INSERT: the transaction rolls back and NOTHING is left behind."""
+        left = self._budget_left_secs()
+        if left is not None and left < MIN_DB_START_SECS:
+            raise BudgetSpent(f"pass budget too small before {stage}")
+
+    def _connect(self):
+        left = self._budget_left_secs()
+        if left is not None and left < MIN_DB_START_SECS:
+            # r5 MEDIUM 1: the write does not START at all when the budget
+            # cannot pay for a whole second of connect plus its headroom.
+            raise BudgetSpent("pass budget too small to start the DB write")
+        connect_timeout, _ = self._timeouts(left=left)
+        conn = psycopg.connect(self.dsn, autocommit=False,
+                               connect_timeout=connect_timeout)
+        try:
+            # The connect consumed budget: re-read what is LEFT and bound
+            # the statements by it (r5 MEDIUM 1).
+            statement_timeout_ms = self._stage_timeout("the DB statements")
+            # SET cannot take a bound parameter: inline the validated int.
+            conn.execute(f"SET LOCAL statement_timeout = "
+                         f"{int(statement_timeout_ms)}")
+        except Exception:
+            conn.close()
+            raise
+        return conn
+
+    def escalate(self, repo: str, pr: int, head_sha: str, *,
+                 advisor_round: int, detail: dict,
+                 builder_payload: dict,
+                 max_attempts: int = 3,
+                 authority=None) -> tuple[bool, str]:
+        """`yes` -> the ONE escalated Zeus round whose brief is the plan.
+
+        `authority` (r3 HIGH 2) re-proves the PR's GitHub-side state INSIDE
+        the lock: zero-arg callable -> (ok, reason). A refusal defers."""
+        # The CAS re-check keys on detail->'advisor_round' — inject it so the
+        # idempotency never depends on the caller remembering it.
+        detail = dict(detail or {})
+        detail.setdefault("advisor_round", advisor_round)
+        with self._connect() as conn:
+            try:
+                cur = conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                    (f"{repo}:{pr}",))
+                reason = _defer_reason(cur, repo, pr, advisor_round,
+                                       quiet_secs=self.quiet_secs)
+                if not reason and authority is not None:
+                    ok, why = authority()
+                    if not ok:
+                        reason = f"deferred: {why}"
+                if reason:
+                    conn.rollback()
+                    return False, reason
+                # r5 MEDIUM 1 — the budget is re-read before the durable
+                # INSERT: the connect and the defer reads consumed it.
+                self._require_budget("the escalation write")
+                cur.execute(
+                    "INSERT INTO neo_actions(repo,pr_number,head_sha,phase,"
+                    "builder_round,verdict,credits,detail) "
+                    "VALUES (%s,%s,%s,'escalated',%s,'ESCALATE',0,%s)",
+                    (repo, pr, head_sha, advisor_round,
+                     json.dumps(detail or {})))
+                cur.execute(_JOBS_INSERT_FRESH,
+                            (repo, pr, head_sha, advisor_round,
+                             json.dumps(builder_payload or {}),
+                             max_attempts))
+                job_row = cur.fetchone()
+                if job_row is None:
+                    # HIGH 1 (r3): a job row already exists for this round —
+                    # never re-arm it. The whole decision rolls back.
+                    conn.rollback()
+                    return False, JOB_EXISTS_REASON
+                conn.commit()
+                return True, (f"escalated round {advisor_round} recorded "
+                              f"(5 normal + 1 escalated = 6, never a 7th)")
+            except Exception:
+                conn.rollback()
+                raise
+
+    def stop(self, repo: str, pr: int, head_sha: str, *,
+             advisor_round: int, detail: dict,
+             authority=None) -> tuple[bool, str]:
+        """`no` / bad / timeout -> the stop marker Zeus checks before any
+        further round (already_escalated) — no builder job, ever."""
+        # Same defense as escalate(): the CAS re-check keys on
+        # detail->'advisor_round' — never depend on the caller for it.
+        detail = dict(detail or {})
+        detail.setdefault("advisor_round", advisor_round)
+        with self._connect() as conn:
+            try:
+                cur = conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                    (f"{repo}:{pr}",))
+                reason = _defer_reason(cur, repo, pr, advisor_round,
+                                       quiet_secs=self.quiet_secs)
+                if not reason and authority is not None:
+                    ok, why = authority()
+                    if not ok:
+                        reason = f"deferred: {why}"
+                if reason:
+                    conn.rollback()
+                    return False, reason
+                # r5 MEDIUM 1 — the budget is re-read before the durable
+                # INSERT (the stop marker is as durable as the escalation).
+                self._require_budget("the stop marker write")
+                cur.execute(
+                    "INSERT INTO neo_actions(repo,pr_number,head_sha,phase,"
+                    "builder_round,verdict,credits,detail) "
+                    "VALUES (%s,%s,%s,'escalated',0,'PARKED',0,%s)",
+                    (repo, pr, head_sha, json.dumps(detail or {})))
+                conn.commit()
+                return True, "stop marker recorded (Zeus is off this PR)"
+            except Exception:
+                conn.rollback()
+                raise
+
+    def mark_notified(self, repo: str, pr: int) -> int:
+        """r4 HIGH D — the durable delivered-flag on this PR's committed
+        Kronos decision rows (stop marker and/or escalated marker). The
+        notification reconstruction (src/kronos/judge.py) skips rows that
+        carry it, so a committed decision is re-notified at most once more
+        (at-least-once alerting). Kronos's OWN rows only — the WHERE clause
+        pins detail.kronos."""
+        with self._connect() as conn:
+            try:
+                cur = conn.execute(
+                    "UPDATE neo_actions SET detail = jsonb_set("
+                    "detail, '{kronos_notified}', 'true'::jsonb) "
+                    "WHERE repo=%s AND pr_number=%s AND phase='escalated' "
+                    "AND COALESCE(detail->'kronos_notified',"
+                    "'false'::jsonb) <> 'true'::jsonb "
+                    "AND (detail->'kronos_stop' = 'true'::jsonb "
+                    "     OR (detail->'kronos' = 'true'::jsonb "
+                    "         AND position('kronos:' in "
+                    "                      detail->>'advice_id') = 1))",
+                    (repo, pr))
+                marked = cur.rowcount
+                conn.commit()
+                return marked
+            except Exception:
+                conn.rollback()
+                raise
