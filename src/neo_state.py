@@ -354,10 +354,30 @@ class NeoState:
                         (f"{repo}:{pr}",),
                     )
                     still = c.execute(
-                        "SELECT 1 FROM neo_actions WHERE id=%s AND phase=%s",
+                        "SELECT detail FROM neo_actions "
+                        "WHERE id=%s AND phase=%s",
                         (row_id, ESCALATION_INFLIGHT_PHASE),
                     ).fetchone()
                     if not still:
+                        c.rollback()
+                        continue
+                    # ABA guard: the staleness decision was made on a
+                    # snapshot taken before the lock. Re-read the LIVE
+                    # consumed_at; a marker that was reclaimed and re-taken
+                    # meanwhile (changed / fresh consumed_at) is untouched.
+                    live = still[0]
+                    if isinstance(live, str):
+                        try:
+                            live = json.loads(live)
+                        except (TypeError, ValueError):
+                            live = {}
+                    try:
+                        live_consumed = float((live or {}).get("consumed_at") or 0)
+                    except (TypeError, ValueError):
+                        live_consumed = 0.0
+                    if (live_consumed != consumed
+                            or live_consumed <= 0
+                            or time.time() - live_consumed < stale_secs):
                         c.rollback()
                         continue
                     # MEDIUM 2: the outcome may have committed before the
