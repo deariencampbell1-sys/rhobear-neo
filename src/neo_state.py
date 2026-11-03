@@ -432,13 +432,24 @@ class NeoState:
                              str(detail.get("advice_id") or "")),
                         ).fetchall()
                         for (round_no,) in candidates:
-                            if _builder_job_exists(c, repo, pr,
-                                                   round_no) is False:
-                                # the decision's job is missing: a partial
-                                # outcome — not settled, it must be repaired.
-                                continue
-                            settled = True
-                            break
+                            job_state = _builder_job_exists(c, repo, pr,
+                                                            round_no)
+                            if job_state is True:
+                                # the decision's job EXISTS: the outcome is
+                                # settled and the marker may be cleared.
+                                settled = True
+                                break
+                            # False: the decision's job is missing — a
+                            # partial outcome, not settled, it must be
+                            # repaired.
+                            # None: the job state cannot be TOLD (neo_jobs
+                            # unreachable, the round unparseable) — also
+                            # NOT settled: an unknown state must never be
+                            # read as "the round is done" (it would delete
+                            # the only recovery marker of a decision whose
+                            # builder job may never have been created).
+                            # Both keep the marker: the round is re-driven.
+                            continue
                     if settled:
                         c.execute(
                             "DELETE FROM neo_actions WHERE id=%s", (row_id,))

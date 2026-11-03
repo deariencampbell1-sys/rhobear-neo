@@ -44,7 +44,7 @@ class GithubIssueClient:
 
     @staticmethod
     def _default_http(method: str, url: str, *, headers: dict, body=None,
-                      timeout: int = 30):
+                      timeout: float = 30):
         req = urllib.request.Request(url, data=body, method=method,
                                      headers=headers)
         try:

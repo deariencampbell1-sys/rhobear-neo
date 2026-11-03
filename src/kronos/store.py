@@ -47,6 +47,27 @@ from . import BudgetSpent
 #: 5 normal Zeus fix rounds + at most 1 Kronos escalated round.
 ROUND_CEILING = 6
 
+#: The smallest remaining pass budget (seconds) at which a DB write may
+#: still START, or continue at a stage boundary.
+#:
+#: r5 MEDIUM 1 — the CONNECT is whole-second work.  libpq parses
+#: `connect_timeout` as a WHOLE number of seconds and truncates a
+#: fraction to 0, and 0 means "wait forever" (measured on the build box:
+#: a 0.2 s connect_timeout waited 130 s!).  Even a whole second can
+#: overshoot the request by up to a second (measured: a 1 s
+#: connect_timeout took 2.00 s).  So a DB write needs a whole second to
+#: connect, a second of headroom for that overshoot, and a second for
+#: its statements: below MIN_DB_START_SECS the write does not start at
+#: all (BudgetSpent) and is deferred to the next pass.
+MIN_DB_START_SECS = 3.0
+
+#: How many DB statements ONE write performs (the advisory lock, the
+#: defer reads, the action insert, the job insert, the commit).  The
+#: statement timeout is what is LEFT of the budget DIVIDED by them, so
+#: the SUM of the statements fits in the remaining budget — bounding each
+#: statement independently would let their sum overrun the deadline.
+WRITE_STATEMENTS = 6
+
 #: Default quiet window (seconds): a PR Zeus touched more recently than this
 #: may be inside the consume-then-act gap (HIGH 4) — defer.
 DEFAULT_QUIET_SECS = 3600
@@ -157,33 +178,92 @@ class SqlWrites:
         # never overrun the deadline.
         self._budget_left = budget_left
 
-    def _timeouts(self) -> tuple[int, int]:
+    def _budget_left_secs(self) -> float | None:
+        """Seconds LEFT of the pass budget (None = no budget bound)."""
+        if self._budget_left is None:
+            return None
+        return float(self._budget_left())
+
+    def _timeouts(self, left: float | None = None) -> tuple[int, int]:
         """(connect_timeout, statement_timeout_ms) — what is LEFT of the pass
         budget, never a free-standing cap that can overrun the deadline.
 
         r4 MEDIUM 1: an exhausted budget means the write does not start at
         all (BudgetSpent) — exactly like every other side effect of the
-        pass.  Without a pass budget the plain timeouts stand."""
+        pass.  Without a pass budget the plain timeouts stand.
+
+        r5 MEDIUM 1: the CONNECT is whole-second work — libpq truncates a
+        fractional connect_timeout to 0, and 0 means "wait forever"
+        (measured: a 0.2 s connect_timeout waited 130 s!) — and even a
+        whole second can overshoot the request by up to a second
+        (measured: a 1 s connect_timeout took 2.00 s).  So the connect
+        takes at most floor(left) - 1 seconds: the connect can never
+        outlive the deadline it protects.  The statement timeout is
+        milliseconds and is what is left DIVIDED by the write's
+        statements, so their SUM fits in the remaining budget."""
         connect = self.connect_timeout
         statement = self.statement_timeout_ms
-        if self._budget_left is not None:
-            left = float(self._budget_left())
+        if left is None:
+            left = self._budget_left_secs()
+        if left is not None:
             if left <= 0:
                 raise BudgetSpent(
                     "pass budget exhausted before the DB write")
-            # the statement timeout is milliseconds — it can be bounded
-            # below a second; the connect timeout is whole seconds.
-            connect = max(1, min(connect, int(left) or 1))
-            statement = max(1, min(statement, int(left * 1000)))
+            # The CONNECT may use at most HALF the remaining budget: its
+            # wall clock can exceed its timeout by up to a second, and the
+            # statements still need their share.
+            connect = max(1, min(connect, int(left / 2) - 1))
+            # The statements share what the connect leaves, DIVIDED by the
+            # write's statement count: bounding each statement
+            # independently would let their SUM overrun the deadline.
+            stmt_left = left - (connect + 1)
+            statement = max(1, min(statement,
+                                   int(stmt_left * 1000) // WRITE_STATEMENTS))
         return connect, statement
+    def _stage_timeout(self, stage: str) -> int:
+        """The pass budget re-read at a DB STAGE boundary: the connect
+        itself consumed budget, so the statements are bounded by what is
+        LEFT NOW — and the stage does not start at all when too little is
+        left.
+
+        r5 MEDIUM 1.  Raises BudgetSpent; the caller rolls the transaction
+        back, so a refused write leaves NOTHING behind."""
+        left = self._budget_left_secs()
+        if left is None:
+            return self.statement_timeout_ms
+        if left < MIN_DB_START_SECS:
+            raise BudgetSpent(f"pass budget too small before {stage}")
+        return max(1, min(self.statement_timeout_ms,
+                          int(left * 1000) // WRITE_STATEMENTS))
+
+    def _require_budget(self, stage: str) -> None:
+        """r5 MEDIUM 1 — the budget is re-read at EVERY stage boundary of a
+        write (the connect, the lock and the defer reads all consume it).
+        A write whose budget died before its INSERT does not start the
+        INSERT: the transaction rolls back and NOTHING is left behind."""
+        left = self._budget_left_secs()
+        if left is not None and left < MIN_DB_START_SECS:
+            raise BudgetSpent(f"pass budget too small before {stage}")
 
     def _connect(self):
-        connect_timeout, statement_timeout_ms = self._timeouts()
+        left = self._budget_left_secs()
+        if left is not None and left < MIN_DB_START_SECS:
+            # r5 MEDIUM 1: the write does not START at all when the budget
+            # cannot pay for a whole second of connect plus its headroom.
+            raise BudgetSpent("pass budget too small to start the DB write")
+        connect_timeout, _ = self._timeouts(left=left)
         conn = psycopg.connect(self.dsn, autocommit=False,
                                connect_timeout=connect_timeout)
-        # SET cannot take a bound parameter: inline the validated int.
-        conn.execute(f"SET LOCAL statement_timeout = "
-                     f"{int(statement_timeout_ms)}")
+        try:
+            # The connect consumed budget: re-read what is LEFT and bound
+            # the statements by it (r5 MEDIUM 1).
+            statement_timeout_ms = self._stage_timeout("the DB statements")
+            # SET cannot take a bound parameter: inline the validated int.
+            conn.execute(f"SET LOCAL statement_timeout = "
+                         f"{int(statement_timeout_ms)}")
+        except Exception:
+            conn.close()
+            raise
         return conn
 
     def escalate(self, repo: str, pr: int, head_sha: str, *,
@@ -213,6 +293,9 @@ class SqlWrites:
                 if reason:
                     conn.rollback()
                     return False, reason
+                # r5 MEDIUM 1 — the budget is re-read before the durable
+                # INSERT: the connect and the defer reads consumed it.
+                self._require_budget("the escalation write")
                 cur.execute(
                     "INSERT INTO neo_actions(repo,pr_number,head_sha,phase,"
                     "builder_round,verdict,credits,detail) "
@@ -259,6 +342,9 @@ class SqlWrites:
                 if reason:
                     conn.rollback()
                     return False, reason
+                # r5 MEDIUM 1 — the budget is re-read before the durable
+                # INSERT (the stop marker is as durable as the escalation).
+                self._require_budget("the stop marker write")
                 cur.execute(
                     "INSERT INTO neo_actions(repo,pr_number,head_sha,phase,"
                     "builder_round,verdict,credits,detail) "

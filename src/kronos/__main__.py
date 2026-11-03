@@ -84,31 +84,54 @@ _HTTP_TIMEOUT_SECS = 30
 _DB_TIMEOUT_SECS = 15
 
 
-def _mint_timeout(left_fn) -> int:
+def _budget_timeout(left: float, cap: int) -> float:
+    """The timeout of ONE call: what is LEFT of the pass budget, never more.
+
+    r5 MEDIUM 1 — the old helpers floored the timeout to ONE second, so a
+    0.2 s remainder bought a FULL SECOND of network time: the call
+    outlived the deadline it was supposed to protect.  A whole-second
+    timeout is used while at least a second is left (never more than the
+    remainder); below that the EXACT remainder is used — urllib's socket
+    timeout accepts a fraction, so the call still cannot outlive the
+    deadline.
+    """
+    if left >= 1:
+        return max(1, min(int(cap), int(left)))
+    return min(float(cap), left)
+
+
+def _mint_timeout(left_fn) -> float:
     """r4 MEDIUM E — a token mint's HTTP timeout is bounded by what is LEFT
     of the pass budget (the App client's own default is a free-standing
     30 s).  r4 MEDIUM 1 — an EXHAUSTED budget (nothing left) is never
-    floored to one second: the mint does not start at all (BudgetSpent)."""
+    floored to one second: the mint does not start at all (BudgetSpent).
+
+    r5 MEDIUM 1 — and a sub-second remainder is honoured EXACTLY (a
+    fraction), never rounded up to a whole second that outlives the
+    deadline."""
     if left_fn is None:
         return _HTTP_TIMEOUT_SECS
     left = float(left_fn())
     if left <= 0:
         raise BudgetSpent("pass budget exhausted before the token mint")
-    return max(1, min(_HTTP_TIMEOUT_SECS, int(left)))
+    return _budget_timeout(left, _HTTP_TIMEOUT_SECS)
 
 
-def _http_timeout(left_fn, cap: int = _HTTP_TIMEOUT_SECS) -> int:
+def _http_timeout(left_fn, cap: int = _HTTP_TIMEOUT_SECS) -> float:
     """The timeout of ONE http call: what is LEFT of the pass budget, never
     a free-standing cap.
 
     r4 MEDIUM 1 — an EXHAUSTED budget (nothing left) is never floored to one
-    second: the call does not start at all (BudgetSpent)."""
+    second: the call does not start at all (BudgetSpent).
+
+    r5 MEDIUM 1 — a sub-second remainder is honoured exactly (a fraction),
+    never rounded up to a whole second that outlives the deadline."""
     if left_fn is None:
         return int(cap)
     left = float(left_fn())
     if left <= 0:
         raise BudgetSpent("pass budget exhausted before the HTTP call")
-    return max(1, min(int(cap), int(left)))
+    return _budget_timeout(left, int(cap))
 
 #: The judge sweep's page (HIGH 3, r3): filtered, quiet, undecided PRs only,
 #: keyset-paged past the persisted cursor. The NOT EXISTS clause drops
@@ -675,6 +698,13 @@ def _judge_sweep(cfg, state, db, services, out, *, now_fn, left_fn, clamp):
                 github=services.http, github_timeout=clamp(15),
                 apollo_login=cfg.apollo_login,
                 timeout=clamp(cfg.judge_timeout_secs))
+        except BudgetSpent:
+            # r5 MEDIUM 1 — the write was refused because the pass budget
+            # died: NOTHING was written, so the PR stays unjudged and is
+            # deferred to the next pass (never marked processed).
+            out(f"kronos judge: {repo}#{pr}: pass budget exhausted before "
+                "the decision write — deferred to the next pass")
+            break
         except Exception as exc:  # noqa: BLE001 — one PR never stops the sweep
             out(f"kronos judge: {repo}#{pr} failed: "
                 f"{type(exc).__name__}")

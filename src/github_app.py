@@ -128,7 +128,7 @@ class GitHubApp:
         time_fn=time.time,
         repo_ttl: int = REPO_CACHE_TTL_SECS,
         token_refresh_lead: int = TOKEN_REFRESH_LEAD_SECS,
-        http_timeout: int = 30,
+        http_timeout: float = 30,
     ) -> None:
         self.app_id = str(app_id).strip()
         self._key_pem = key_pem

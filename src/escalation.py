@@ -58,6 +58,17 @@ class AdvisorNotFound(AdvisorFailed):
     of waiting out the timeout."""
 
 
+class DecisionUnreadable(EscalationError):
+    """The COMMITTED escalation decision could not be READ (a transient
+    database error).
+
+    r5 HIGH 2 — UNREADABLE is not ABSENT.  A decision that cannot be read
+    is UNKNOWN: the recovery must defer (no terminal outcome, the marker
+    survives for the next poll) instead of concluding "there is no
+    decision" — which would PARK a successful escalation and lose its
+    builder round."""
+
+
 @dataclass
 class RoundRecord:
     """One builder round in the escalation context."""
@@ -460,7 +471,12 @@ def _committed_decision(state, repo: str, pr: int, advice_id: str):
     r4 MEDIUM 2 — the decision (the 'escalated' row) is written BEFORE the
     builder job is created.  When the job insert fails the decision exists
     without its effect: the recovery must REPAIR that partial outcome (never
-    park it, never write a second decision)."""
+    park it, never write a second decision).
+
+    r5 HIGH 2 — a lookup that FAILS is UNKNOWN, not ABSENT: it raises
+    DecisionUnreadable so the caller defers instead of concluding "there is
+    no decision" (which would PARK a successful escalation and lose its
+    builder round)."""
     if not advice_id:
         return None
     getter = getattr(state, "advisor_escalation_detail", None)
@@ -468,8 +484,10 @@ def _committed_decision(state, repo: str, pr: int, advice_id: str):
         return None
     try:
         decision = getter(repo, pr, advice_id)
-    except Exception:  # noqa: BLE001 — a read failure is not a decision
-        return None
+    except Exception as exc:  # noqa: BLE001 — UNREADABLE, never ABSENT
+        raise DecisionUnreadable(
+            f"the committed decision of {advice_id} could not be read: "
+            f"{exc}") from exc
     # only a real decision record counts (a stubbed state returns anything)
     if not isinstance(decision, dict):
         return None
@@ -641,7 +659,21 @@ def recover_escalations(
         # and no contradictory PARKED row is appended to a successful
         # advice.  The repair needs no advisor — the decision carries the
         # (redacted) plan the job is built from.
-        decision = _committed_decision(state, repo, pr, advice_id)
+        #
+        # r5 HIGH 2 — a decision that cannot be READ is UNKNOWN, not
+        # ABSENT: the pass DEFERS (no terminal outcome, no PARKED row, the
+        # marker survives for the next poll).  Reading it as "no decision"
+        # would park a successful escalation and lose its builder round.
+        try:
+            decision = _committed_decision(state, repo, pr, advice_id)
+        except DecisionUnreadable as exc:
+            log.warning("escalation %s#%s advice %s: the committed decision "
+                        "is unreadable (%s) — deferred, never parked",
+                        repo, pr, advice_id, exc)
+            handled.append({"repo": repo, "pr": pr, "action": "deferred",
+                            "reason": "the committed escalation decision is "
+                                      "unreadable — deferred (never parked)"})
+            continue
         if decision is not None and _recorded_plan(decision).get("steps"):
             out = _consume_and_act(
                 state, repo, pr, head_sha, advice_id, installation_id,
