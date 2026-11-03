@@ -24,6 +24,7 @@ import psycopg
 import pytest
 from psycopg.rows import dict_row
 
+from src.jobs import Jobs
 from src.neo_state import (
     ESCALATION_INFLIGHT_PHASE,
     ESCALATION_INFLIGHT_STALE_SECS,
@@ -296,6 +297,12 @@ def test_cleanup_failure_after_escalated_outcome_never_parks(
         state.record("o/r", 320, HEAD, "escalated", verdict="ESCALATE",
                      builder_round=6,
                      detail={"advice_id": "adv-m2", "reason": "escalated"})
+        # r4 MEDIUM 2: a SETTLED advice is an escalated decision WITH its
+        # builder job — the round it decided can actually run.  (The review
+        # called out that this fake action inserted no real builder job, so
+        # it could not establish the partial outcome either.)
+        Jobs(fresh).create_builder("o/r", 320, HEAD, 6,
+                                   payload={"round": 6})
         return {"action": "escalated"}
 
     out = _consume_and_act(state, "o/r", 320, HEAD, "adv-m2", 1, _act,
