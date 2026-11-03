@@ -360,6 +360,26 @@ class NeoState:
                     if not still:
                         c.rollback()
                         continue
+                    # MEDIUM 2: the outcome may have committed before the
+                    # cleanup failed/crashed. A settled advice (its escalated
+                    # row, or any later parked row) is cleared without
+                    # re-acting, so no contradictory decision is appended.
+                    settled = c.execute(
+                        "SELECT 1 FROM neo_actions WHERE repo=%s "
+                        "AND pr_number=%s AND id>%s AND ((phase='parked' AND head_sha=(SELECT head_sha FROM neo_actions WHERE id=%s)) "
+                        "OR (phase='escalated' AND "
+                        "COALESCE(detail->>%s, '')=%s)) LIMIT 1",
+                        (repo, pr, row_id, row_id, "advice_id",
+                         str(detail.get("advice_id") or "")),
+                    ).fetchone()
+                    if settled:
+                        c.execute(
+                            "DELETE FROM neo_actions WHERE id=%s", (row_id,))
+                        c.commit()
+                        out.append({"repo": repo, "pr": pr,
+                                    "action": "cleared (outcome already "
+                                              "recorded)"})
+                        continue
                     # Supersession is ordered by durable row id, not merely
                     # the presence of any escalating row: older A must never
                     # supersede newer B. Include live in-flight owners too.
