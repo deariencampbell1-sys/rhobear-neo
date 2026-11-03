@@ -43,6 +43,15 @@ import time
 from pathlib import Path
 
 
+class BudgetSpent(RuntimeError):
+    """The pass budget is gone: no NEW call may start. The work is deferred
+    to the next pass instead of overrunning the deadline.
+
+    r4 MEDIUM 1 — an EXHAUSTED budget is never floored to a one-second
+    timeout: the mint, the HTTP call and the DB write of an exhausted pass
+    do not start at all."""
+
+
 class KronosState:
     """Small JSON-file state store (alert dedupe windows, open-alert
     tracking, flap windows, judged markers, the notify outbox, the judge's

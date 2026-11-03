@@ -408,17 +408,19 @@ def escalate_pr(
     existing_round = (state.advisor_escalation_for(repo, pr, advice_id)
                       if advice_id else None)
     if existing_round is None:
+        # r4 MEDIUM 2: the DECISION carries the (redacted) plan, so the
+        # builder job of a committed decision can be created LATER — the
+        # recovery repairs a decision whose job insert failed instead of
+        # parking a successful advice and losing its round.
+        stored_plan = dict(redacted)
+        stored_plan["steps_count"] = len(work_order.steps)
         state.record(repo, pr, head_sha, "escalated", verdict="ESCALATE",
                      builder_round=new_round,
                      detail={
                          "reason": "escalated to frontier advisor",
                          "advice_id": str(advice_id or ""),
-                         "work_order": {
-                             "route": redacted["route"],
-                             "summary": redacted["summary"],
-                             "root_cause": redacted["root_cause"],
-                             "steps_count": len(work_order.steps),
-                         },
+                         "work_order": stored_plan,
+                         "installation_id": installation_id,
                          "advisor_round": new_round,
                      })
     else:
@@ -450,6 +452,92 @@ def escalate_pr(
         "work_order": redacted,
         "round": new_round,
     }
+
+
+def _committed_decision(state, repo: str, pr: int, advice_id: str):
+    """The COMMITTED escalation decision of this advice, or None.
+
+    r4 MEDIUM 2 — the decision (the 'escalated' row) is written BEFORE the
+    builder job is created.  When the job insert fails the decision exists
+    without its effect: the recovery must REPAIR that partial outcome (never
+    park it, never write a second decision)."""
+    if not advice_id:
+        return None
+    getter = getattr(state, "advisor_escalation_detail", None)
+    if getter is None:
+        return None
+    try:
+        decision = getter(repo, pr, advice_id)
+    except Exception:  # noqa: BLE001 — a read failure is not a decision
+        return None
+    # only a real decision record counts (a stubbed state returns anything)
+    if not isinstance(decision, dict):
+        return None
+    return decision
+
+
+def _recorded_plan(decision: dict | None) -> dict:
+    """The (redacted) plan recorded with a committed decision — empty when
+    the decision predates the recorded plan (then the builder job cannot be
+    rebuilt from the row alone)."""
+    if not isinstance(decision, dict):
+        return {}
+    plan = (decision.get("detail") or {}).get("work_order")
+    return plan if isinstance(plan, dict) else {}
+
+
+def _repair_escalated_round(state, jobs, repo: str, pr: int, head_sha: str,
+                             decision: dict) -> dict:
+    """Create the builder job of a COMMITTED escalation decision when it is
+    missing (the job insert failed after the decision committed).
+
+    Idempotent: the job of a round is unique — an existing job is never
+    re-armed and never duplicated, and the decision itself is never written
+    again (ONE advice, ONE decision, ONE round)."""
+    plan = _recorded_plan(decision)
+    if not plan.get("steps"):
+        raise EscalationError(
+            "the committed escalation carries no recorded plan — the "
+            "builder job cannot be rebuilt")
+    try:
+        round_no = int(decision.get("round") or 0)
+    except (TypeError, ValueError):
+        round_no = 0
+    if not round_no:
+        raise EscalationError(
+            "the committed escalation carries no round — the builder job "
+            "cannot be rebuilt")
+    getter = getattr(state, "builder_job_state", None)
+    job_state = getter(repo, pr, round_no) if getter is not None else None
+    if isinstance(job_state, str):
+        return {"action": "escalated",
+                "reason": "the builder job of the committed round exists"}
+    if jobs is None:
+        raise EscalationError(
+            "no jobs writer: the builder job cannot be created")
+    decision_sha = decision.get("head_sha") or head_sha
+    jobs.create_builder(repo, pr, decision_sha, round_no, payload={
+        "verdict": "BOUNCE-BUILDER",
+        "head_sha": decision_sha,
+        "phase": "escalated",
+        "round": round_no,
+        "context": "neo:escalated",
+        "escalated": True,
+        "work_order": plan,
+        "installation_id": (decision.get("detail") or {}).get(
+            "installation_id"),
+    })
+    log.info("repaired the builder job of the committed escalation %s#%s "
+             "(round %d)", repo, pr, round_no)
+    return {"action": "escalated",
+            "reason": "the builder job of the committed round was created",
+            "round": round_no}
+
+
+def _never_park(reason: str):
+    """Never park a COMMITTED escalation decision — the advice stays pending
+    so its round can be repaired (the decision is the successful outcome)."""
+    raise EscalationError(reason)
 
 
 def _consume_and_act(state, repo: str, pr: int, head_sha: str,
@@ -548,7 +636,32 @@ def recover_escalations(
         started_at = row.get("started_at") or row["created_at"].timestamp()
         waited = time.time() - started_at
 
-        if waited > timeout_secs:
+        # r4 MEDIUM 2 — a COMMITTED decision is never parked: its builder
+        # JOB is repaired instead (idempotently), so the round is not lost
+        # and no contradictory PARKED row is appended to a successful
+        # advice.  The repair needs no advisor — the decision carries the
+        # (redacted) plan the job is built from.
+        decision = _committed_decision(state, repo, pr, advice_id)
+        if decision is not None and _recorded_plan(decision).get("steps"):
+            out = _consume_and_act(
+                state, repo, pr, head_sha, advice_id, installation_id,
+                lambda: _repair_escalated_round(state, jobs, repo, pr,
+                                                head_sha, decision),
+                started_at=started_at, detail=row.get("detail"),
+            )
+            if out is None:
+                handled.append({"repo": repo, "pr": pr, "action": "dropped",
+                                "reason": "superseded by a newer escalation"})
+            else:
+                handled.append({"repo": repo, "pr": pr, **out})
+            continue
+        # A decision whose plan was not recorded (written before the plan
+        # was stored) cannot be rebuilt from the row: it is still never
+        # parked — the advice stays pending and the normal poll may still
+        # complete the round.
+        decided = decision is not None
+
+        if waited > timeout_secs and not decided:
             if not advice_id:
                 # A marker without an advice_id can never be polled: consume it
                 # under the per-PR lock ONLY if it is still the newest marker (a
@@ -586,6 +699,24 @@ def recover_escalations(
         try:
             status = poll_advice(cfg, advice_id)
         except AdvisorNotFound as exc:
+            if decided:
+                # r4 MEDIUM 2: the decision is committed — the advisor lost
+                # ITS record, the decision is not.  The advice stays pending
+                # (never parked): a successful advice is not a failure.
+                out = _consume_and_act(
+                    state, repo, pr, head_sha, advice_id, installation_id,
+                    lambda: _never_park(
+                        f"advisor lost the record for {advice_id}: {exc}"),
+                    started_at=started_at, detail=row.get("detail"),
+                )
+                if out is None:
+                    handled.append({"repo": repo, "pr": pr,
+                                    "action": "dropped",
+                                    "reason": "superseded by a newer "
+                                              "escalation"})
+                else:
+                    handled.append({"repo": repo, "pr": pr, **out})
+                continue
             # Extra A: the advisor restarted and lost the record.  Park
             # immediately with the reason — no 30-minute wait.
             lost_reason = f"advisor lost the record for {advice_id}: {exc}"
@@ -626,6 +757,24 @@ def recover_escalations(
             else:
                 handled.append({"repo": repo, "pr": pr, **out})
         elif status.status == "failed":
+            if decided:
+                # r4 MEDIUM 2: the decision is committed — the advice is not
+                # parked (never a contradictory PARKED row next to a
+                # successful escalation): it stays pending.
+                out = _consume_and_act(
+                    state, repo, pr, head_sha, advice_id, installation_id,
+                    lambda: _never_park(
+                        f"advisor failed: {status.error or 'unknown'}"),
+                    started_at=started_at, detail=row.get("detail"),
+                )
+                if out is None:
+                    handled.append({"repo": repo, "pr": pr,
+                                    "action": "dropped",
+                                    "reason": "superseded by a newer "
+                                              "escalation"})
+                else:
+                    handled.append({"repo": repo, "pr": pr, **out})
+                continue
             out = _consume_and_act(
                 state, repo, pr, head_sha, advice_id, installation_id,
                 lambda: _park_pr(

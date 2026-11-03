@@ -42,6 +42,8 @@ import json
 
 import psycopg
 
+from . import BudgetSpent
+
 #: 5 normal Zeus fix rounds + at most 1 Kronos escalated round.
 ROUND_CEILING = 6
 
@@ -144,18 +146,44 @@ class SqlWrites:
 
     def __init__(self, dsn: str, *, quiet_secs: int = DEFAULT_QUIET_SECS,
                  connect_timeout: int = 15,
-                 statement_timeout_ms: int = 15000):
+                 statement_timeout_ms: int = 15000,
+                 budget_left=None):
         self.dsn = dsn
         self.quiet_secs = int(quiet_secs)
         self.connect_timeout = max(1, int(connect_timeout))
         self.statement_timeout_ms = max(1, int(statement_timeout_ms))
+        # r4 MEDIUM 1 — the pass budget (seconds LEFT).  The DB work of a
+        # pass is bounded by it: a write started at the end of the pass can
+        # never overrun the deadline.
+        self._budget_left = budget_left
+
+    def _timeouts(self) -> tuple[int, int]:
+        """(connect_timeout, statement_timeout_ms) — what is LEFT of the pass
+        budget, never a free-standing cap that can overrun the deadline.
+
+        r4 MEDIUM 1: an exhausted budget means the write does not start at
+        all (BudgetSpent) — exactly like every other side effect of the
+        pass.  Without a pass budget the plain timeouts stand."""
+        connect = self.connect_timeout
+        statement = self.statement_timeout_ms
+        if self._budget_left is not None:
+            left = float(self._budget_left())
+            if left <= 0:
+                raise BudgetSpent(
+                    "pass budget exhausted before the DB write")
+            # the statement timeout is milliseconds — it can be bounded
+            # below a second; the connect timeout is whole seconds.
+            connect = max(1, min(connect, int(left) or 1))
+            statement = max(1, min(statement, int(left * 1000)))
+        return connect, statement
 
     def _connect(self):
+        connect_timeout, statement_timeout_ms = self._timeouts()
         conn = psycopg.connect(self.dsn, autocommit=False,
-                               connect_timeout=self.connect_timeout)
+                               connect_timeout=connect_timeout)
         # SET cannot take a bound parameter: inline the validated int.
         conn.execute(f"SET LOCAL statement_timeout = "
-                     f"{int(self.statement_timeout_ms)}")
+                     f"{int(statement_timeout_ms)}")
         return conn
 
     def escalate(self, repo: str, pr: int, head_sha: str, *,

@@ -53,7 +53,7 @@ import logging
 import sys
 import time
 
-from . import KronosState, PassLock
+from . import BudgetSpent, KronosState, PassLock
 from .alert import Alerter, GithubIssueClient
 from .checks import BROKEN, OK, WARN, CheckResult
 from .checks import (
@@ -84,18 +84,31 @@ _HTTP_TIMEOUT_SECS = 30
 _DB_TIMEOUT_SECS = 15
 
 
-class BudgetSpent(RuntimeError):
-    """r4 MEDIUM E — the pass budget is gone: no NEW call may start. The
-    work is deferred to the next pass instead of overrunning the deadline."""
-
-
 def _mint_timeout(left_fn) -> int:
     """r4 MEDIUM E — a token mint's HTTP timeout is bounded by what is LEFT
     of the pass budget (the App client's own default is a free-standing
-    30 s)."""
+    30 s).  r4 MEDIUM 1 — an EXHAUSTED budget (nothing left) is never
+    floored to one second: the mint does not start at all (BudgetSpent)."""
     if left_fn is None:
         return _HTTP_TIMEOUT_SECS
-    return max(1, min(_HTTP_TIMEOUT_SECS, int(left_fn())))
+    left = float(left_fn())
+    if left <= 0:
+        raise BudgetSpent("pass budget exhausted before the token mint")
+    return max(1, min(_HTTP_TIMEOUT_SECS, int(left)))
+
+
+def _http_timeout(left_fn, cap: int = _HTTP_TIMEOUT_SECS) -> int:
+    """The timeout of ONE http call: what is LEFT of the pass budget, never
+    a free-standing cap.
+
+    r4 MEDIUM 1 — an EXHAUSTED budget (nothing left) is never floored to one
+    second: the call does not start at all (BudgetSpent)."""
+    if left_fn is None:
+        return int(cap)
+    left = float(left_fn())
+    if left <= 0:
+        raise BudgetSpent("pass budget exhausted before the HTTP call")
+    return max(1, min(int(cap), int(left)))
 
 #: The judge sweep's page (HIGH 3, r3): filtered, quiet, undecided PRs only,
 #: keyset-paged past the persisted cursor. The NOT EXISTS clause drops
@@ -182,7 +195,8 @@ class Services:
     @staticmethod
     def writes(dsn: str, *, quiet_secs: int | None = None,
                connect_timeout: int | None = None,
-               statement_timeout_ms: int | None = None):
+               statement_timeout_ms: int | None = None,
+               budget_left=None):
         kw = {}
         if quiet_secs is not None:
             kw["quiet_secs"] = quiet_secs
@@ -190,6 +204,9 @@ class Services:
             kw["connect_timeout"] = connect_timeout
         if statement_timeout_ms is not None:
             kw["statement_timeout_ms"] = statement_timeout_ms
+        # r4 MEDIUM 1: the pass budget bounds the DB work of the pass.
+        if budget_left is not None:
+            kw["budget_left"] = budget_left
         return SqlWrites(dsn, **kw)
 
     # -- HTTP (RouteGate judge + GitHub) ----------------------------------
@@ -450,7 +467,7 @@ def _alerter(cfg: KronosConfig, state: KronosState, now_fn,
               else (lambda method, url, *, headers=None, body=None,
                     timeout=_HTTP_TIMEOUT_SECS: services.http(
                         method, url, headers=headers, body=body,
-                        timeout=max(1, min(int(timeout), int(left_fn())))))))
+                        timeout=_http_timeout(left_fn, int(timeout))))))
     return Alerter(client, state, now_fn=now_fn,
                    window_secs=cfg.alert_window_secs, label=cfg.alert_label)
 
@@ -466,6 +483,10 @@ def _alert_once(cfg, state, out, *, fingerprint, subject, body, now_fn,
         out(f"kronos alert: {fingerprint} {action}")
         if action != "suppressed":
             state.slot("open_alerts")[fingerprint] = now_iso()
+    except BudgetSpent:
+        # r4 MEDIUM 1: the pass budget is gone — the alert is deferred to
+        # the next pass, no call was started past the deadline.
+        out(f"kronos alert: {fingerprint} deferred (pass budget exhausted)")
     except Exception as exc:  # noqa: BLE001 — an alert failure never stops
         out(f"kronos alert: {fingerprint} failed: {type(exc).__name__}")
 
@@ -501,8 +522,7 @@ def _pr_commenter(services, cfg, left_fn=None):
         app = GitHubApp(cfg.zeus_app_id, cfg.zeus_app_key,
                         http_timeout=_mint_timeout(left_fn))
         token = app.token_for_repo(repo)
-        timeout = _HTTP_TIMEOUT_SECS if left_fn is None else \
-            max(1, min(_HTTP_TIMEOUT_SECS, int(left_fn())))
+        timeout = _http_timeout(left_fn, _HTTP_TIMEOUT_SECS)
         status, raw = services.http(
             "POST", f"https://api.github.com/repos/{repo}/issues/{pr}/comments",
             headers={"Accept": "application/vnd.github+json",
@@ -575,7 +595,10 @@ def _judge_sweep(cfg, state, db, services, out, *, now_fn, left_fn, clamp):
                              quiet_secs=cfg.zeus_quiet_secs,
                              connect_timeout=clamp(_DB_TIMEOUT_SECS),
                              statement_timeout_ms=clamp(_DB_TIMEOUT_SECS)
-                             * 1000)
+                             * 1000,
+                             # r4 MEDIUM 1: the DB work of the pass is
+                             # bounded by what is LEFT of the budget.
+                             budget_left=left_fn)
     alerter = _alerter(cfg, state, now_fn, services=services,
                        left_fn=left_fn)
     comments = _pr_commenter(services, cfg, left_fn)

@@ -52,6 +52,32 @@ def _started_at(detail: dict, created_at) -> float:
     return created_at.timestamp()
 
 
+def _builder_job_exists(c, repo: str, pr: int, builder_round) -> bool | None:
+    """True when the builder job of `builder_round` exists, False when it
+    does not, None when it cannot be told (no neo_jobs table).
+
+    r4 MEDIUM 2 — an escalated DECISION is a settled outcome only when its
+    builder job exists; a decision without its job is a PARTIAL outcome."""
+    try:
+        round_no = int(builder_round)
+    except (TypeError, ValueError):
+        return None
+    try:
+        # to_regclass never errors (it returns NULL for a missing table) —
+        # a failed SELECT would abort the caller's transaction.
+        has_table = c.execute(
+            "SELECT to_regclass('neo_jobs') IS NOT NULL").fetchone()[0]
+    except Exception:  # noqa: BLE001 — unknown, not "missing"
+        return None
+    if not has_table:
+        return None
+    row = c.execute(
+        "SELECT 1 FROM neo_jobs WHERE kind='builder' AND repo=%s AND "
+        "pr_number=%s AND builder_round=%s LIMIT 1",
+        (repo, pr, round_no)).fetchone()
+    return row is not None
+
+
 # r4 (HIGH C, authorized Zeus interop change — Morpheus ruling 2026-11-02):
 # take_escalation() no longer DELETES the consumed advice's rows. They are
 # re-phased to this marker phase with a consumed_at timestamp, so there is
@@ -384,14 +410,35 @@ class NeoState:
                     # cleanup failed/crashed. A settled advice (its escalated
                     # row, or any later parked row) is cleared without
                     # re-acting, so no contradictory decision is appended.
+                    # r4 MEDIUM 2: an escalated row is a SETTLED outcome only
+                    # when its builder JOB exists — the decision without its
+                    # job is a PARTIAL outcome: it is re-driven (the recovery
+                    # repairs the missing job), never cleared as if the
+                    # round were done.
                     settled = c.execute(
                         "SELECT 1 FROM neo_actions WHERE repo=%s "
-                        "AND pr_number=%s AND id>%s AND ((phase='parked' AND head_sha=(SELECT head_sha FROM neo_actions WHERE id=%s)) "
-                        "OR (phase='escalated' AND "
-                        "COALESCE(detail->>%s, '')=%s)) LIMIT 1",
-                        (repo, pr, row_id, row_id, "advice_id",
-                         str(detail.get("advice_id") or "")),
+                        "AND pr_number=%s AND id>%s AND phase='parked' AND "
+                        "head_sha=(SELECT head_sha FROM neo_actions WHERE "
+                        "id=%s) LIMIT 1",
+                        (repo, pr, row_id, row_id),
                     ).fetchone()
+                    if not settled:
+                        candidates = c.execute(
+                            "SELECT builder_round FROM neo_actions WHERE "
+                            "repo=%s AND pr_number=%s AND id>%s AND "
+                            "phase='escalated' AND "
+                            "COALESCE(detail->>%s, '')=%s ORDER BY id DESC",
+                            (repo, pr, row_id, "advice_id",
+                             str(detail.get("advice_id") or "")),
+                        ).fetchall()
+                        for (round_no,) in candidates:
+                            if _builder_job_exists(c, repo, pr,
+                                                   round_no) is False:
+                                # the decision's job is missing: a partial
+                                # outcome — not settled, it must be repaired.
+                                continue
+                            settled = True
+                            break
                     if settled:
                         c.execute(
                             "DELETE FROM neo_actions WHERE id=%s", (row_id,))
@@ -477,6 +524,65 @@ class NeoState:
             return int(row[0])
         except (TypeError, ValueError):
             return None
+
+    def advisor_escalation_detail(self, repo: str, pr: int, advice_id: str):
+        """The COMMITTED escalation decision for `advice_id`: its round, its
+        head_sha and its detail (the recorded plan).  None when this advice
+        has not escalated.
+
+        r4 MEDIUM 2 — the decision (the 'escalated' row) is written BEFORE
+        the builder job is created; when the job insert fails the decision
+        exists without its effect.  This is the durable record the recovery
+        needs to REPAIR that partial outcome (never park it, never write a
+        second decision)."""
+        if not advice_id:
+            return None
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT builder_round, head_sha, detail FROM neo_actions "
+                "WHERE repo=%s AND pr_number=%s AND phase='escalated' AND "
+                "detail->>'advice_id'=%s ORDER BY id DESC LIMIT 1",
+                (repo, pr, str(advice_id)),
+            ).fetchone()
+        if not row:
+            return None
+        detail = row[2]
+        if isinstance(detail, str):
+            try:
+                detail = json.loads(detail)
+            except (TypeError, ValueError):
+                detail = {}
+        try:
+            round_no = int(row[0])
+        except (TypeError, ValueError):
+            round_no = 0
+        return {"round": round_no, "head_sha": str(row[1] or ""),
+                "detail": detail if isinstance(detail, dict) else {}}
+
+    def builder_job_state(self, repo: str, pr: int, builder_round: int):
+        """The state of the builder job of `builder_round` ('queued',
+        'running', 'done', ...), or None when the job does not exist.
+
+        neo_jobs lives in the SAME database (ensure_schema delegates to
+        jobs.py) — this is the read side of the repair: a committed
+        decision whose job is missing is a PARTIAL outcome."""
+        try:
+            round_no = int(builder_round)
+        except (TypeError, ValueError):
+            return None
+        with self._conn() as c:
+            try:
+                has_table = c.execute(
+                    "SELECT to_regclass('neo_jobs') IS NOT NULL").fetchone()[0]
+            except Exception:  # noqa: BLE001 — unknown, not "missing"
+                return None
+            if not has_table:
+                return None
+            row = c.execute(
+                "SELECT state FROM neo_jobs WHERE kind='builder' AND repo=%s "
+                "AND pr_number=%s AND builder_round=%s LIMIT 1",
+                (repo, pr, round_no)).fetchone()
+        return str(row[0]) if row else None
 
     def already_escalated(self, repo: str, pr: int) -> bool:
         """True once this PR has had its ONE genuine advisor-escalated round.
