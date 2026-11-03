@@ -260,3 +260,66 @@ def test_recover_escalations_reclaims_a_stale_marker_end_to_end(
             "SELECT phase FROM neo_actions WHERE repo='o/r' AND "
             "pr_number=308").fetchall()
     assert [r["phase"] for r in rows] == ["parked"], rows
+
+
+# --- MEDIUM 2: outcome committed, cleanup failed/crashed -> stale reclaim ---
+
+class _CleanupFails(NeoState):
+    def clear_inflight_markers(self, *a, **k):
+        raise RuntimeError("cleanup crashed after the outcome committed")
+
+
+def _phases(dsn, repo, pr):
+    with psycopg.connect(dsn, row_factory=dict_row) as c:
+        return [r["phase"] for r in c.execute(
+            "SELECT phase FROM neo_actions WHERE repo=%s AND pr_number=%s "
+            "ORDER BY id", (repo, pr)).fetchall()]
+
+
+class _Cfg:
+    advisor_url = "http://127.0.0.1:9"
+    advisor_token = "t"
+
+
+def _no_poll(monkeypatch):
+    def _boom(cfg, advice_id):
+        raise AssertionError("a settled advice must not be re-polled")
+    monkeypatch.setattr(_escalation, "poll_advice", _boom)
+
+
+def test_cleanup_failure_after_escalated_outcome_never_parks(
+        fresh, monkeypatch):
+    state = _CleanupFails(fresh)
+    state.record_escalating("o/r", 320, HEAD, advice_id="adv-m2")
+
+    def _act():
+        state.record("o/r", 320, HEAD, "escalated", verdict="ESCALATE",
+                     builder_round=6,
+                     detail={"advice_id": "adv-m2", "reason": "escalated"})
+        return {"action": "escalated"}
+
+    out = _consume_and_act(state, "o/r", 320, HEAD, "adv-m2", 1, _act,
+                           detail={"advice_id": "adv-m2"})
+    assert out == {"action": "escalated"}
+    assert _marker_phases(fresh, "o/r", 320), "marker should linger"
+    _age_inflight(fresh, "o/r", 320, seconds=7200)
+    _no_poll(monkeypatch)
+
+    _escalation.recover_escalations(_Cfg(), NeoState(fresh), None,
+                                    timeout_secs=1800)
+    assert _phases(fresh, "o/r", 320) == ["escalated"], \
+        "stale recovery appended a decision after a successful escalation"
+
+
+def test_crash_after_parked_outcome_clears_marker_without_acting(
+        fresh, monkeypatch):
+    state = NeoState(fresh)
+    state.record_escalating("o/r", 321, HEAD, advice_id="adv-m2b")
+    assert state.take_escalation("o/r", 321, "adv-m2b") is True
+    _escalation._park_pr(state, None, "o/r", 321, HEAD, "gave up")
+    _age_inflight(fresh, "o/r", 321, seconds=7200)
+    _no_poll(monkeypatch)
+
+    _escalation.recover_escalations(_Cfg(), state, None, timeout_secs=1800)
+    assert _phases(fresh, "o/r", 321) == ["parked"], \
+        _phases(fresh, "o/r", 321)
