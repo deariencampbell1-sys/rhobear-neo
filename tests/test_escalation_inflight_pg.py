@@ -323,3 +323,44 @@ def test_crash_after_parked_outcome_clears_marker_without_acting(
     _escalation.recover_escalations(_Cfg(), state, None, timeout_secs=1800)
     assert _phases(fresh, "o/r", 321) == ["parked"], \
         _phases(fresh, "o/r", 321)
+
+
+def test_stale_sweeper_does_not_reopen_a_freshly_retaken_marker(fresh):
+    """ABA: sweeper snapshots stale marker N; meanwhile N is reclaimed and
+    re-taken (fresh consumed_at). The resumed sweeper must leave it alone."""
+    import threading
+    state = NeoState(fresh)
+    state.record_escalating("o/r", 330, HEAD, advice_id="adv-aba")
+    assert state.take_escalation("o/r", 330, "adv-aba") is True
+    _age_inflight(fresh, "o/r", 330, seconds=7200)
+
+    lock = psycopg.connect(fresh, autocommit=False)
+    lock.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", ("o/r:330",))
+    result: list = []
+    t = threading.Thread(
+        target=lambda: result.append(state.reclaim_stale_inflight()))
+    t.start()
+    try:
+        deadline = time.time() + 10
+        blocked = False
+        while time.time() < deadline and not blocked:
+            with psycopg.connect(fresh, autocommit=True) as c:
+                blocked = c.execute(
+                    "SELECT count(*) FROM pg_locks WHERE locktype='advisory' "
+                    "AND NOT granted").fetchone()[0] > 0
+            time.sleep(0.05)
+        assert blocked, "sweeper never reached the PR lock"
+        # reclaim + retake happened while the sweeper waited: fresh marker
+        lock.execute(
+            "UPDATE neo_actions SET detail = jsonb_set(detail, "
+            "'{consumed_at}', to_jsonb(%s::double precision)) "
+            "WHERE repo=%s AND pr_number=%s AND phase=%s",
+            (time.time(), "o/r", 330, ESCALATION_INFLIGHT_PHASE))
+        lock.commit()
+    finally:
+        t.join(15)
+        lock.close()
+    assert not t.is_alive()
+    assert result == [[]], result
+    assert [p for p, _ in _marker_phases(fresh, "o/r", 330)] == \
+        [ESCALATION_INFLIGHT_PHASE], "stale snapshot re-opened a live marker"
